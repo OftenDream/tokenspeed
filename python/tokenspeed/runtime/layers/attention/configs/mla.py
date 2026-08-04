@@ -29,7 +29,6 @@ from tokenspeed.runtime.layers.attention.configs.base import (
     BaseAttnConfig,
     resolve_dtype,
 )
-from tokenspeed.runtime.layers.attention.kv_cache.base import BaseTokenToKVPool
 from tokenspeed.runtime.utils.server_args import ServerArgs
 
 
@@ -108,21 +107,3 @@ class MLAConfig(BaseAttnConfig):
                 self.kv_lora_rank + self.qk_rope_head_dim
             ) * torch._utils._element_size(self.kv_cache_dtype)
         return cell_size
-
-    def create_pool(
-        self,
-        num_layers: int,
-        max_total_num_tokens: int,
-        rank: int,
-        enable_memory_saver: bool,
-    ) -> BaseTokenToKVPool:
-        # MLA now runs exclusively on the shared LCM arena, built by
-        # lcm_setup.create_lcm_pool via the "plain_mla" recipe. The classic
-        # per-layer-tensor MLATokenToKVPool storage was retired; the registry
-        # always resolves an LCM plan for MLA, so this factory is never the one
-        # that builds the pool.
-        raise RuntimeError(
-            "MLA KV cache is built through the LCM arena (lcm_setup), not "
-            "MLAConfig.create_pool; an MLA model reached the classic pool path, "
-            "which means the LCM gating did not fire."
-        )

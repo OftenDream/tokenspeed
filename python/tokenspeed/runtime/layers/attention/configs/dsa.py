@@ -27,7 +27,6 @@ from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.configs.model_config import ModelConfig
 from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
-from tokenspeed.runtime.layers.attention.kv_cache.base import BaseTokenToKVPool
 from tokenspeed.runtime.utils.server_args import ServerArgs
 
 _INDEX_K_FP8_GROUP_SIZE = 128
@@ -80,20 +79,3 @@ class DSAConfig(MLAConfig):
             self.index_head_dim,
         )
         return super().cache_cell_size() + index_k_cell_size
-
-    def create_pool(
-        self,
-        num_layers: int,
-        max_total_num_tokens: int,
-        rank: int,
-        enable_memory_saver: bool,
-    ) -> BaseTokenToKVPool:
-        # DSA now runs exclusively on the shared LCM arena, built by
-        # lcm_setup.create_lcm_pool via the "dsa" recipe. The classic
-        # per-layer-tensor path was retired; the registry always resolves an
-        # LCM plan for DSA, so this factory is never the one that builds it.
-        raise RuntimeError(
-            "DSA KV cache is built through the LCM arena (lcm_setup), not "
-            "DSAConfig.create_pool; a DSA model reached the classic pool path, "
-            "which means the LCM gating did not fire."
-        )

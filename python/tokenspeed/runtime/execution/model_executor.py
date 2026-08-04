@@ -85,7 +85,7 @@ from tokenspeed.runtime.utils.server_args import ServerArgs
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
-    from tokenspeed.runtime.layers.attention.kv_cache.base import BaseTokenToKVPool
+    from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
     from tokenspeed.runtime.sampling.sampling_params import SamplingParams
 
 logger = get_colorful_logger(__name__)
@@ -293,11 +293,11 @@ class ModelExecutor:
         config: ModelExecutorConfig,
         model_runner: ModelRunner,
         attn_backend: AttentionBackend,
-        token_to_kv_pool: BaseTokenToKVPool,
+        token_to_kv_pool: CachePool,
         sampling_backend: SamplingBackend,
         draft_model_runner: ModelRunner | None = None,
         draft_attn_backend: AttentionBackend | None = None,
-        draft_token_to_kv_pool: BaseTokenToKVPool | None = None,
+        draft_token_to_kv_pool: CachePool | None = None,
     ):
         self.device = config.device
         self.config = config
@@ -305,19 +305,20 @@ class ModelExecutor:
         self.sampling_backend = sampling_backend
         self.attn_backend = attn_backend
         self.token_to_kv_pool = token_to_kv_pool
-        # Every pool runs on the LCM arena and publishes a runtime contract; the
-        # per-group tables travel as CacheBatchMetadata. Fail fast here rather
-        # than at the first forward: a missing contract means the model family
-        # has no LCM recipe yet (add one in lcm_setup.prepare_lcm_setup, see the
-        # 'plain_mha' / 'msa' recipes for the pattern).
+        # Every pool runs on the shared cache arena and publishes a runtime
+        # contract; the per-group tables travel as CacheBatchMetadata. Fail fast
+        # here rather than at the first forward: a missing contract means the
+        # model family has no cache recipe yet (add one in
+        # kv_cache.setup.prepare_cache_setup, see the 'mha' / 'msa' recipes for
+        # the pattern).
         self._cache_runtime_contract = getattr(
             token_to_kv_pool, "runtime_contract", None
         )
         if self._cache_runtime_contract is None:
             raise RuntimeError(
                 f"KV pool {type(token_to_kv_pool).__name__} publishes no "
-                "PagedCacheRuntimeContract. Every pool must be built from an "
-                "LCM recipe (lcm_setup.prepare_lcm_setup)."
+                "PagedCacheRuntimeContract. Every pool must be built from a "
+                "cache recipe (kv_cache.setup.prepare_cache_setup)."
             )
         # The batch-ordered full-history table backs out_cache_loc and the
         # draft page table. First contract group with family=history and

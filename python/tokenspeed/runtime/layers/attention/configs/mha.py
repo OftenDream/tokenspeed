@@ -30,7 +30,6 @@ from tokenspeed.runtime.layers.attention.configs.base import (
     BaseAttnConfig,
     resolve_dtype,
 )
-from tokenspeed.runtime.layers.attention.kv_cache.base import BaseTokenToKVPool
 from tokenspeed.runtime.utils.server_args import ServerArgs
 
 
@@ -41,8 +40,8 @@ class MHAConfig(BaseAttnConfig):
     layer_types: tuple[str, ...] = ()
     sliding_window_tokens: int | tuple[int | None, ...] | None = None
     max_scheduled_tokens: int = 0
-    # True iff server_args.disaggregation_mode != "null"; the pool's slab
-    # guards consume it.
+    # True iff server_args.disaggregation_mode != "null"; used to reject
+    # layouts whose aliased fields cannot use legacy per-layer transfers.
     pd_disaggregation_enabled: bool = False
     # Extra model-declared paged-cache groups (e.g. Inkling paged sconv); forwarded to publication
     extra_paged_groups: tuple[PagedCacheGroupSpec, ...] = ()
@@ -127,18 +126,3 @@ class MHAConfig(BaseAttnConfig):
             # One UE8M0 byte per 32 fp8 data bytes.
             cell += cell // 32
         return cell
-
-    def create_pool(
-        self,
-        num_layers: int,
-        max_total_num_tokens: int,
-        rank: int,
-        enable_memory_saver: bool,
-    ) -> BaseTokenToKVPool:
-        raise RuntimeError(
-            "Every KV pool now runs on the shared LCM arena with a "
-            "PagedCacheRuntimeContract; the classic MHA pool path was removed. "
-            "This model family has no LCM recipe yet: add one in "
-            "lcm_setup.prepare_lcm_setup (see the 'plain_mha' and 'msa' "
-            "recipes for the pattern) and gate it in registry.lcm_family."
-        )

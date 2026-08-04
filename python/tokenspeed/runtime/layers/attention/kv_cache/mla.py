@@ -27,7 +27,9 @@ from tokenspeed.runtime.cache.utils import (
     get_mla_kv_buffer_triton,
     set_mla_kv_buffer_triton,
 )
-from tokenspeed.runtime.layers.attention.kv_cache.base import BaseTokenToKVPool
+from tokenspeed.runtime.configs import paged_cache_spec
+from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
+from tokenspeed.runtime.layers.attention.kv_cache.plan import CacheMemoryPlan
 from tokenspeed.runtime.layers.paged_attention import PagedAttention
 from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.pdl import pdl_enabled
@@ -35,18 +37,16 @@ from tokenspeed.runtime.utils.torch_memory_saver_adapter import TorchMemorySaver
 
 logger = get_colorful_logger(__name__)
 
+GB = 1024 * 1024 * 1024
 
-class MLATokenToKVPool(BaseTokenToKVPool):
-    """Compute interface for MLA latent KV pools.
 
-    Holds the MLA read/write kernels (``set_mla_kv_buffer`` /
-    ``get_mla_kv_buffer`` and the key/value buffer views) shared by every MLA
-    pool. Storage is owned by subclasses: all MLA models run on the shared LCM
-    arena (:class:`LcmMLATokenToKVPool`), so this class does not allocate its
-    own per-layer tensors and is never instantiated directly. ``_create_buffers``
-    is the storage hook a subclass must implement.
-    """
+def _get_tensor_size_bytes(t: torch.Tensor | list[torch.Tensor]):
+    if isinstance(t, list):
+        return sum(_get_tensor_size_bytes(x) for x in t)
+    return np.prod(t.shape) * t.dtype.itemsize
 
+
+class MLATokenToKVPool(CachePool):
     def __init__(
         self,
         size: int,
@@ -62,12 +62,17 @@ class MLATokenToKVPool(BaseTokenToKVPool):
         max_context_len: int,
         page_size: int,
         rank: int,
-        enable_kv_cache_copy: bool = False,
-        enable_alt_stream: bool = True,
+        *,
+        memory_plan: CacheMemoryPlan,
         max_scheduled_tokens: int = 0,
     ):
         super().__init__(
-            size, dtype, device, max_batch_size, max_context_len, page_size, rank
+            size,
+            dtype,
+            device,
+            page_size,
+            rank,
+            memory_plan,
         )
         self.model_dtype = model_dtype
         self.quant_method = quant_method
@@ -76,45 +81,106 @@ class MLATokenToKVPool(BaseTokenToKVPool):
         self.qk_rope_head_dim = qk_rope_head_dim
         self.layer_num = layer_num
         self.kv_cache_dim = kv_lora_rank + qk_rope_head_dim
-
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=enable_memory_saver
         )
 
         self._create_buffers()
-        self._compute_buffer_data_ptrs()
 
-        self.device_module = torch.get_device_module(self.device)
-        self.alt_stream = (
-            self.device_module.Stream()
-            if torch.cuda.is_available() and enable_alt_stream
-            else None
+        specs, counts = self._publish_paged_cache_groups(
+            max_live_requests=max_batch_size,
+            max_scheduled_tokens=max_scheduled_tokens,
+            max_total_tokens=size,
+            max_context_len=max_context_len,
         )
-        self._kv_copy_config = None
+        self.paged_cache_group_specs = tuple(specs)
+        self.paged_cache_group_page_counts = counts
+
+    def _publish_paged_cache_groups(
+        self,
+        *,
+        max_live_requests: int,
+        max_scheduled_tokens: int,
+        max_total_tokens: int,
+        max_context_len: int,
+    ) -> tuple[list[paged_cache_spec.PagedCacheGroupSpec], dict[str, int]]:
+        return paged_cache_spec.publish_paged_cache_groups(
+            layer_types=(),
+            sliding_window_tokens=None,
+            page_size=self.page_size,
+            max_live_requests=max_live_requests,
+            max_scheduled_tokens=max_scheduled_tokens,
+            max_total_tokens=max_total_tokens,
+            max_context_len=max_context_len,
+        )
 
     def _create_buffers(self) -> None:
-        """Allocate ``self.kv_buffer``; implemented by the storage subclass."""
-        raise NotImplementedError(
-            "MLATokenToKVPool is a compute base; a storage subclass "
-            "(LcmMLATokenToKVPool) must implement _create_buffers"
-        )
+        with self.memory_saver_adapter.region(tag="kv_cache", enable_cpu_backup=False):
+            # The padded page 0 is used for writing dummy outputs from padded tokens.
+            if self.quant_method == "per_token_head":
+                self.kv_buffer = [
+                    (
+                        self.field(
+                            f"layer.{layer_id}.latent_kv", self.store_dtype
+                        ).view(-1, 1, self.kv_lora_rank),
+                        self.field(
+                            f"layer.{layer_id}.latent_scale", torch.float32
+                        ).view(-1, 1, 1),
+                        self.field(f"layer.{layer_id}.rope_k", self.model_dtype).view(
+                            -1, 1, self.qk_rope_head_dim
+                        ),
+                    )
+                    for layer_id in range(self.layer_num)
+                ]
+            else:
+                self.kv_buffer = [
+                    self.field(f"layer.{layer_id}.latent_kv", self.store_dtype).view(
+                        -1, 1, self.kv_cache_dim
+                    )
+                    for layer_id in range(self.layer_num)
+                ]
 
-    def _compute_buffer_data_ptrs(self) -> None:
-        """Cache device pointers and per-token strides for every KV buffer.
+    def get_kv_size_bytes(self):
+        assert hasattr(self, "kv_buffer")
+        kv_size_bytes = 0
+        for kv_cache in self.kv_buffer:
+            kv_size_bytes += _get_tensor_size_bytes(kv_cache)
+        return kv_size_bytes
 
-        Drives the tiled KV copy kernel. State-layer slots (``None``) are
-        skipped.
-        """
-        all_buffers = [buffer for buffer in self.kv_buffer if buffer is not None]
-        self.data_ptrs = torch.tensor(
-            [buf.data_ptr() for buf in all_buffers],
-            dtype=torch.uint64,
-            device=self.device,
-        )
-        self.data_strides = torch.tensor(
-            [np.prod(buf.shape[1:]) * buf.dtype.itemsize for buf in all_buffers],
-            device=self.device,
-        )
+    # for disagg
+    def get_contiguous_buf_infos(self):
+        if self.quant_method == "per_token_head":
+            kv_data_ptrs = [
+                sub_tuple[i].data_ptr()
+                for i in range(3)
+                for sub_tuple in self.kv_buffer
+            ]
+            kv_data_lens = [
+                sub_tuple[i].nbytes for i in range(3) for sub_tuple in self.kv_buffer
+            ]
+            kv_item_lens = [
+                sub_tuple[i][0].nbytes * self.page_size
+                for i in range(3)
+                for sub_tuple in self.kv_buffer
+            ]
+        else:
+            # MLA has only one kv_buffer, so only the information of this buffer needs to be returned.
+            kv_data_ptrs = [self.kv_buffer[i].data_ptr() for i in range(self.layer_num)]
+            kv_data_lens = [self.kv_buffer[i].nbytes for i in range(self.layer_num)]
+            kv_item_lens = [
+                self.kv_buffer[i][0].nbytes * self.page_size
+                for i in range(self.layer_num)
+            ]
+        return kv_data_ptrs, kv_data_lens, kv_item_lens
+
+    def get_layerwise_buf_info_offsets(self, start_idx=0):
+        if self.quant_method == "per_token_head":
+            return [
+                [start_idx + i * self.layer_num + layer_id for i in range(3)]
+                for layer_id in range(self.layer_num)
+            ]
+        else:
+            return [[start_idx + layer_id] for layer_id in range(self.layer_num)]
 
     def get_key_buffer(self, layer_id: int):
         if self.layer_transfer_counter is not None:
@@ -122,9 +188,12 @@ class MLATokenToKVPool(BaseTokenToKVPool):
         buffer = self.kv_buffer[layer_id]
         if buffer is None:
             raise ValueError(f"layer {layer_id} is a KDA state layer")
-        if self.store_dtype != self.dtype:
+        if self.quant_method == "per_token_head":
+            return buffer
+        elif self.store_dtype != self.dtype:
             return buffer.view(self.dtype)
-        return buffer
+        else:
+            return buffer
 
     def get_value_buffer(self, layer_id: int):
         if self.layer_transfer_counter is not None:
@@ -132,9 +201,12 @@ class MLATokenToKVPool(BaseTokenToKVPool):
         buffer = self.kv_buffer[layer_id]
         if buffer is None:
             raise ValueError(f"layer {layer_id} is a KDA state layer")
-        if self.store_dtype != self.dtype:
+        if self.quant_method == "per_token_head":
+            return buffer[:2]
+        elif self.store_dtype != self.dtype:
             return buffer[..., : self.kv_lora_rank].view(self.dtype)
-        return buffer[..., : self.kv_lora_rank]
+        else:
+            return buffer[..., : self.kv_lora_rank]
 
     def get_kv_buffer(self, layer_id: int):
         return self.get_key_buffer(layer_id), self.get_value_buffer(layer_id)
@@ -148,7 +220,18 @@ class MLATokenToKVPool(BaseTokenToKVPool):
         k_scale: float | None = None,
         v_scale: float | None = None,
     ):
-        self.kv_buffer[layer.layer_id][loc] = cache_k
+        layer_id = layer.layer_id
+        if self.quant_method == "per_token_head":
+            k_lora = cache_k[..., : self.kv_lora_rank].float()
+            k_rope = cache_k[..., self.kv_lora_rank :].float()
+            scale = k_lora.abs().amax(dim=-1, keepdim=True).clamp(1e-26) / 448.0
+            k_lora = (k_lora / scale).to(torch.float8_e4m3fn)
+            k_rope = (k_rope / scale).to(self.model_dtype)
+            self.kv_buffer[layer_id][0][loc] = k_lora.view(self.store_dtype)
+            self.kv_buffer[layer_id][1][loc] = scale
+            self.kv_buffer[layer_id][2][loc] = k_rope
+        else:
+            self.kv_buffer[layer_id][loc] = cache_k
 
     def set_mla_kv_buffer(
         self,
@@ -159,23 +242,38 @@ class MLATokenToKVPool(BaseTokenToKVPool):
         sanitize: bool = False,
     ):
         layer_id = layer.layer_id
-        if self.store_dtype != self.dtype:
-            # Bitwise-viewed pool: pre-cast and re-view for the raw word copy.
-            if cache_k_nope.dtype != self.dtype:
-                cache_k_nope = cache_k_nope.to(self.dtype)
-                cache_k_rope = cache_k_rope.to(self.dtype)
-            cache_k_nope = cache_k_nope.view(self.store_dtype)
-            cache_k_rope = cache_k_rope.view(self.store_dtype)
-        # else: the write kernel casts to the buffer dtype on store.
+        if self.quant_method == "per_token_head":
+            # Preserve the writer's sanitization contract for the quantized
+            # fallback. The BF16 path below folds this work into Triton.
+            if sanitize:
+                cache_k_nope = torch.nan_to_num(cache_k_nope)
+                cache_k_rope = torch.nan_to_num(cache_k_rope)
+            k_lora = cache_k_nope.float()
+            k_rope = cache_k_rope.float()
+            scale = k_lora.abs().amax(dim=-1, keepdim=True).clamp(1e-26) / 448.0
+            k_lora = (k_lora / scale).to(torch.float8_e4m3fn)
+            k_rope = (k_rope / scale).to(self.model_dtype)
+            self.kv_buffer[layer_id][0][loc] = k_lora.view(self.store_dtype)
+            self.kv_buffer[layer_id][1][loc] = scale
+            self.kv_buffer[layer_id][2][loc] = k_rope
+        else:
+            if self.store_dtype != self.dtype:
+                # Bitwise-viewed pool: pre-cast and re-view for the raw word copy.
+                if cache_k_nope.dtype != self.dtype:
+                    cache_k_nope = cache_k_nope.to(self.dtype)
+                    cache_k_rope = cache_k_rope.to(self.dtype)
+                cache_k_nope = cache_k_nope.view(self.store_dtype)
+                cache_k_rope = cache_k_rope.view(self.store_dtype)
+            # else: the write kernel casts to the buffer dtype on store.
 
-        set_mla_kv_buffer_triton(
-            self.kv_buffer[layer_id],
-            loc,
-            cache_k_nope,
-            cache_k_rope,
-            enable_pdl=pdl_enabled(),
-            sanitize=sanitize,
-        )
+            set_mla_kv_buffer_triton(
+                self.kv_buffer[layer_id],
+                loc,
+                cache_k_nope,
+                cache_k_rope,
+                enable_pdl=pdl_enabled(),
+                sanitize=sanitize,
+            )
 
     def get_mla_kv_buffer(
         self,
@@ -185,6 +283,15 @@ class MLATokenToKVPool(BaseTokenToKVPool):
     ):
         layer_id = layer.layer_id
         dst_dtype = dst_dtype or self.dtype
+
+        if self.quant_method == "per_token_head":
+            k_lora_cache, k_scale_cache, k_rope_cache = self.kv_buffer[layer_id]
+            k_lora = k_lora_cache[loc].view(self.dtype).float()
+            k_scale = k_scale_cache[loc]
+            k_rope = k_rope_cache[loc].float()
+            cache_k_nope = (k_lora * k_scale).to(dst_dtype).contiguous()
+            cache_k_rope = (k_rope * k_scale).to(dst_dtype).contiguous()
+            return cache_k_nope, cache_k_rope
 
         kv_buffer = self.get_key_buffer(layer_id)
         cache_k_nope = torch.empty(
