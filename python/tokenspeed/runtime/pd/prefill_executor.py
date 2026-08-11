@@ -82,11 +82,7 @@ class DisaggPrefillExecutor:
         token: int,
         spec_candidate_ids: list[int] | None = None,
     ) -> None:
-        """Called by event_loop after prefill forward to record the first output token."""
-        if self.uses_cache_contract and spec_candidate_ids is not None:
-            raise NotImplementedError(
-                "Paged cache PD does not support speculative/MTP bootstrap candidates"
-            )
+        """Record bootstrap token and speculative candidates for the PD handoff."""
         if self.uses_cache_contract and (
             isinstance(token, bool) or not isinstance(token, int) or token < 0
         ):
@@ -94,6 +90,8 @@ class DisaggPrefillExecutor:
         self._request_token[request_id] = token
         if spec_candidate_ids is not None:
             self._request_spec_candidate_ids[request_id] = spec_candidate_ids
+        else:
+            self._request_spec_candidate_ids.pop(request_id, None)
         if self._layerwise_enabled:
             sender = self.senders.get(request_id)
             if sender is None:
@@ -315,6 +313,7 @@ class DisaggPrefillExecutor:
             token = self._request_token.get(request_id)
             if isinstance(token, bool) or not isinstance(token, int) or token < 0:
                 raise RuntimeError("Paged cache bootstrap token is unavailable")
+            spec_candidate_ids = self._request_spec_candidate_ids.get(request_id)
             page_ids = np.asarray(
                 cache_manifest_page_ids(
                     manifest,
@@ -329,20 +328,31 @@ class DisaggPrefillExecutor:
                     sender,
                     op.request_pool_indices[index],
                     token,
+                    spec_candidate_ids,
                     manifest,
                     page_ids,
                 )
             )
 
-        for request_id, sender, aux_index, token, manifest, page_ids in pending:
+        for (
+            request_id,
+            sender,
+            aux_index,
+            token,
+            spec_candidate_ids,
+            manifest,
+            page_ids,
+        ) in pending:
             sender.send(
                 page_ids,
                 aux_index,
                 True,
                 bootstrap_token=token,
+                spec_candidate_ids=spec_candidate_ids,
                 page_manifest=manifest,
             )
             self._request_token.pop(request_id, None)
+            self._request_spec_candidate_ids.pop(request_id, None)
 
     def register(
         self,

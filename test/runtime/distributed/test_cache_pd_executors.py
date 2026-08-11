@@ -215,11 +215,12 @@ def test_decode_publishes_manifest_through_legacy_receiver() -> None:
     assert executor._request_pool_indices == {"request-0": 7}
 
 
-def test_prefill_submits_manifest_through_legacy_sender() -> None:
+def test_prefill_submits_manifest_and_candidates_through_contract_sender() -> None:
     import tokenspeed.runtime.pd.prefill_executor as prefill_module
 
     layout = _layout()
     destination = _destination_transfer_info(layout)
+    spec_candidate_ids = [42, 43, 44, 45]
     calls = []
 
     class _Sender:
@@ -235,6 +236,7 @@ def test_prefill_submits_manifest_through_legacy_sender() -> None:
         transfer_infos={9: {destination.mooncake_session_id: destination}}
     )
     executor._request_token = {"request-0": 42}
+    executor._request_spec_candidate_ids = {"request-0": spec_candidate_ids}
 
     executor._cache_decode(_op())
 
@@ -243,8 +245,26 @@ def test_prefill_submits_manifest_through_legacy_sender() -> None:
     assert args[0].tolist() == [2, 3, 6]
     assert args[1:] == (7, True)
     assert kwargs["bootstrap_token"] == 42
+    assert kwargs["spec_candidate_ids"] == spec_candidate_ids
     assert kwargs["page_manifest"].prompt_len == 5
     assert executor._request_token == {}
+    assert executor._request_spec_candidate_ids == {}
+
+
+def test_cache_contract_records_speculative_bootstrap_candidates() -> None:
+    import tokenspeed.runtime.pd.prefill_executor as prefill_module
+
+    executor = object.__new__(prefill_module.DisaggPrefillExecutor)
+    executor.uses_cache_contract = True
+    executor._request_token = {}
+    executor._request_spec_candidate_ids = {}
+    executor._layerwise_enabled = False
+
+    candidates = [42, 43, 44, 45]
+    executor.store_prefill_token("request-0", 7, 42, candidates)
+
+    assert executor._request_token == {"request-0": 42}
+    assert executor._request_spec_candidate_ids == {"request-0": candidates}
 
 
 def test_cache_contract_epd_abort_notifies_decode() -> None:
