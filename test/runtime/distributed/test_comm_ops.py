@@ -36,6 +36,7 @@ class TestAutoBackendTopology:
         backend._rsag = Mock()
         backend._triton_ar = Mock()
         backend._trtllm_ar = Mock()
+        backend._trtllm_ar.has_trtllm_ar.return_value = False
         return backend
 
     def test_group_spans_nodes(self, backend):
@@ -85,6 +86,7 @@ class TestAutoBackendTopology:
         backend._nccl.all_reduce.assert_called_once_with(
             tensor, tuple(range(8)), op=None
         )
+        backend._trtllm_ar.has_trtllm_ar.assert_called_once_with(tuple(range(8)))
         backend._triton_ar.can_run.assert_not_called()
 
     def test_cross_node_all_reduce_uses_trtllm_when_armed(self, backend):
