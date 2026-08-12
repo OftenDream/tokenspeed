@@ -1110,14 +1110,7 @@ def _assert_slots_visible(
     [
         pytest.param(torch.bfloat16, id="q_bf16"),
         pytest.param(torch.float8_e4m3fn, id="q_e4m3"),
-        pytest.param(
-            torch.float8_e5m2,
-            id="q_e5m2",
-            marks=pytest.mark.skipif(
-                not is_cdna4(),
-                reason="E5M2 DSA support is specific to gfx950",
-            ),
-        ),
+        pytest.param(torch.float8_e5m2, id="q_e5m2"),
     ],
 )
 def test_dsa_with_sparse_kvcache(mode: str, api, q_dtype: torch.dtype) -> None:
@@ -1186,14 +1179,7 @@ def test_dsa_with_sparse_kvcache(mode: str, api, q_dtype: torch.dtype) -> None:
     [
         pytest.param(torch.bfloat16, id="q_bf16"),
         pytest.param(torch.float8_e4m3fn, id="q_e4m3"),
-        pytest.param(
-            torch.float8_e5m2,
-            id="q_e5m2",
-            marks=pytest.mark.skipif(
-                not is_cdna4(),
-                reason="E5M2 DSA support is specific to gfx950",
-            ),
-        ),
+        pytest.param(torch.float8_e5m2, id="q_e5m2"),
     ],
 )
 @pytest.mark.parametrize(
@@ -1263,10 +1249,6 @@ def test_dsa_dense_kvcache(
     torch.testing.assert_close(out.float(), ref.float(), rtol=8e-2, atol=8e-2)
 
 
-@pytest.mark.skipif(
-    not is_cdna4(),
-    reason="dense FP8 specialization is specific to the gfx950 implementation",
-)
 @pytest.mark.parametrize(
     "api",
     [
@@ -1277,8 +1259,16 @@ def test_dsa_dense_kvcache(
 @pytest.mark.parametrize(
     ("valid_lengths", "max_seqlen_k"),
     [
-        pytest.param((0, 1, 33, 2048), 2112, id="static-full-width"),
-        pytest.param((0, 1, 31, 33), 33, id="dynamic-short-list"),
+        pytest.param(
+            (0, 1, 31, 32, 33, 63, 64, 65, 2048),
+            2112,
+            id="static-full-width",
+        ),
+        pytest.param(
+            (0, 1, 31, 32, 33, 63, 64, 65),
+            65,
+            id="dynamic-short-list",
+        ),
     ],
 )
 @pytest.mark.parametrize(
@@ -1295,7 +1285,7 @@ def test_dsa_dense_fp8_glm52_production_shape(
     fp8_dtype: torch.dtype,
 ) -> None:
     device = "cuda"
-    tokens = 4
+    tokens = len(valid_lengths)
     num_heads = 16
     num_slots = 2112
     topk = 2048
@@ -1347,6 +1337,8 @@ def test_dsa_dense_fp8_glm52_production_shape(
     )
     assert out.shape == (tokens, num_heads, kv_lora_rank)
     assert out.dtype == torch.bfloat16
+    assert torch.isfinite(out).all()
+    torch.testing.assert_close(out[0], torch.zeros_like(out[0]))
     torch.testing.assert_close(out.float(), ref.float(), rtol=8e-2, atol=8e-2)
 
 
