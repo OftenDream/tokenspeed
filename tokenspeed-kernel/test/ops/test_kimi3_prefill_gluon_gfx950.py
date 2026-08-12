@@ -15,6 +15,7 @@ if not is_cdna4():
     )
 
 
+import tokenspeed_kernel.ops.attn_res as attn_res  # noqa: E402
 from tokenspeed_kernel.ops.attn_res import attn_res_fwd  # noqa: E402
 from tokenspeed_kernel.ops.moe import moe_sigmoid_bias_topk  # noqa: E402
 from tokenspeed_kernel.ops.moe.sigmoid_topk import _gluon_eligible  # noqa: E402
@@ -77,6 +78,45 @@ def test_attn_res_public_block_major_dispatch_matches_reference() -> None:
         valid_blocks,
     )
     torch.testing.assert_close(actual, expected, rtol=5e-3, atol=1.6e-2)
+
+
+def test_attn_res_large_prefill_dispatch_boundary(monkeypatch) -> None:
+    selected = []
+    real_select = attn_res.select_kernel
+
+    def capture_selection(*args, **kwargs):
+        selected.append(real_select(*args, **kwargs).name)
+        return lambda **kwargs: None
+
+    monkeypatch.setattr(attn_res, "select_kernel", capture_selection)
+    cases = (
+        (16384, 7168, True),
+        (16385, 7168, True),
+        (65536, 7168, True),
+        (65537, 7168, True),
+        (32768, 7168, False),
+        (64, 4096, True),
+    )
+    for tokens, hidden, fuse_output_norm in cases:
+        weight = torch.empty(hidden, device="meta", dtype=torch.bfloat16)
+        layer = torch.empty(tokens, hidden, device="meta", dtype=torch.bfloat16)
+        history = torch.empty(11, tokens, hidden, device="meta", dtype=torch.bfloat16)
+        attn_res.attn_res_fwd(
+            layer,
+            history,
+            weight,
+            weight,
+            out_norm_weight=weight if fuse_output_norm else None,
+        )
+
+    assert selected == [
+        "gluon_attn_res_fwd_gfx950",
+        "gluon_attn_res_fwd_gfx950",
+        "gluon_attn_res_fwd_gfx950",
+        "torch_attn_res_fwd",
+        "torch_attn_res_fwd",
+        "torch_attn_res_fwd",
+    ]
 
 
 @pytest.mark.parametrize("tokens", [1, 17, 8192])

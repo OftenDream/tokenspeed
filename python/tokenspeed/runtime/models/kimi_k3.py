@@ -57,7 +57,6 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Iterable
-from functools import partial
 from typing import TYPE_CHECKING
 
 import torch
@@ -85,7 +84,6 @@ from tokenspeed_kernel.ops.gemm.triton_gemv import (
 )
 from tokenspeed_kernel.ops.moe import (
     latent_moe_decode_pipeline_available,
-    latent_moe_expert_shared,
     latent_moe_input_projections,
 )
 from tokenspeed_kernel.ops.moe.flashinfer.trtllm_mxfp4 import (
@@ -98,7 +96,6 @@ from tokenspeed.runtime.configs.kimi_k3_config import KimiK3Config, KimiLinearCo
 from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.distributed.comm_ops import (
     all_reduce,
-    all_reduce_two,
     prepare_all_reduce_fusion,
     prepare_all_reduce_lane,
 )
@@ -121,6 +118,7 @@ from tokenspeed.runtime.layers.moe.latent import (
     Kimi3MoEExecutionPlan,
     LatentMoELayer,
     kimi3_join_reduce_moe,
+    latent_moe_expert_shared_all_reduce,
 )
 from tokenspeed.runtime.layers.moe.loader import build_moe_checkpoint_loader
 from tokenspeed.runtime.layers.moe.schema import ExpertCheckpointSchema
@@ -1114,11 +1112,7 @@ class KimiLinearMoE(nn.Module):
                     if self.execution_plan.joint_moe_reduce
                     else self._reduce_shared
                 ),
-                joint_reduce=(
-                    partial(all_reduce_two, group=mapping.moe.ep_group)
-                    if self.execution_plan.joint_moe_reduce
-                    else None
-                ),
+                joint_reduce=self.execution_plan.joint_moe_reduce,
                 shared_expert_stream=(
                     alt_stream if self.execution_plan.overlap_shared_experts else None
                 ),
@@ -1175,7 +1169,9 @@ class KimiLinearMoE(nn.Module):
             offset += rows
 
     def _latent_input_projections(
-        self, hidden_states: torch.Tensor
+        self,
+        hidden_states: torch.Tensor,
+        shared_out: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
         """Project the router, routed latent, and shared partial in one pass.
 
@@ -1197,6 +1193,7 @@ class KimiLinearMoE(nn.Module):
         shared_output = kimi3_shared_down_projection(
             shared_input,
             self.shared_experts.down_proj.weight,
+            out=shared_out,
         )
         return router_logits, routed_input, shared_output
 
@@ -1240,8 +1237,9 @@ class KimiLinearMoE(nn.Module):
         W13 and SiTU run separately; the next launch computes routed W2 beside
         the shared down projection. One collective reduces both partials. The
         final routed up projection adds ``prefix_sum`` and the shared output in
-        its epilogue when a specialized implementation is available. Top-k and
-        the optional routed norm remain separate launches.
+        its epilogue when a specialized implementation is available. The
+        optional routed norm folds into that final projection; top-k remains
+        a separate launch.
         """
 
         router_logits, routed_input, shared_input = latent_moe_input_projections(
@@ -1253,13 +1251,7 @@ class KimiLinearMoE(nn.Module):
             up_clamp=self.shared_experts.act_fn.linear_beta,
         )
         topk_output = self.topk(hidden_states, router_logits)
-        routed_output = hidden_states.new_empty(
-            (hidden_states.shape[0], self.routed_expert_down_proj.weight.shape[0])
-        )
-        shared_output = hidden_states.new_empty(
-            (hidden_states.shape[0], self.shared_experts.down_proj.weight.shape[0])
-        )
-        routed_latent, shared_output = latent_moe_expert_shared(
+        routed_latent, shared_output = latent_moe_expert_shared_all_reduce(
             routed_input,
             self.experts.w13_weight,
             self.experts.w13_weight_scale,
@@ -1273,16 +1265,8 @@ class KimiLinearMoE(nn.Module):
             linear_clamp=self.experts.activation_situ_linear_beta,
             expert_start=self.experts.ep_rank * self.experts.num_local_experts,
             w13_interleaved=self.experts.w13_input_layout == "interleaved",
-            routed_out=routed_output,
-            shared_out=shared_output,
-        )
-        shared_output, routed_latent = all_reduce_two(
-            shared_output,
-            routed_latent,
             group=self.mapping.moe.ep_group,
         )
-        if self.routed_expert_norm is not None:
-            routed_latent = self.routed_expert_norm(routed_latent)
         return self.native_latent_moe.finalize_output(
             routed_latent,
             prefix_sum,
