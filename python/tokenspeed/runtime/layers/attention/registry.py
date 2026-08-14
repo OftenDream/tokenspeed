@@ -491,12 +491,11 @@ def _wrap_inkling_backend(
     )
 
     kernel_size = text_config.sconv_kernel_size
-    spec_tokens = max(1, int(getattr(attn_config, "speculative_num_draft_tokens", 1)))
+    spec_tokens = attn_config.speculative_num_draft_tokens
     # Ring row of absolute position p is p % R. R must keep a round's
-    # pre-chunk tap reads and chunk-row writes disjoint mod R:
-    # (W-1) history taps + K chunk rows + the draft's lookback depth
-    # (spec steps - 1 = K - 2). Uniform across target and draft.
-    ring_size = (kernel_size - 1) + spec_tokens + max(spec_tokens - 2, 0)
+    # pre-chunk tap reads and chunk-row writes disjoint mod R: (W-1) history
+    # taps + K chunk rows. Uniform across target and draft.
+    ring_size = (kernel_size - 1) + spec_tokens
     conv_pool = InklingConvStatePool(
         num_layers=num_layers,
         # Row 0 is reserved (1-based indices); +2 covers it plus a padding slot
@@ -518,7 +517,7 @@ def _wrap_inkling_backend(
         inner,
         conv_pool,
         conv_columns=conv_columns,
-        spec_num_tokens=getattr(attn_config, "speculative_num_draft_tokens", 1),
+        spec_num_tokens=spec_tokens,
         is_draft=is_draft,
         enable_layerwise_cache_ready=enable_layerwise_cache_ready,
     )
@@ -774,15 +773,6 @@ def _prepare_verify_workspace(
         )
     elif is_inkling:
         model_name = "Inkling"
-        if draft_backend is not None:
-            lookback = (
-                int(server_args.speculative_num_steps) - 1
-                if int(server_args.speculative_num_steps) > 1
-                and os.environ.get("INKLING_MTP_DECODE_LOOKBACK", "1") != "0"
-                else 0
-            )
-            if lookback and not draft_backend.configure_draft_lookback(lookback):
-                raise RuntimeError("Inkling MTP draft rejected its planned lookback")
         actual_bytes = backend.fixed_workspace_bytes()
         if draft_backend is not None:
             actual_bytes += draft_backend.fixed_workspace_bytes()
