@@ -2048,6 +2048,7 @@ def rel_mha_prefill(
     window_left: int = -1,
     return_lse: bool = False,
     softmax_scale: float | None = None,
+    tau: torch.Tensor | None = None,
     enable_pdl: bool = False,
     # dispatch options
     override: str | None = None,
@@ -2074,6 +2075,9 @@ def rel_mha_prefill(
             shape [total_q, num_q_heads].
         softmax_scale: Scale applied to QK logits before softmax. None uses the
             backend default 1/sqrt(head_dim).
+        tau: Optional fp32 per-query-row multiplier on the total pre-softmax
+            logits, ``tau * (softmax_scale * q@k^T + rel)``; shape matches
+            q's row count and values must be positive.
         enable_pdl: Launch eligible kernels with Programmatic Dependent
             Launch (Hopper+).
         override: Optional kernel override name.
@@ -2134,6 +2138,7 @@ def rel_mha_prefill(
             window_left=window_left,
             return_lse=return_lse,
             softmax_scale=softmax_scale,
+            tau=tau,
             enable_pdl=enable_pdl,
         )
 
@@ -2154,6 +2159,7 @@ def rel_mha_extend_with_kvcache(
     window_left: int = -1,
     return_lse: bool = False,
     softmax_scale: float | None = None,
+    tau: torch.Tensor | None = None,
     enable_pdl: bool = False,
     q_scale: torch.Tensor | None = None,
     k_scale: torch.Tensor | None = None,
@@ -2185,6 +2191,9 @@ def rel_mha_extend_with_kvcache(
             shape [total_q, num_q_heads].
         softmax_scale: Scale applied to QK logits before softmax. None uses the
             backend default 1/sqrt(head_dim).
+        tau: Optional fp32 per-query-row multiplier on the total pre-softmax
+            logits, ``tau * (softmax_scale * q@k^T + rel)``; shape matches
+            q's row count and values must be positive.
         enable_pdl: Launch eligible kernels with Programmatic Dependent
             Launch (Hopper+).
         override: Optional kernel override name.
@@ -2258,6 +2267,7 @@ def rel_mha_extend_with_kvcache(
             window_left=window_left,
             return_lse=return_lse,
             softmax_scale=softmax_scale,
+            tau=tau,
             enable_pdl=enable_pdl,
             **scale_kwargs,
         )
@@ -2277,6 +2287,7 @@ def rel_mha_decode_with_kvcache(
     # attention options
     window_left: int = -1,
     softmax_scale: float | None = None,
+    tau: torch.Tensor | None = None,
     enable_pdl: bool = False,
     q_scale: torch.Tensor | None = None,
     k_scale: torch.Tensor | None = None,
@@ -2308,6 +2319,9 @@ def rel_mha_decode_with_kvcache(
         window_left: Exclusive left sliding-window size. -1 means full attention.
         softmax_scale: Scale applied to QK logits before softmax. None uses the
             backend default 1/sqrt(head_dim).
+        tau: Optional fp32 per-query-row multiplier on the total pre-softmax
+            logits, ``tau * (softmax_scale * q@k^T + rel)``; shape matches
+            q's row count and values must be positive.
         enable_pdl: Launch eligible kernels with Programmatic Dependent
             Launch (Hopper+).
         override: Optional kernel override name.
@@ -2382,6 +2396,7 @@ def rel_mha_decode_with_kvcache(
             max_seqlen_q=max_seqlen_q,
             window_left=window_left,
             softmax_scale=softmax_scale,
+            tau=tau,
             enable_pdl=enable_pdl,
             **scale_kwargs,
         )
