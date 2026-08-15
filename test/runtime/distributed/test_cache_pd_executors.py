@@ -316,7 +316,7 @@ def test_decode_receiver_sends_static_registration_then_three_frame_request() ->
             cache_layout=layout,
             engine_rank=0,
         ),
-        topology=_topology(tp_size=2, tp_rank=1, global_rank=3),
+        topology=_topology(tp_size=2, tp_rank=1, global_rank=1),
         rank_port=9000,
         update_status=lambda room, status: statuses.append((room, status)),
     )
