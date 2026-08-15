@@ -32,7 +32,6 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
-from typing import Any
 
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
     CacheFieldLayout,
@@ -515,7 +514,7 @@ def build_cache_block_manifest(
         )
         if logical_slots and logical_slots[-1] >= table.shape[1]:
             raise CacheContractError(
-                f"table {spec.group_id!r} misses logical slot " f"{logical_slots[-1]}"
+                f"table {spec.group_id!r} misses logical slot {logical_slots[-1]}"
             )
         block_ids = tuple(
             int(table[request_row, logical_slot]) for logical_slot in logical_slots
@@ -619,15 +618,13 @@ def build_cache_layerwise_block_selection(
             logical_slots = (final_slots[0],) if is_final else ()
         if logical_slots and logical_slots[-1] >= table.shape[1]:
             raise CacheContractError(
-                f"table {spec.group_id!r} misses logical slot " f"{logical_slots[-1]}"
+                f"table {spec.group_id!r} misses logical slot {logical_slots[-1]}"
             )
         source_block_ids = tuple(
             int(table[request_row, logical_slot]) for logical_slot in logical_slots
         )
         group_capacity = layout.plan.group(spec.group_id).page_count
-        for logical_slot, block_id in zip[Any](
-            logical_slots, source_block_ids, strict=True
-        ):
+        for logical_slot, block_id in zip(logical_slots, source_block_ids, strict=True):
             if block_id <= 0 or block_id >= group_capacity:
                 raise CacheContractError(
                     f"table {spec.group_id!r} logical slot {logical_slot} "
