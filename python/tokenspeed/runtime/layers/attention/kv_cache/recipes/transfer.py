@@ -128,6 +128,7 @@ def _text_config(model_config: ModelConfig):
         return text_config
     return getattr(model_config.hf_config, "text_config", model_config.hf_config)
 
+
 def _source_model(
     layer_id: int,
     *,

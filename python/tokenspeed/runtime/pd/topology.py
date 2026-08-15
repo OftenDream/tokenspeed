@@ -60,9 +60,7 @@ class PDParallelTopology:
             if size <= 0:
                 raise ValueError(f"{name}_size must be greater than 0, got {size}")
             if not 0 <= rank < size:
-                raise ValueError(
-                    f"{name}_rank must be in [0, {size}), got {rank}"
-                )
+                raise ValueError(f"{name}_rank must be in [0, {size}), got {rank}")
 
         expected_world_size = self.tp_size * self.cp_size * self.dp_size
         if self.world_size != expected_world_size:
