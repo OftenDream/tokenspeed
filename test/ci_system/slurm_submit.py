@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
-from pipeline import build_matrix, normalize_task
+from pipeline import build_matrix, normalize_task, validate_gb300_runner_alias
 
 GPU_RE = re.compile(r"(?:^|-)([1-9]\d*)gpu(?:-|$)")
 TASK_TYPES = {"ut", "server_smoke", "eval", "perf"}
@@ -85,17 +85,7 @@ def load_task(
     if effective_runner is not None:
         if data["type"] == "perf":
             raise ValueError("runner aliases are not supported for perf tasks")
-        if not declared_runner.startswith("b300-") or not effective_runner.startswith(
-            "gb300-"
-        ):
-            raise ValueError("runner aliases must map b300-* to gb300-*")
-        if gpu_count(declared_runner) != gpu_count(effective_runner):
-            raise ValueError("runner alias GPU counts must match")
-        if declared_runner.removeprefix("b300-") != effective_runner.removeprefix(
-            "gb300-"
-        ):
-            raise ValueError("runner alias suffixes must match")
-        runner = effective_runner
+        runner = validate_gb300_runner_alias(declared_runner, effective_runner)
     gpus = gpu_count(runner)
     slurm = data.get("slurm", {})
     nodes = int(slurm.get("nodes", 1))
@@ -173,7 +163,7 @@ def select_tasks(args: argparse.Namespace, repo: Path) -> list[Task]:
         raise ValueError("--runner-alias requires --config")
     if not runners:
         raise ValueError("--all requires --runner")
-    matrix = build_matrix(repo / "test/ci", repo, args.trigger)
+    matrix = build_matrix(repo / "test/ci", repo, args.trigger, "all", None, "all")
     tasks = [
         load_task(repo, item["config"], item["runner"])
         for item in matrix["include"]
@@ -486,6 +476,19 @@ srun "${{srun_args[@]}}" "${{container_command[@]}}"
         "--unbuffered",
         "--kill-on-bad-exit=1",
     ]
+    image_prepare_args = [
+        "--overlap",
+        "--nodes=1",
+        "--ntasks=1",
+        "--gres=none",
+        "--unbuffered",
+        "--kill-on-bad-exit=1",
+        "--export=ALL",
+        f"--container-image={image}",
+        "--no-container-entrypoint",
+        "--no-container-mount-home",
+        "--container-remap-root",
+    ]
     server_srun = [
         "--overlap",
         "--label",
@@ -529,6 +532,7 @@ srun "${{srun_args[@]}}" "${{container_command[@]}}"
     return common + f"""
 {shell_array("prepare_args", prepare_args)}
 {shell_array("client_prepare_args", client_prepare_args)}
+{shell_array("image_prepare_args", image_prepare_args)}
 {shell_array("cleanup_args", cleanup_args)}
 
 server_src="$scratch/server-src"
@@ -542,6 +546,7 @@ server_container_mounts="$(IFS=,; printf '%s' "${{server_mounts[*]}}")"
 client_container_mounts="$(IFS=,; printf '%s' "${{client_mounts[*]}}")"
 head_node="$(scontrol show hostnames "$SLURM_JOB_NODELIST" | sed -n '1p')"
 client_prepare_args+=(--nodelist="$head_node")
+image_prepare_args+=(--nodelist="$head_node")
 
 server_step_pid=""
 client_step_pid=""
@@ -561,6 +566,10 @@ cleanup() {{
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
+
+# Import a new image digest once before every node opens the shared Enroot
+# cache. Concurrent first-use imports race on the cache's final rename.
+srun "${{image_prepare_args[@]}}" true
 
 srun "${{prepare_args[@]}}" \
   bash -c 'set -euo pipefail; mkdir -p "$1/.ci-artifacts" "$2"; tar -xf "$3" -C "$1"' \
@@ -954,7 +963,10 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--runner-alias",
         action="append",
-        help="Slurm-only declared/effective runner pair: b300-Ngpu=gb300-Ngpu.",
+        help=(
+            "Slurm-only declared/effective runner pair: "
+            "[slurm-]b300-Ngpu=[slurm-]gb300-Ngpu."
+        ),
     )
     parser.add_argument(
         "--type", dest="task_types", action="append", choices=sorted(TASK_TYPES)
