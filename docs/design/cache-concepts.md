@@ -147,11 +147,12 @@ Consumers outside the cache layer treat the ids as opaque.
 Logical width does not imply dense physical residency. Full-history KV and
 retained sliding-window rows materialize every block their kernels read, but a
 full-history snapshot-state prefill needs only its input checkpoint, final
-output checkpoint, and decode/overlap reservations. Its table therefore keeps
-absolute slot positions while representing skipped intermediate checkpoints as
-null holes (`0`). State consumers may gather only the declared input/output
-slots; compacting the row or publishing an unwritten intermediate checkpoint
-would break position identity.
+output checkpoint. The next decode admission allocates its destination after
+prefill scheduling and rolls the expired input page forward, including under
+overlap scheduling. Its table therefore keeps absolute slot positions while
+representing skipped intermediate checkpoints as null holes (`0`). State
+consumers may gather only the declared input/output slots; compacting the row or
+publishing an unwritten intermediate checkpoint would break position identity.
 
 ### Python runtime: maps logical to physical, perceives as little as possible
 
