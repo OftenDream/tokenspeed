@@ -43,6 +43,7 @@ class Task:
     runner: str
     gpus: int
     nodes: int = 1
+    declared_runner: str | None = None
 
 
 @dataclass(frozen=True)
@@ -59,7 +60,12 @@ def gpu_count(runner: str) -> int:
     return int(matches[0])
 
 
-def load_task(repo: Path, config: str, runner: str | None = None) -> Task:
+def load_task(
+    repo: Path,
+    config: str,
+    runner: str | None = None,
+    effective_runner: str | None = None,
+) -> Task:
     path = (repo / config).resolve()
     try:
         relative = path.relative_to(repo).as_posix()
@@ -75,6 +81,21 @@ def load_task(repo: Path, config: str, runner: str | None = None) -> Task:
         runner = labels[0]
     if runner not in labels:
         raise ValueError(f"{runner!r} is not declared by {relative}")
+    declared_runner = runner
+    if effective_runner is not None:
+        if data["type"] == "perf":
+            raise ValueError("runner aliases are not supported for perf tasks")
+        if not declared_runner.startswith("b300-") or not effective_runner.startswith(
+            "gb300-"
+        ):
+            raise ValueError("runner aliases must map b300-* to gb300-*")
+        if gpu_count(declared_runner) != gpu_count(effective_runner):
+            raise ValueError("runner alias GPU counts must match")
+        if declared_runner.removeprefix("b300-") != effective_runner.removeprefix(
+            "gb300-"
+        ):
+            raise ValueError("runner alias suffixes must match")
+        runner = effective_runner
     gpus = gpu_count(runner)
     slurm = data.get("slurm", {})
     nodes = int(slurm.get("nodes", 1))
@@ -84,7 +105,22 @@ def load_task(repo: Path, config: str, runner: str | None = None) -> Task:
             f"{relative}: slurm.gpus_per_node={gpus_per_node} does not match "
             f"runner {runner!r} ({gpus} GPUs)"
         )
-    return Task(relative, str(data["name"]), str(data["type"]), runner, gpus, nodes)
+    return Task(
+        relative,
+        str(data["name"]),
+        str(data["type"]),
+        runner,
+        gpus,
+        nodes,
+        declared_runner if effective_runner is not None else None,
+    )
+
+
+def parse_runner_alias(value: str) -> tuple[str, str]:
+    declared, separator, effective = value.partition("=")
+    if not separator or not declared or not effective:
+        raise ValueError("--runner-alias must be DECLARED=EFFECTIVE")
+    return declared, effective
 
 
 def task_matches(repo: Path, task: Task, patterns: list[str]) -> bool:
@@ -101,6 +137,7 @@ def task_matches(repo: Path, task: Task, patterns: list[str]) -> bool:
 
 def select_tasks(args: argparse.Namespace, repo: Path) -> list[Task]:
     runners = args.runner or []
+    runner_aliases = getattr(args, "runner_alias", None) or []
     task_types = set(args.task_types or DEFAULT_TASK_TYPES)
     patterns = args.match or []
     excluded_patterns = getattr(args, "exclude_match", None) or []
@@ -111,11 +148,19 @@ def select_tasks(args: argparse.Namespace, repo: Path) -> list[Task]:
         )
 
     if args.config:
-        tasks = (
-            [load_task(repo, args.config, runner) for runner in runners]
-            if runners
-            else [load_task(repo, args.config)]
-        )
+        if runners and runner_aliases:
+            raise ValueError("--runner and --runner-alias cannot be combined")
+        if runner_aliases:
+            tasks = [
+                load_task(repo, args.config, *parse_runner_alias(value))
+                for value in runner_aliases
+            ]
+        else:
+            tasks = (
+                [load_task(repo, args.config, runner) for runner in runners]
+                if runners
+                else [load_task(repo, args.config)]
+            )
         tasks = [
             task
             for task in tasks
@@ -124,6 +169,8 @@ def select_tasks(args: argparse.Namespace, repo: Path) -> list[Task]:
         if not tasks:
             raise ValueError("the selected config does not match the task filters")
         return tasks
+    if runner_aliases:
+        raise ValueError("--runner-alias requires --config")
     if not runners:
         raise ValueError("--all requires --runner")
     matrix = build_matrix(repo / "test/ci", repo, args.trigger)
@@ -281,11 +328,13 @@ def render_script(
         "test/ci_system/pipeline.py",
         "execute",
         f"--config={task.config}",
-        f"--runner={task.runner}",
+        f"--runner={task.declared_runner or task.runner}",
         "--work-dir=/workspace",
         "--setup-mode=slurm",
         "--print-plan",
     ]
+    if task.declared_runner is not None:
+        pipeline.append(f"--runner-override={task.runner}")
     bootstrap = (
         'export LD_LIBRARY_PATH="/opt/tokenspeed-cuda-runtime'
         '${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"; '
@@ -310,6 +359,45 @@ def render_script(
         "SLURM_STEP_ID,SLURM_STEP_NUM_NODES,SLURM_STEP_NODELIST,SLURM_NODEID,"
         "SLURM_PROCID,SLURM_LOCALID",
     ]
+    gpu_device_mounts = ""
+    if task.runner.startswith(("gb300-", "slurm-gb300-")):
+        gpu_device_mounts = r"""
+# The GB300 Pyxis hook does not expose allocated device nodes.
+gpu_ids="${SLURM_JOB_GPUS:-${CUDA_VISIBLE_DEVICES:-}}"
+IFS=',' read -ra visible_gpus <<< "$gpu_ids"
+mounted_gpu_count=0
+for token in "${visible_gpus[@]}"; do
+  if [[ "$token" =~ ^[0-9]+$ ]]; then
+    first_gpu=$((10#$token))
+    last_gpu=$first_gpu
+  elif [[ "$token" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+    first_gpu=$((10#${BASH_REMATCH[1]}))
+    last_gpu=$((10#${BASH_REMATCH[2]}))
+  else
+    continue
+  fi
+  for ((gpu = first_gpu; gpu <= last_gpu; gpu++)); do
+    device="/dev/nvidia$gpu"
+    if [ -e "$device" ]; then
+      gpu_mounts+=("$device:$device")
+      mounted_gpu_count=$((mounted_gpu_count + 1))
+    fi
+  done
+done
+if ((mounted_gpu_count == 0)); then
+  echo "No NVIDIA device nodes matched Slurm GPU allocation: ${gpu_ids:-<unset>}" >&2
+  exit 2
+fi
+for device in \
+  /dev/nvidiactl \
+  /dev/nvidia-uvm \
+  /dev/nvidia-uvm-tools \
+  /dev/nvidia-nvswitchctl \
+  /dev/nvidia-caps \
+  /dev/nvidia-caps-imex-channels; do
+  [ ! -e "$device" ] || gpu_mounts+=("$device:$device")
+done
+"""
     common = f"""#!/usr/bin/env bash
 set -euo pipefail
 
@@ -330,8 +418,11 @@ mounts=(
   "$run:/workspace/.ci-artifacts"
   {shlex.quote(str(cache) + ":/home/runner/.cache")}
 )
+gpu_mounts=()
 
-# This cluster's Pyxis hook exposes devices but omits driver libraries/tools.
+{gpu_device_mounts}
+
+# The cluster Pyxis hooks omit driver libraries and tools.
 driver_dir=""
 for lib in libcuda.so.1 libnvidia-ml.so.1 libnvidia-ptxjitcompiler.so.1 libnvidia-nvvm.so.4; do
   link="$(ldconfig -p 2>/dev/null | awk -v name="$lib" \
@@ -370,7 +461,7 @@ nvidia_smi="$(command -v nvidia-smi 2>/dev/null || true)"
 trap 'rm -rf -- "$scratch"' EXIT
 mkdir -p "$src/.ci-artifacts" "$tmp"
 tar -xf "$source_archive" -C "$src"
-mounts=("$src:/workspace" "$tmp:/tmp" "${{mounts[@]}}")
+mounts=("$src:/workspace" "$tmp:/tmp" "${{gpu_mounts[@]}}" "${{mounts[@]}}")
 container_mounts="$(IFS=,; printf '%s' "${{mounts[*]}}")"
 {shell_array("srun_args", srun)}
 srun_args+=(--container-mounts="$container_mounts")
@@ -444,7 +535,8 @@ server_src="$scratch/server-src"
 client_src="$scratch/client-src"
 server_tmp="$scratch/server-tmp"
 client_tmp="$scratch/client-tmp"
-server_mounts=("$server_src:/workspace" "$server_tmp:/tmp" "${{mounts[@]}}")
+# Full-node server allocations use the same GPU device IDs on every node.
+server_mounts=("$server_src:/workspace" "$server_tmp:/tmp" "${{gpu_mounts[@]}}" "${{mounts[@]}}")
 client_mounts=("$client_src:/workspace" "$client_tmp:/tmp" "${{mounts[@]}}")
 server_container_mounts="$(IFS=,; printf '%s' "${{server_mounts[*]}}")"
 client_container_mounts="$(IFS=,; printf '%s' "${{client_mounts[*]}}")"
@@ -638,10 +730,11 @@ def print_progress(
 ) -> None:
     print(f"\nSlurm progress ({time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())})")
     for submission in submissions:
-        state = states.get(
-            submission.job_id,
-            {"state": "UNKNOWN", "elapsed": "", "reason": ""},
-        )
+        state = states.get(submission.job_id) or {
+            "state": "UNKNOWN",
+            "elapsed": "",
+            "reason": "",
+        }
         status = {
             "COMPLETED": "PASS",
             "FAILED": "FAIL",
@@ -752,7 +845,16 @@ def write_report(
         detail = result_detail(result_path)
         row = {
             "job_id": submission.job_id,
-            "task": submission.task.__dict__,
+            "task": {
+                # Keep the public report schema stable; declared_runner is
+                # internal selection metadata for an effective alias.
+                "config": submission.task.config,
+                "name": submission.task.name,
+                "task_type": submission.task.task_type,
+                "runner": submission.task.runner,
+                "gpus": submission.task.gpus,
+                "nodes": submission.task.nodes,
+            },
             "log": str(submission.log),
             "result": str(result_path),
             **state,
@@ -849,6 +951,11 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     source.add_argument("--config")
     source.add_argument("--all", action="store_true")
     parser.add_argument("--runner", action="append")
+    parser.add_argument(
+        "--runner-alias",
+        action="append",
+        help="Slurm-only declared/effective runner pair: b300-Ngpu=gb300-Ngpu.",
+    )
     parser.add_argument(
         "--type", dest="task_types", action="append", choices=sorted(TASK_TYPES)
     )

@@ -106,16 +106,35 @@ def test_amd_runner_prefixes_cover_legacy_and_arc_labels():
 
 def test_nvidia_runner_groups_split_arm_from_x86():
     assert is_nvidia_arm_runner("gb200-1gpu")
+    assert is_nvidia_arm_runner("gb300-4gpu")
     assert not is_nvidia_arm_runner("b200-1gpu")
     assert not is_nvidia_arm_runner("amd-mi35x-1gpu-test")
 
     assert runner_matches_group("gb200-1gpu", "nvidia")
     assert runner_matches_group("gb200-1gpu", "nvidia-arm")
     assert not runner_matches_group("gb200-1gpu", "nvidia-x86")
+    assert runner_matches_group("gb300-4gpu", "nvidia")
+    assert runner_matches_group("gb300-4gpu", "nvidia-arm")
+    assert not runner_matches_group("gb300-4gpu", "nvidia-x86")
     assert runner_matches_group("b200-1gpu", "nvidia-x86")
     assert runner_matches_group("b300-4gpu", "nvidia-x86")
     assert not runner_matches_group("amd-mi35x-1gpu-test", "nvidia-arm")
     assert not runner_matches_group("amd-mi35x-1gpu-test", "nvidia-x86")
+
+
+def test_slurm_runner_override_is_narrow_and_gpu_counted():
+    assert (
+        pipeline.apply_slurm_runner_override("b300-1gpu", "gb300-1gpu", "slurm", "ut")
+        == "gb300-1gpu"
+    )
+    with pytest.raises(ValueError, match="GPU counts"):
+        pipeline.apply_slurm_runner_override("b300-4gpu", "gb300-1gpu", "slurm", "ut")
+    with pytest.raises(ValueError, match="b300"):
+        pipeline.apply_slurm_runner_override("b200-1gpu", "gb300-1gpu", "slurm", "ut")
+    with pytest.raises(ValueError, match="setup-mode"):
+        pipeline.apply_slurm_runner_override("b300-1gpu", "gb300-1gpu", "ci", "ut")
+    with pytest.raises(ValueError, match="perf"):
+        pipeline.apply_slurm_runner_override("b300-4gpu", "gb300-4gpu", "slurm", "perf")
 
 
 def test_nvidia_gpu_cleanup_runner_prefixes_cover_gb200_and_b300():
@@ -123,10 +142,12 @@ def test_nvidia_gpu_cleanup_runner_prefixes_cover_gb200_and_b300():
     assert is_gb200_runner("gb200-4gpu-perf")
     assert is_gb200_runner("slurm-gb200-4node-4gpu")
     assert not is_gb200_runner("b300-4gpu")
+    assert not is_gb200_runner("gb300-4gpu")
 
     assert should_run_nvidia_gpu_cleanup("gb200-1gpu")
     assert should_run_nvidia_gpu_cleanup("gb200-4gpu-perf")
     assert should_run_nvidia_gpu_cleanup("b300-4gpu")
+    assert not should_run_nvidia_gpu_cleanup("gb300-4gpu")
     assert not should_run_nvidia_gpu_cleanup("b200-4gpu")
     assert not should_run_nvidia_gpu_cleanup("h100-1gpu")
     assert not should_run_nvidia_gpu_cleanup("amd-mi35x-2gpu-test")

@@ -111,13 +111,12 @@ for fork PRs where repository variables are unavailable. To temporarily remove
 additional unavailable GPU runners from PR test matrices, set the
 `TOKENSPEED_CI_EXCLUDED_RUNNER_LABELS` repository variable to comma-separated,
 case-insensitive substrings such as `gb200, mi355`. Matching uses the resolved
-runner label after applying `TOKENSPEED_B200_RUNNER_LABEL`; the built-in `b300`
-baseline therefore matches both `b300-*` and `gb300-*`, while `mi355` matches
-`amd-mi355-*`. Empty entries are ignored. If every runner in a workflow group
-is excluded, its matrix job is skipped while the workflow still finishes.
-This variable applies only to the three PR test workflows. Clear or unset it to
-restore all runner labels except the NVIDIA workflow's `h100` and `b300`
-baselines.
+runner label after applying `TOKENSPEED_B200_RUNNER_LABEL`; `mi355` therefore
+matches `amd-mi355-*`. Empty entries are ignored. If every runner in a workflow
+group is excluded, its matrix job is skipped while the workflow still
+finishes. This variable applies only to the three PR test workflows. Clear or
+unset it to restore all runner labels except the NVIDIA workflow's `h100` and
+`b300` baselines.
 
 The CI system derives `SM` from common runner label prefixes by default:
 `h100`/`h200` use `sm90`, `b200`/`gb200` use `sm100`, and `b300`/`gb300` use
@@ -126,7 +125,8 @@ override or extend the defaults for a single runner label.
 
 PR workflows split runner labels by vendor and host architecture. `PR Test
 NVIDIA` uses the `nvidia-x86` runner group, while `PR Test NVIDIA ARM` uses
-the `nvidia-arm` runner group for `gb200` labels.
+the `nvidia-arm` runner group. GB300 is classified as NVIDIA ARM, but is not
+declared in task YAMLs and therefore does not enter default CI matrices.
 
 ## Slurm with Pyxis/Enroot
 
@@ -224,8 +224,31 @@ python3 test/ci_system/slurm_submit.py \
 matching tasks are submitted before `--follow` starts, so their Slurm jobs can
 run concurrently.
 
-On the GB200 Slurm coordinator, use the shell launcher for manual scheduling.
-It supplies the cluster's shared artifact/cache paths and pinned runner image:
+On a Slurm coordinator, use the shell launcher for manual scheduling. It
+supplies the cluster's shared artifact/cache paths and pinned runner image.
+The defaults target GB200; on GB300 set the shared paths under
+`/data/home/$USER`:
+
+```bash
+TS_CI_ARTIFACT_ROOT=/data/home/$USER/tokenspeed-slurm \
+TS_CI_CACHE_DIR=/data/home/$USER/tokenspeed-cache \
+test/ci/run_slurm.sh \
+  test/ci/ut/ut-tokenspeed-kernel.yaml \
+  --runner-alias b300-1gpu=gb300-1gpu \
+  --type ut \
+  --wait
+```
+
+The `Slurm Dispatch` workflow exposes a `cluster` input. `gb200` keeps the
+existing `slurm-dispatch` coordinator and runner defaults. `gb300` is an
+explicit opt-in: select one YAML, then the workflow maps its single declared
+`b300-Ngpu` label to `gb300-Ngpu` (or validates one explicit `gb300-*` runner).
+GB300 labels are not added to task YAMLs or default CI matrices. Registering
+the separate `slurm-dispatch-gb300` coordinator is an infrastructure
+prerequisite. GB300 perf tasks are disabled until GB300-specific reference
+values are measured.
+
+GB200 examples:
 
 ```bash
 # One existing YAML:
