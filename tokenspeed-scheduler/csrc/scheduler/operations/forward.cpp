@@ -64,6 +64,20 @@ std::vector<GroupDemand> makeGroupDemands(std::vector<BlockTable>& tables, Group
     return demands;
 }
 
+void makeSnapshotStatePrefillSparse(std::span<GroupDemand> demands, std::span<const CacheGroupConfig> cache_groups,
+                                    const CacheCoordinator& coordinator, std::int32_t after_tokens) {
+    _assert(demands.size() == cache_groups.size(), "demands/cache groups size mismatch");
+    _assert(after_tokens > 0, "snapshot-state prefill requires a positive endpoint");
+    for (std::size_t i = 0; i < demands.size(); ++i) {
+        if (!cache_groups[i].IsSnapshotStateGroup()) {
+            continue;
+        }
+        const std::int32_t block_granularity = coordinator.GroupBlockGranularity(static_cast<std::int32_t>(i));
+        demands[i].num_tokens = after_tokens;
+        demands[i].materialized_suffix_start = (after_tokens - 1) / block_granularity;
+    }
+}
+
 void appendCompletedPrefixHashes(std::vector<std::string>& prefix_hashes,
                                  const std::vector<std::span<const std::int32_t>>& prefix_pages,
                                  std::int32_t filled_prefix_pages) {
@@ -275,13 +289,16 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
 
     const bool completes_prefill = tokens_this_round == unscheduled;
     const std::int32_t decode_reserve = completes_prefill ? decode_input_tokens : 0;
-    std::vector<BlockTable> tables(static_cast<std::size_t>(coordinator_.NumGroups()));
-    std::vector<GroupDemand> demands =
-        makeGroupDemands(tables, GroupDemand{.num_tokens = tokens_this_round, .reserve_tokens = decode_reserve});
-
     const fsm::PrefillSource source = config_.role == Role::kD && request->Is<fsm::Submitted>()
                                           ? fsm::PrefillSource::kRemote
                                           : fsm::PrefillSource::kLocal;
+    std::vector<BlockTable> tables(static_cast<std::size_t>(coordinator_.NumGroups()));
+    std::vector<GroupDemand> demands =
+        makeGroupDemands(tables, GroupDemand{.num_tokens = tokens_this_round, .reserve_tokens = decode_reserve});
+    if (source == fsm::PrefillSource::kLocal) {
+        makeSnapshotStatePrefillSparse(demands, config_.cache_groups, coordinator_, hit_tokens + tokens_this_round);
+    }
+
     if (config_.enable_pd_cache && source == fsm::PrefillSource::kRemote) {
         for (std::size_t i = 0; i < demands.size(); ++i) {
             const CacheGroupConfig& group = config_.cache_groups[i];
@@ -298,7 +315,6 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
             }
         }
     }
-
     std::vector<CacheKey> event_keys = registerKvEventPrefixPages(*request, match.candidate_prefix_hashes, 0);
     std::optional<CacheCoordinator::AdmissionResult> admission = admit(context, std::move(match.probe), demands);
     if (!admission) {
@@ -363,6 +379,9 @@ std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
                                      .num_computed_tokens = num_computed_tokens,
                                      .reserve_tokens = decode_reserve,
                                  });
+    if (request->PrefillSource() == fsm::PrefillSource::kLocal) {
+        makeSnapshotStatePrefillSparse(demands, config_.cache_groups, coordinator_, first_pos + tokens_this_round);
+    }
     if (!admitWithKvEventTracking(context, *request, cache_progress, completed.first_new_prefix_page, demands)) {
         context.capacity_blocker = request->Id();
         return std::nullopt;

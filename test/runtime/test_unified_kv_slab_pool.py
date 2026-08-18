@@ -468,8 +468,8 @@ class MLAPoolAllocationHookTest(unittest.TestCase):
 class StateCacheGroupPageCountTest(unittest.TestCase):
     """compute_cache_group_page_counts: the family="state" branch is
     positive and bounded by the full-history formula for the same inputs
-    (state rows keep <= 2 live pages per request -- the W=2 write window --
-    and snapshots are bounded by the shared page-id space).
+    (sparse state prefill keeps input/output checkpoints plus decode and
+    overlap reservations, independent of the prefill chunk width).
     The direct-loaded module still imports ceil_div from the real package
     at call time, so this skips on a bare interpreter.
     """
@@ -501,12 +501,12 @@ class StateCacheGroupPageCountTest(unittest.TestCase):
         self.assertGreater(counts["linear_attention"], 0)
         self.assertLessEqual(counts["linear_attention"], counts["full_attention"])
 
-    def test_state_branch_departs_from_full_history_formula(self):
-        # B=0 with a non-page-multiple T distinguishes the state branch
-        # (floor(T/P) + 0 live) from the full-history one (ceil(T/P) + B):
-        # 1000/16 -> state 62+1=63 < full 63+1=64.
-        counts = self._counts(max_live_requests=0, max_total_tokens=1000)
-        self.assertLess(counts["linear_attention"], counts["full_attention"])
+    def test_state_branch_is_independent_of_chunk_and_total_token_width(self):
+        small = self._counts(max_scheduled_tokens=16, max_total_tokens=128)
+        large = self._counts(max_scheduled_tokens=4096, max_total_tokens=1 << 20)
+        self.assertEqual(small["linear_attention"], large["linear_attention"])
+        # R=2: two input/output blocks + one decode reservation each + dummy.
+        self.assertEqual(small["linear_attention"], 2 * 2 + 2 + 1)
 
 
 class CachePoolFieldBindingTest(unittest.TestCase):
