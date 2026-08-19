@@ -119,7 +119,18 @@ std::int64_t Scheduler::singleRequestLcmBlocksRequired(std::int32_t token_limit)
     std::vector<std::int64_t> group_pages(static_cast<std::size_t>(coordinator_.NumGroups()));
     for (std::int32_t i = 0; i < coordinator_.NumGroups(); ++i) {
         const std::int64_t block_granularity = coordinator_.GroupBlockGranularity(i);
+        const CacheGroupConfig& group = config_.cache_groups[static_cast<std::size_t>(i)];
         const auto local_prefill_peak = [&] {
+            if (group.IsSnapshotStateGroup()) {
+                if (max_prompt_tokens == 0) {
+                    return ceilDiv(decode_width + protected_tokens, block_granularity);
+                }
+                const std::int64_t output_and_reservations =
+                    1 + ceilDiv(decode_width + protected_tokens, block_granularity);
+                const std::int64_t input_lookback =
+                    max_prompt_tokens > chunk_tokens ? coordinator_.GroupBoundaryLookbackPages(i) : 0;
+                return input_lookback + output_and_reservations;
+            }
             // Across every prompt up to max_prompt_tokens, retain the largest
             // resident window seen by either the first chunk or a later chunk.
             const std::int64_t first_prompt = std::min(max_prompt_tokens, chunk_tokens);
@@ -137,7 +148,6 @@ std::int64_t Scheduler::singleRequestLcmBlocksRequired(std::int32_t token_limit)
         if (coordinator_.GroupIsPrefixClosed(i)) {
             child_pages = ceilDiv(static_cast<std::int64_t>(token_limit) + protected_tokens, block_granularity);
         } else if (config_.role == Role::kD) {
-            const CacheGroupConfig& group = config_.cache_groups[static_cast<std::size_t>(i)];
             const bool latest_snapshot =
                 config_.enable_pd_cache && group.transfer_policy == CacheTransferPolicy::LatestSnapshot;
             if (latest_snapshot) {

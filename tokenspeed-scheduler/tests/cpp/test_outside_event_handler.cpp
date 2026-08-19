@@ -688,11 +688,10 @@ protected:
 };
 
 TEST_F(PdLocalRecoveryCapacityTestSuite, SingleRequestCapacityIncludesLocalRecoveryWorkingSet) {
-    // Full KV uses ceil(tokens / 4) parents. A local-recovery chunk peaks at
-    // five State parents: one lookback plus four pages for an eight-token
-    // chunk, including the final decode reservation where applicable.
-    // Eight usable parents therefore admit at most 12 total tokens.
-    EXPECT_EQ(scheduler_->MaxSingleRequestTokens(), 12);
+    // Full KV uses ceil(tokens / 4) parents. Sparse local recovery needs three
+    // State parents: input checkpoint, final output, and decode reservation.
+    // Eight usable parents therefore admit at most 20 total tokens.
+    EXPECT_EQ(scheduler_->MaxSingleRequestTokens(), 20);
 }
 
 TEST_F(PdSparseDecodeAdmissionTestSuite, MaterializesHistoryAndLatestStateSnapshotAtomically) {

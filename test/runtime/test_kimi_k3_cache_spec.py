@@ -82,14 +82,38 @@ def test_lcm_geometry_packs_two_kda_pages_at_tp16() -> None:
 def test_lcm_parent_demand_uses_per_group_packing() -> None:
     recipe, _, layout = kimi_tp8_layout(max_bs=1, max_scheduled_tokens=8_192)
 
-    # 131_072 tokens at this concurrency needs exactly 284 parents; the search
-    # inverts that demand -- what 284 parents admit needs no more than 284,
+    # Sparse state prefill needs one input, one output, and one decode-reserve
+    # block per KDA group, independent of the 8K chunk width.
+    # The search inverts that demand -- what 95 parents admit needs no more,
     # and one parent fewer admits strictly less.
-    assert recipe.parents_needed(layout, 131_072) == 284
-    admitted = recipe.token_capacity(layout, 284)
+    assert recipe.parents_needed(layout, 131_072) == 95
+    admitted = recipe.token_capacity(layout, 95)
     assert admitted >= 131_072
-    assert recipe.parents_needed(layout, admitted) <= 284
-    assert recipe.token_capacity(layout, 283) < admitted
+    assert recipe.parents_needed(layout, admitted) <= 95
+    assert recipe.token_capacity(layout, 94) < admitted
+
+
+def test_sparse_state_parent_demand_tracks_decode_and_overlap_width() -> None:
+    baseline, _, layout = kimi_tp8_layout(
+        max_bs=3,
+        max_scheduled_tokens=8_192,
+        decode_input_tokens=128,
+        overlap_schedule_depth=0,
+    )
+    overlapped, _, _ = kimi_tp8_layout(
+        max_bs=3,
+        max_scheduled_tokens=8_192,
+        decode_input_tokens=128,
+        overlap_schedule_depth=1,
+    )
+
+    # Three KDA groups with packing 1: overlap protects one extra state block
+    # per live request in every group.
+    assert (
+        overlapped.parents_needed(layout, 131_072)
+        - baseline.parents_needed(layout, 131_072)
+        == 3 * 3
+    )
 
 
 def test_k3_merged_solve_with_draft_shares_page_ids():

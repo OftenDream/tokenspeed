@@ -144,6 +144,15 @@ entry *values*, however, are **`CacheBlock` ids** — handles to the physical
 storage the cache layer allocated. The scheduler owns allocation, so its output names that storage directly.
 Consumers outside the cache layer treat the ids as opaque.
 
+Logical width does not imply dense physical residency. Full-history KV and
+retained sliding-window rows materialize every block their kernels read, but a
+full-history snapshot-state prefill needs only its input checkpoint, final
+output checkpoint, and decode/overlap reservations. Its table therefore keeps
+absolute slot positions while representing skipped intermediate checkpoints as
+null holes (`0`). State consumers may gather only the declared input/output
+slots; compacting the row or publishing an unwritten intermediate checkpoint
+would break position identity.
+
 ### Python runtime: maps logical to physical, perceives as little as possible
 
 The Python side owns the translation from the scheduler's cache-block tables

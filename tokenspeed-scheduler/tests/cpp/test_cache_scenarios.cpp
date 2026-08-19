@@ -192,6 +192,37 @@ TEST_F(MambaChunkAlignmentSuite, PartialPrefillEndsAtStatePageBoundary) {
     }
 }
 
+class MambaSparsePrefillSuite : public MambaChunkAlignmentSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = MambaChunkAlignmentSuite::MakeConfig();
+        cfg.max_scheduled_tokens = 12;
+        return cfg;
+    }
+};
+
+TEST_F(MambaSparsePrefillSuite, LongLocalChunkMaterializesOnlyStateOutputAndDecodeReserve) {
+    Submit(MakeRequestSpec("r1", /*num_pages=*/3));  // 12 tokens
+
+    ExecutionPlan plan = PlanOnce();
+    const ForwardBatch* op = FindForwardBatch(plan);
+    ASSERT_NE(op, nullptr);
+    ASSERT_EQ(op->input_lengths, std::vector<std::int32_t>{12});
+
+    EXPECT_EQ(RealPages(op->block_tables.at("full")).size(), 4u);
+
+    const auto& state = op->block_tables.at("state").at(0);
+    ASSERT_EQ(state.size(), 4u);
+    EXPECT_EQ(state[0], 0);
+    EXPECT_EQ(state[1], 0);
+    EXPECT_GT(state[2], 0);  // final prefill checkpoint
+    EXPECT_GT(state[3], 0);  // first decode reservation
+    EXPECT_EQ(RealPages(op->block_tables.at("state")).size(), 2u);
+
+    ASSERT_EQ(plan.pages_to_zero.count("state"), 1u);
+    EXPECT_EQ(plan.pages_to_zero.at("state").size(), 2u);
+}
+
 class MambaMixedBudgetSuite : public MambaChunkAlignmentSuite {
 protected:
     SchedulerConfig MakeConfig() override {
