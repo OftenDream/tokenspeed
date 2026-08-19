@@ -79,6 +79,38 @@ def test_lcm_geometry_packs_two_kda_pages_at_tp16() -> None:
     assert conv.shape[0] == 3 * 96 * 128 // 16
 
 
+def test_speculative_verify_workspace_is_reserved_outside_the_arena() -> None:
+    recipe, _, layout = kimi_tp8_layout(
+        draft_layers=5,
+        max_bs=4,
+        speculative_algorithm="DSPARK",
+        speculative_num_draft_tokens=8,
+    )
+
+    # Four requests, each with one committed seed row and eight candidate rows,
+    # across all 69 target KDA layers.
+    expected_workspace_bytes = 2_022_174_720
+    assert recipe.workspace_bytes() == expected_workspace_bytes
+
+    setup = recipe.setup()
+    assert setup.fixed_workspace_bytes == expected_workspace_bytes
+    expected_parents = (
+        recipe.cache_budget_bytes - expected_workspace_bytes
+    ) // layout.lcm_block_bytes - 1
+    assert setup.spec.memory_plan.num_lcm_blocks == expected_parents
+
+
+def test_non_speculative_kimi_reserves_no_verify_workspace() -> None:
+    recipe, _, _ = kimi_tp8_layout(
+        draft_layers=5,
+        max_bs=4,
+        speculative_algorithm=None,
+        speculative_num_draft_tokens=8,
+    )
+
+    assert recipe.workspace_bytes() == 0
+
+
 def test_lcm_parent_demand_uses_per_group_packing() -> None:
     recipe, _, layout = kimi_tp8_layout(max_bs=1, max_scheduled_tokens=8_192)
 
