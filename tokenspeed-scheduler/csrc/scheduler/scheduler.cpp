@@ -122,14 +122,10 @@ std::int64_t Scheduler::singleRequestLcmBlocksRequired(std::int32_t token_limit)
         const CacheGroupConfig& group = config_.cache_groups[static_cast<std::size_t>(i)];
         const auto local_prefill_peak = [&] {
             if (group.IsSnapshotStateGroup()) {
-                if (max_prompt_tokens == 0) {
-                    return ceilDiv(decode_width + protected_tokens, block_granularity);
-                }
-                const std::int64_t output_and_reservations =
-                    1 + ceilDiv(decode_width + protected_tokens, block_granularity);
+                if (token_limit == 0) return std::int64_t{0};
                 const std::int64_t input_lookback =
                     max_prompt_tokens > chunk_tokens ? coordinator_.GroupBoundaryLookbackPages(i) : 0;
-                return input_lookback + output_and_reservations;
+                return std::max<std::int64_t>(2, input_lookback + 1);
             }
             // Across every prompt up to max_prompt_tokens, retain the largest
             // resident window seen by either the first chunk or a later chunk.
@@ -151,11 +147,7 @@ std::int64_t Scheduler::singleRequestLcmBlocksRequired(std::int32_t token_limit)
             const bool latest_snapshot =
                 config_.enable_pd_cache && group.transfer_policy == CacheTransferPolicy::LatestSnapshot;
             if (latest_snapshot) {
-                // The final prompt page may be full, so a non-zero decode
-                // reservation can span one more page than its own page count.
-                const std::int64_t reserved_tokens = decode_width + protected_tokens;
-                const std::int64_t snapshot_pages =
-                    reserved_tokens == 0 ? 1 : 1 + ceilDiv(reserved_tokens, block_granularity);
+                const std::int64_t snapshot_pages = token_limit == 0 ? 0 : 1;
                 // A retracted Decode request may recover by locally
                 // recomputing its suffix. Old State checkpoints are
                 // evictable, but one recovery chunk and its lookback must fit.

@@ -78,6 +78,16 @@ void makeSnapshotStatePrefillSparse(std::span<GroupDemand> demands, std::span<co
     }
 }
 
+void deferSnapshotStateDecodeReservation(std::span<GroupDemand> demands,
+                                         std::span<const CacheGroupConfig> cache_groups) {
+    _assert(demands.size() == cache_groups.size(), "demands/cache groups size mismatch");
+    for (std::size_t i = 0; i < demands.size(); ++i) {
+        if (cache_groups[i].IsSnapshotStateGroup()) {
+            demands[i].reserve_tokens = 0;
+        }
+    }
+}
+
 void appendCompletedPrefixHashes(std::vector<std::string>& prefix_hashes,
                                  const std::vector<std::span<const std::int32_t>>& prefix_pages,
                                  std::int32_t filled_prefix_pages) {
@@ -315,6 +325,7 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
             }
         }
     }
+    deferSnapshotStateDecodeReservation(demands, config_.cache_groups);
     std::vector<CacheKey> event_keys = registerKvEventPrefixPages(*request, match.candidate_prefix_hashes, 0);
     std::optional<CacheCoordinator::AdmissionResult> admission = admit(context, std::move(match.probe), demands);
     if (!admission) {
@@ -382,6 +393,7 @@ std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
     if (request->PrefillSource() == fsm::PrefillSource::kLocal) {
         makeSnapshotStatePrefillSparse(demands, config_.cache_groups, coordinator_, first_pos + tokens_this_round);
     }
+    deferSnapshotStateDecodeReservation(demands, config_.cache_groups);
     if (!admitWithKvEventTracking(context, *request, cache_progress, completed.first_new_prefix_page, demands)) {
         context.capacity_blocker = request->Id();
         return std::nullopt;

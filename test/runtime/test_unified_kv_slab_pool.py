@@ -468,8 +468,8 @@ class MLAPoolAllocationHookTest(unittest.TestCase):
 class StateCacheGroupPageCountTest(unittest.TestCase):
     """compute_cache_group_page_counts: the family="state" branch is
     positive and bounded by the full-history formula for the same inputs
-    (sparse state prefill keeps input/output checkpoints plus decode and
-    overlap reservations, independent of the prefill chunk width).
+    (sparse state uses two rolling checkpoints independent of overlap and
+    prefill chunk width).
     The direct-loaded module still imports ceil_div from the real package
     at call time, so this skips on a bare interpreter.
     """
@@ -505,8 +505,13 @@ class StateCacheGroupPageCountTest(unittest.TestCase):
         small = self._counts(max_scheduled_tokens=16, max_total_tokens=128)
         large = self._counts(max_scheduled_tokens=4096, max_total_tokens=1 << 20)
         self.assertEqual(small["linear_attention"], large["linear_attention"])
-        # R=2: two input/output blocks + one decode reservation each + dummy.
-        self.assertEqual(small["linear_attention"], 2 * 2 + 2 + 1)
+        # R=2: two input/output blocks each plus one allocator dummy page.
+        self.assertEqual(small["linear_attention"], 2 * 2 + 1)
+
+    def test_state_branch_is_independent_of_overlap(self):
+        baseline = self._counts(overlap_schedule_depth=0, decode_input_tokens=1)
+        overlapped = self._counts(overlap_schedule_depth=1, decode_input_tokens=1)
+        self.assertEqual(baseline["linear_attention"], overlapped["linear_attention"])
 
 
 class CachePoolFieldBindingTest(unittest.TestCase):

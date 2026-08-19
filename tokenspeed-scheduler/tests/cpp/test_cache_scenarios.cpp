@@ -201,7 +201,7 @@ protected:
     }
 };
 
-TEST_F(MambaSparsePrefillSuite, LongLocalChunkMaterializesOnlyStateOutputAndDecodeReserve) {
+TEST_F(MambaSparsePrefillSuite, LocalChunkDefersStateDecodeReservationUntilCompletion) {
     Submit(MakeRequestSpec("r1", /*num_pages=*/3));  // 12 tokens
 
     ExecutionPlan plan = PlanOnce();
@@ -212,15 +212,52 @@ TEST_F(MambaSparsePrefillSuite, LongLocalChunkMaterializesOnlyStateOutputAndDeco
     EXPECT_EQ(RealPages(op->block_tables.at("full")).size(), 4u);
 
     const auto& state = op->block_tables.at("state").at(0);
-    ASSERT_EQ(state.size(), 4u);
+    ASSERT_EQ(state.size(), 3u);
     EXPECT_EQ(state[0], 0);
     EXPECT_EQ(state[1], 0);
     EXPECT_GT(state[2], 0);  // final prefill checkpoint
-    EXPECT_GT(state[3], 0);  // first decode reservation
-    EXPECT_EQ(RealPages(op->block_tables.at("state")).size(), 2u);
+    EXPECT_EQ(RealPages(op->block_tables.at("state")).size(), 1u);
 
     ASSERT_EQ(plan.pages_to_zero.count("state"), 1u);
-    EXPECT_EQ(plan.pages_to_zero.at("state").size(), 2u);
+    EXPECT_EQ(plan.pages_to_zero.at("state").size(), 1u);
+
+    SendForwardDone("r1", {42});
+    ExecutionPlan decode_plan = PlanOnce();
+    const ForwardBatch* decode = FindForwardBatch(decode_plan);
+    ASSERT_NE(decode, nullptr);
+    const auto& decode_state = decode->block_tables.at("state").at(0);
+    ASSERT_EQ(decode_state.size(), 4u);
+    EXPECT_GT(decode_state[2], 0);
+    EXPECT_GT(decode_state[3], 0);
+    ASSERT_EQ(decode_plan.pages_to_zero.count("state"), 1u);
+    EXPECT_EQ(decode_plan.pages_to_zero.at("state").size(), 1u);
+}
+
+class MambaOverlapRollingStateSuite : public MambaSparsePrefillSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = MambaSparsePrefillSuite::MakeConfig();
+        cfg.overlap_schedule_depth = 1;
+        return cfg;
+    }
+};
+
+TEST_F(MambaOverlapRollingStateSuite, FinalPrefillUsesInputAndOutputWithoutDecodeReserve) {
+    Submit(MakeRequestSpec("r1", /*num_pages=*/4));  // 16 tokens
+
+    ASSERT_NE(FindForwardBatch(PlanOnce()), nullptr);
+    ExecutionPlan final_prefill = PlanOnce();
+    const ForwardBatch* op = FindForwardBatch(final_prefill);
+    ASSERT_NE(op, nullptr);
+    ASSERT_EQ(op->input_lengths, std::vector<std::int32_t>{4});
+
+    const auto& state = op->block_tables.at("state").at(0);
+    ASSERT_EQ(state.size(), 4u);
+    EXPECT_EQ(state[0], 0);
+    EXPECT_EQ(state[1], 0);
+    EXPECT_GT(state[2], 0);  // rolling input
+    EXPECT_GT(state[3], 0);  // final prefill output
+    EXPECT_EQ(RealPages(op->block_tables.at("state")).size(), 2u);
 }
 
 class MambaMixedBudgetSuite : public MambaChunkAlignmentSuite {

@@ -328,9 +328,6 @@ class KimiK3Recipe(CacheRecipe):
         protected_pages = max_live_requests * math.ceil(
             depth * limits["decode_input_tokens"] / page_tokens
         )
-        decode_reservation_pages = max_live_requests * math.ceil(
-            limits["decode_input_tokens"] / page_tokens
-        )
         parents = 0
         for group_id, packing in layout.group_packing:
             if group_id == FULL_ATTENTION:
@@ -341,10 +338,7 @@ class KimiK3Recipe(CacheRecipe):
                     + protected_pages
                 )
             else:
-                # Sparse state prefill keeps input/output checkpoints and the
-                # first decode destination, independent of the chunk width.
-                child_pages = (
-                    2 * max_live_requests + decode_reservation_pages + protected_pages
-                )
+                # Snapshot state rolls between two pages per live request.
+                child_pages = 2 * max_live_requests
             parents += math.ceil(child_pages / packing)
         return parents
