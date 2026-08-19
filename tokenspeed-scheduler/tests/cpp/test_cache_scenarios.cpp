@@ -1239,6 +1239,58 @@ TEST_F(CapacityBlockSuite, RetractsLargestRunningRequestImmediately) {
     EXPECT_EQ(scheduler_->PoolFreeBlocks(), 12);
 }
 
+class MambaFusedRetractionDrainSuite : public MambaSparsePrefillSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = MambaSparsePrefillSuite::MakeConfig();
+        cfg.device_allocator.total_pages = 9;
+        cfg.host_allocator.total_pages = 9;
+        cfg.max_scheduled_tokens = 64;
+        for (auto& group : cfg.cache_groups) {
+            group.total_pages = cfg.device_allocator.total_pages;
+        }
+        return cfg;
+    }
+};
+
+TEST_F(MambaFusedRetractionDrainSuite, RetractionDrainsResidentBeforeReadmittingVictim) {
+    ASSERT_EQ(scheduler_->PoolFreeBlocks(), 8);
+
+    Submit(MakeRequestSpec("a", /*num_pages=*/2));
+    Submit(MakeRequestSpec("b", /*num_pages=*/2, /*start=*/101));
+    Submit(MakeRequestSpec("c", /*num_pages=*/2, /*start=*/201));
+
+    ExecutionPlan prefill = PlanOnce();
+    const ForwardBatch* prefill_op = FindForwardBatch(prefill);
+    ASSERT_NE(prefill_op, nullptr);
+    ASSERT_EQ(prefill_op->request_ids, (std::vector<std::string>{"a", "b"}));
+    SendForwardDone("a", {42});
+    SendForwardDone("b", {142});
+
+    ExecutionPlan retract_round = PlanOnce();
+    const ForwardBatch* retract_op = FindForwardBatch(retract_round);
+    ASSERT_NE(retract_op, nullptr);
+    ASSERT_TRUE(retract_op->request_ids.empty());
+    ASSERT_EQ(scheduler_->WaitingSize(), 2u);
+    ASSERT_EQ(scheduler_->DecodingSize(), 0u);
+    ASSERT_EQ(scheduler_->PrefillSize(), 1u);
+
+    ExecutionPlan drain_round = PlanOnce();
+    const ForwardBatch* drain_op = FindForwardBatch(drain_round);
+    ASSERT_NE(drain_op, nullptr);
+    ASSERT_EQ(drain_op->request_ids, (std::vector<std::string>{"b"}))
+        << "the resident survivor must decode before the victim re-prefills";
+
+    SendForwardDone("b", {143});
+    SendFinish("b");
+    ExecutionPlan resumed_admission = PlanOnce();
+    const ForwardBatch* resumed_op = FindForwardBatch(resumed_admission);
+    ASSERT_NE(resumed_op, nullptr);
+    EXPECT_EQ(resumed_op->request_ids, (std::vector<std::string>{"a", "c"}));
+    EXPECT_EQ(resumed_op->input_lengths, (std::vector<std::int32_t>{9, 8}));
+    EXPECT_EQ(resumed_op->prefill_lengths, (std::vector<std::int32_t>{9, 8}));
+}
+
 class FusedRetractionL2TestSuite : public CapacityBlockSuite {
 protected:
     SchedulerConfig MakeConfig() override {

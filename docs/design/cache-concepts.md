@@ -409,6 +409,25 @@ from `_capacity_from_parents`, one monotonic binary search shared by all.
 `scheduler_limits` is the single place a recipe reads the scheduler's
 concurrency, so demand and capacity cannot size against different numbers.
 
+The runtime's global `max_num_seqs` is divided across attention DP ranks to
+produce each scheduler's rank-local `max_batch_size`. These values limit
+simultaneous sequence slots; they do **not** reserve enough history cache for
+that many maximum-length requests. Aggregate prompt and decode growth must
+still fit the recipe's reported token capacity. When that dynamic pool is
+overcommitted, admission can fail even though the batch still has a free
+sequence slot.
+
+For a fused scheduler without Host L2, such a failure may directly retract a
+resident request and release its Device pages. Direct retraction enters a
+capacity-drain phase: already-resident `Prefilling`, `PrefillDone`, and
+`Decoding` requests continue, while `Submitted` requests (including the
+requeued victim) cannot consume the released pages. Admission resumes
+automatically after that resident cohort finishes. This prevents an
+overcommitted workload from repeatedly rebuilding a prompt, decoding briefly,
+and retracting it again. Best-effort L2 writeback, PD Decode recovery, and
+ordinary capacity-fit continuous batching do not use this fused direct-drain
+path.
+
 ## Code placement
 
 * Prefix-matching code (prefix hashing, match/lookup, reuse boundaries) lives

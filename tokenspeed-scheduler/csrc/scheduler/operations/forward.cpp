@@ -543,6 +543,9 @@ void Scheduler::retractForCapacity(PlanBuildContext& context, const std::vector<
         return;
     }
     request_to_retract->Apply(fsm::RetractEvent{&coordinator_});
+    if (!config_.HasHostCache()) {
+        fused_capacity_drain_ = true;
+    }
     spdlog::info("[Scheduler] retract: released request {} ({} tokens) for cache capacity", request_to_retract->Id(),
                  request_to_retract->TokenSize());
 }
@@ -561,6 +564,14 @@ std::pair<std::vector<ForwardOperation>, std::vector<LoadBackOperation>> Schedul
         Request* request = findRequest(*recovery_barrier_);
         if (request == nullptr || request->Is<fsm::Finished>() || request->Is<fsm::Retracted>()) {
             recovery_barrier_.reset();
+        }
+    }
+    if (fused_capacity_drain_) {
+        const bool has_resident = std::ranges::any_of(candidates, [](const Request* request) {
+            return request->Is<fsm::Prefilling>() || request->Is<fsm::PrefillDone>() || request->Is<fsm::Decoding>();
+        });
+        if (!has_resident) {
+            fused_capacity_drain_ = false;
         }
     }
     const auto priority = [this](const Request* request) {
@@ -654,6 +665,9 @@ std::pair<std::vector<ForwardOperation>, std::vector<LoadBackOperation>> Schedul
     for (Request* request : candidates) {
         if (token_budget <= 0 || operations.size() == static_cast<std::size_t>(config_.max_batch_size)) {
             break;
+        }
+        if (fused_capacity_drain_ && request->Is<fsm::Submitted>()) {
+            continue;
         }
         if (build_prefill_handoff_batch && !request->Is<fsm::PrefillDone>()) {
             break;
