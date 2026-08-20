@@ -200,6 +200,7 @@ class CacheContractMetadataTest(unittest.TestCase):
             head_dim=128,
             is_draft=False,
             speculative_num_draft_tokens=1,
+            max_bs=8,
         )
         backend = MambaAttnBackend(config)
         stub_pool = _ContractPool(
@@ -346,6 +347,7 @@ class VerifyMetadataTest(unittest.TestCase):
             head_dim=2,
             is_draft=False,
             speculative_num_draft_tokens=4,
+            max_bs=8,
         )
         self.backend = MambaAttnBackend(config)
         self.state_buffers = {
@@ -456,6 +458,7 @@ class GDNStatePagingGPUTest(unittest.TestCase):
             is_draft=False,
             speculative_num_draft_tokens=spec_num_tokens,
             replay_ssm=replay_ssm,
+            max_bs=8,
         )
         backend = self.MambaAttnBackend(config)
         stub_pool = _ContractPool(

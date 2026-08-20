@@ -346,6 +346,7 @@ class MambaAttnBackend(AttentionBackend):
     # The hybrid wrapper unions the sub-backends' declarations, so a Kimi-K3
     # contract (history + state) is covered once both consumers exist.
     cache_consumer_families = frozenset({"state"})
+    _replay_active: bool = False
 
     def __init__(self, config: BaseAttnConfig):
         super().__init__(config)
@@ -368,6 +369,8 @@ class MambaAttnBackend(AttentionBackend):
         self.state_out_by_group: dict[str, list[torch.Tensor]] = {}
         self.replay_ssm = bool(getattr(config, "replay_ssm", False))
         self._gdn_replay: _GDNReplayWorkspace | None = None
+        self._verify_scratch = None
+        self._verify_commit_ctx = None
 
     def set_kv_pool(self, kv_pool) -> None:
         """Bind a unified pool that publishes state groups and component views."""
@@ -571,12 +574,16 @@ class MambaAttnBackend(AttentionBackend):
         if not self.state_paging_active or self.is_draft:
             return 0
         self._ensure_verify_scratch(max_bs, draft_token_num)
-        return sum(
+        total = sum(
             tensor.nbytes
             for layer_scratch in self._verify_scratch.values()
             for tensor in layer_scratch
             if tensor is not None
         )
+        if self._gdn_replay is not None:
+            total += self._gdn_replay.payload.nbytes
+            total += self._gdn_replay.parameters.nbytes
+        return total
 
     def _verify_copy_tables_get(self) -> dict:
         """Pointer tables for the batched verify state copies and replay:
@@ -1704,6 +1711,7 @@ class MambaAttnBackend(AttentionBackend):
                 ssm_scratch,
                 state_in_blocks,
                 output_indices,
+                layer_id=layer_id,
                 bias=bias,
                 f_a_out=f_a_out,
                 f_b_weight=f_b_weight,
@@ -1723,9 +1731,8 @@ class MambaAttnBackend(AttentionBackend):
             # verify scratch. The accepted position is committed afterward.
             if layer_id == self._state_layer_ids()[0]:
                 self._seed_verify_scratch_batched(batch_size, draft_token_num)
-            init_rows = output_indices[:batch_size, 0] - 1
             conv_states = conv_scratch
-            conv_read = init_rows
+            conv_read = output_indices[:batch_size, 0] - 1
             conv_out = output_indices[:batch_size]
             # shouldn't use contiguous here, because causal_conv1d_update
             # support input non-contiguous
@@ -1872,6 +1879,7 @@ class MambaAttnBackend(AttentionBackend):
         state_in_blocks: torch.Tensor,
         output_indices: torch.Tensor,
         *,
+        layer_id: int,
         bias: torch.Tensor | None,
         f_a_out: torch.Tensor | None,
         f_b_weight: torch.Tensor | None,
@@ -1905,6 +1913,7 @@ class MambaAttnBackend(AttentionBackend):
             ssm_scratch: Per-position recurrent verify scratch.
             state_in_blocks: Per-request committed-state page ids.
             output_indices: ``[bs, T]`` verify scratch row grid.
+            layer_id: Model layer whose verify payload is being processed.
             bias: Conv bias; a fused path requires the bias-free conv.
             f_a_out: Low-rank gate activation (KDA); None on GDN.
             f_b_weight: Second gate projection consumed inside the fusion.
