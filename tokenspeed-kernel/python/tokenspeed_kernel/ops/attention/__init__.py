@@ -58,7 +58,7 @@ from tokenspeed_kernel.ops.attention.triton.dsv4 import (
     dsv4_save_compressor_state,
     write_dsv4_indexer_mxfp4_cache_cuda,
 )
-from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.platform import current_platform, pdl_enabled
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.registry import KernelRegistry, Priority
 from tokenspeed_kernel.selection import (
@@ -723,7 +723,6 @@ def msa_decode_with_kvcache(
     k_scale: float | torch.Tensor | None = None,
     v_scale: float | torch.Tensor | None = None,
     score_out: torch.Tensor | None = None,
-    enable_pdl: bool = False,
     override: str | None = None,
     solution: str | None = None,
 ) -> torch.Tensor:
@@ -758,8 +757,6 @@ def msa_decode_with_kvcache(
             ``-inf`` and reused across layers; forwarded to the kernel to avoid
             a per-layer allocation + fill. Ignored by kernels that do not
             accept it or when its shape does not match.
-        enable_pdl: Request Programmatic Dependent Launch (SM90+) for the
-            indexer's index-key store; forwarded to the kernel.
         override: Optional kernel override name.
         solution: Optional kernel solution to force through normal selection.
 
@@ -841,7 +838,7 @@ def msa_decode_with_kvcache(
             k_scale=k_scale,
             v_scale=v_scale,
             score_out=score_out,
-            enable_pdl=enable_pdl,
+            enable_pdl=pdl_enabled(),
         )
 
 
@@ -2283,6 +2280,7 @@ def mha_extend_with_kvcache(
             softmax_scale=softmax_scale,
             max_seqlen_q=max_seqlen_q,
             max_seqlen_k=max_seqlen_k,
+            enable_pdl=pdl_enabled(),
             **scale_kwargs,
         )
 
@@ -2403,6 +2401,7 @@ def mha_decode_with_kvcache(
             softmax_scale=softmax_scale,
             max_seqlen_k=max_seqlen_k,
             max_seqlen_q=max_seqlen_q,
+            enable_pdl=pdl_enabled(),
             **scale_kwargs,
         )
 
@@ -2424,7 +2423,6 @@ def rel_mha_prefill(
     return_lse: bool = False,
     softmax_scale: float | None = None,
     tau: torch.Tensor | None = None,
-    enable_pdl: bool = False,
     # dispatch options
     override: str | None = None,
     solution: str | None = None,
@@ -2453,8 +2451,6 @@ def rel_mha_prefill(
         tau: Optional fp32 per-query-row multiplier on the total pre-softmax
             logits, ``tau * (softmax_scale * q@k^T + rel)``; shape matches
             q's row count and values must be positive.
-        enable_pdl: Launch eligible kernels with Programmatic Dependent
-            Launch (Hopper+).
         override: Optional kernel override name.
         solution: Optional kernel solution to force through normal selection.
 
@@ -2514,7 +2510,7 @@ def rel_mha_prefill(
             return_lse=return_lse,
             softmax_scale=softmax_scale,
             tau=tau,
-            enable_pdl=enable_pdl,
+            enable_pdl=pdl_enabled(),
         )
 
 
@@ -2535,7 +2531,6 @@ def rel_mha_extend_with_kvcache(
     return_lse: bool = False,
     softmax_scale: float | None = None,
     tau: torch.Tensor | None = None,
-    enable_pdl: bool = False,
     q_scale: torch.Tensor | None = None,
     k_scale: torch.Tensor | None = None,
     v_scale: torch.Tensor | None = None,
@@ -2569,8 +2564,6 @@ def rel_mha_extend_with_kvcache(
         tau: Optional fp32 per-query-row multiplier on the total pre-softmax
             logits, ``tau * (softmax_scale * q@k^T + rel)``; shape matches
             q's row count and values must be positive.
-        enable_pdl: Launch eligible kernels with Programmatic Dependent
-            Launch (Hopper+).
         override: Optional kernel override name.
         solution: Optional kernel solution to force through normal selection.
 
@@ -2643,7 +2636,7 @@ def rel_mha_extend_with_kvcache(
             return_lse=return_lse,
             softmax_scale=softmax_scale,
             tau=tau,
-            enable_pdl=enable_pdl,
+            enable_pdl=pdl_enabled(),
             **scale_kwargs,
         )
 
@@ -2663,7 +2656,6 @@ def rel_mha_decode_with_kvcache(
     window_left: int = -1,
     softmax_scale: float | None = None,
     tau: torch.Tensor | None = None,
-    enable_pdl: bool = False,
     q_scale: torch.Tensor | None = None,
     k_scale: torch.Tensor | None = None,
     v_scale: torch.Tensor | None = None,
@@ -2697,8 +2689,6 @@ def rel_mha_decode_with_kvcache(
         tau: Optional fp32 per-query-row multiplier on the total pre-softmax
             logits, ``tau * (softmax_scale * q@k^T + rel)``; shape matches
             q's row count and values must be positive.
-        enable_pdl: Launch eligible kernels with Programmatic Dependent
-            Launch (Hopper+).
         override: Optional kernel override name.
         solution: Optional kernel solution to force through normal selection.
 
@@ -2772,7 +2762,7 @@ def rel_mha_decode_with_kvcache(
             window_left=window_left,
             softmax_scale=softmax_scale,
             tau=tau,
-            enable_pdl=enable_pdl,
+            enable_pdl=pdl_enabled(),
             **scale_kwargs,
         )
 
@@ -4187,6 +4177,7 @@ def dsa_decode(
             k_scale=k_scale,
             return_lse=return_lse,
             out=out,
+            enable_pdl=pdl_enabled(),
         )
 
 
@@ -4273,6 +4264,7 @@ def dsa_prefill(
             k_scale=k_scale,
             return_lse=return_lse,
             out=out,
+            enable_pdl=pdl_enabled(),
         )
 
 
@@ -4771,7 +4763,6 @@ def attn_merge_state(
     *,
     lse_scale_log2: float = LSE_LN,
     inplace: bool = False,
-    enable_pdl: bool = False,
     override: str | None = None,
     solution: str | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -4784,7 +4775,6 @@ def attn_merge_state(
         lse_b: Second partial log-sum-exp with shape [total_q, num_heads].
         lse_scale_log2: Multiplier that converts input LSE to log2 domain.
         inplace: Whether to write the merged state back into ``out_a``/``lse_a``.
-        enable_pdl: Whether the selected backend should enable PDL when supported.
         override: Optional kernel override name.
         solution: Optional kernel solution to force through normal selection.
 
@@ -4831,7 +4821,7 @@ def attn_merge_state(
             lse_b=lse_b,
             lse_scale_log2=lse_scale_log2,
             inplace=inplace,
-            enable_pdl=enable_pdl,
+            enable_pdl=pdl_enabled(),
         )
 
 

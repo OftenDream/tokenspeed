@@ -670,7 +670,7 @@ if current_platform().is_amd:
             "return_lse": frozenset({False}),
         },
     )
-    def gluon_mha_decode_gfx950(*args, **kwargs):
+    def gluon_mha_decode_gfx950(*args, enable_pdl: bool = False, **kwargs):
         return _decode_impl(*args, **kwargs)
 
     @register_kernel(
@@ -704,7 +704,7 @@ if current_platform().is_amd:
             "return_lse": frozenset({False}),
         },
     )
-    def gluon_mha_decode_gfx1250(*args, **kwargs):
+    def gluon_mha_decode_gfx1250(*args, enable_pdl: bool = False, **kwargs):
         return _decode_gfx1250_impl(*args, **kwargs)
 
     @register_kernel(
@@ -802,7 +802,7 @@ if current_platform().is_amd:
             "return_lse": frozenset({False, True}),
         },
     )
-    def gluon_mha_extend_gfx950(*args, **kwargs):
+    def gluon_mha_extend_gfx950(*args, enable_pdl: bool = False, **kwargs):
         return _extend_impl(*args, **kwargs)
 
     @register_kernel(
@@ -1518,7 +1518,7 @@ if current_platform().is_amd:
             "return_lse": frozenset({False}),
         },
     )
-    def gluon_dsa_decode_gfx950(*args, **kwargs):
+    def gluon_dsa_decode_gfx950(*args, enable_pdl: bool = False, **kwargs):
         return _dsa_decode_impl(*args, **kwargs)
 
     @register_kernel(
@@ -1551,7 +1551,7 @@ if current_platform().is_amd:
             "return_lse": frozenset({False}),
         },
     )
-    def gluon_dsa_prefill_gfx950(*args, **kwargs):
+    def gluon_dsa_prefill_gfx950(*args, enable_pdl: bool = False, **kwargs):
         return _dsa_prefill_impl(*args, **kwargs)
 
     @register_kernel(
@@ -1585,7 +1585,7 @@ if current_platform().is_amd:
             "return_lse": frozenset({False}),
         },
     )
-    def gluon_dsa_prefill_fp8_dense_gfx950(*args, **kwargs):
+    def gluon_dsa_prefill_fp8_dense_gfx950(*args, enable_pdl: bool = False, **kwargs):
         return _dsa_prefill_impl(*args, **kwargs)
 
     @register_kernel(
@@ -1692,7 +1692,7 @@ if current_platform().is_amd:
         },
         tags={"amd", "gfx1250"},
     )
-    def gluon_dsa_decode_gfx1250(*args, **kwargs):
+    def gluon_dsa_decode_gfx1250(*args, enable_pdl: bool = False, **kwargs):
         return _dsa_decode_gfx1250_impl(*args, **kwargs)
 
     @register_kernel(
@@ -1726,7 +1726,7 @@ if current_platform().is_amd:
         },
         tags={"amd", "gfx1250"},
     )
-    def gluon_dsa_prefill_gfx1250(*args, **kwargs):
+    def gluon_dsa_prefill_gfx1250(*args, enable_pdl: bool = False, **kwargs):
         return _dsa_prefill_gfx1250_impl(*args, **kwargs)
 
     @register_kernel(
@@ -1761,7 +1761,7 @@ if current_platform().is_amd:
         },
         tags={"amd", "gfx1250"},
     )
-    def gluon_dsa_prefill_fp8_dense_gfx1250(*args, **kwargs):
+    def gluon_dsa_prefill_fp8_dense_gfx1250(*args, enable_pdl: bool = False, **kwargs):
         return _dsa_prefill_gfx1250_impl(*args, **kwargs)
 
     @register_kernel(
