@@ -27,7 +27,10 @@ from typing import NamedTuple
 
 import psutil
 import torch
-from tokenspeed_kernel.ops.kvcache.host_transfer import transfer_cache_ranges
+from tokenspeed_kernel.ops.kvcache.host_transfer import (
+    HostTransferWorkspace,
+    transfer_cache_ranges,
+)
 from tokenspeed_scheduler import Cache
 
 from tokenspeed.runtime.cache.l2.layerwise_load import LayerwiseLoadTracker
@@ -100,9 +103,11 @@ class L2CacheExecutor:
         host_ratio: float,
         host_size_gb: float,
         io_backend: str,
+        attn_tp_rank: int = 0,
     ):
         if io_backend not in ("direct", "kernel"):
             raise ValueError(f"unsupported KVStore IO backend {io_backend!r}")
+        self.attn_tp_rank = attn_tp_rank
         self.transfer_backend = "dma" if io_backend == "direct" else "auto"
         target_layout = device_pool.cache_transfer_layout()
         draft_layout = (
@@ -157,6 +162,8 @@ class L2CacheExecutor:
         write_priority, load_priority = _cache_stream_priorities()
         self.write_stream = _new_cache_stream(write_priority)
         self.load_stream = _new_cache_stream(load_priority)
+        self._write_workspace = HostTransferWorkspace()
+        self._load_workspace = HostTransferWorkspace()
 
         self._write_acks: list[_Ack] = []
         self._load_acks: list[_Ack] = []
@@ -248,6 +255,37 @@ class L2CacheExecutor:
                 )
         return ranges
 
+    def _fill_workspace_ranges(
+        self,
+        workspace: HostTransferWorkspace,
+        transfers: Sequence[tuple[int, int, int]],
+        field_ids: set[str] | None = None,
+    ) -> tuple[int, int]:
+        max_fields = max((len(group.fields) for group in self.layout.groups), default=0)
+        capacity = max(len(transfers) * max_fields, 1)
+        host = workspace.ensure_range_host(capacity)
+        num_ranges = 0
+        max_bytes = 0
+        for group_index, device_block_id, host_block_id in transfers:
+            group = self.layout.groups[group_index]
+            for field_index, field in enumerate(group.fields):
+                if field_ids is not None and field.field_id not in field_ids:
+                    continue
+                payload = int(field.payload_bytes)
+                host[num_ranges, 0] = field.device_buffer_index
+                host[num_ranges, 1] = (
+                    field.device_block_zero_offset_bytes
+                    + device_block_id * field.block_stride_bytes
+                )
+                host[num_ranges, 2] = self.host_storage.host_field_offset(
+                    group_index, host_block_id, field_index
+                )
+                host[num_ranges, 3] = payload
+                if payload > max_bytes:
+                    max_bytes = payload
+                num_ranges += 1
+        return num_ranges, max_bytes
+
     def _start_writing(
         self,
         op_ids: Sequence[int],
@@ -259,24 +297,31 @@ class L2CacheExecutor:
         if not transfers:
             self._ready_write_op_ids.extend(op_ids)
             return
-        logger.info(
-            "[L2] writeback started: operations=%d blocks=%d",
-            len(op_ids),
-            len(transfers),
-        )
+        if self.attn_tp_rank == 0:
+            logger.info(
+                "[L2] writeback started: operations=%d blocks=%d",
+                len(op_ids),
+                len(transfers),
+            )
         # Retraction is issued only after the scheduler has consumed every
         # outstanding forward result. Still order this stream explicitly after
         # current-stream work before reading the Device cache state.
         start = torch.cuda.Event()
         start.record()
         start.wait(self.write_stream)
+        num_ranges, max_bytes = self._fill_workspace_ranges(
+            self._write_workspace, transfers
+        )
         transfer_cache_ranges(
             "d2h",
             self.layout.buffers,
             self.host_storage.host_buffer,
-            self._transfer_ranges(transfers),
+            (),
             self.write_stream,
             backend=self.transfer_backend,
+            workspace=self._write_workspace,
+            num_ranges=num_ranges,
+            max_bytes=max_bytes,
         )
         finish = torch.cuda.Event()
         finish.record(self.write_stream)
@@ -295,11 +340,12 @@ class L2CacheExecutor:
         if not transfers:
             self._ready_load_op_ids.extend(op_ids)
             return None
-        logger.info(
-            "[L2] load started: operations=%d blocks=%d",
-            len(op_ids),
-            len(transfers),
-        )
+        if self.attn_tp_rank == 0:
+            logger.info(
+                "[L2] load started: operations=%d blocks=%d",
+                len(op_ids),
+                len(transfers),
+            )
 
         # EventLoop zeroes freshly allocated Device blocks before submitting the
         # load. Recording the start event here makes every layer-wise H2D
@@ -319,13 +365,19 @@ class L2CacheExecutor:
             load_events.start_event.wait(self.load_stream)
             for layer_index in range(consumer_count):
                 consumer = self.layout.consumers[consumer_offset + layer_index]
+                num_ranges, max_bytes = self._fill_workspace_ranges(
+                    self._load_workspace, transfers, set(consumer)
+                )
                 transfer_cache_ranges(
                     "h2d",
                     self.layout.buffers,
                     self.host_storage.host_buffer,
-                    self._transfer_ranges(transfers, set(consumer)),
+                    (),
                     self.load_stream,
                     backend=self.transfer_backend,
+                    workspace=self._load_workspace,
+                    num_ranges=num_ranges,
+                    max_bytes=max_bytes,
                 )
                 finish = torch.cuda.Event()
                 finish.record(self.load_stream)

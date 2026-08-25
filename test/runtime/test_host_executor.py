@@ -188,14 +188,15 @@ class GroupAwareWireTest(unittest.TestCase):
             self.skipTest(f"needs runtime dependencies: {exc}")
 
         executor = L2CacheExecutor.__new__(L2CacheExecutor)
+        executor.attn_tp_rank = 0
         executor._ready_write_op_ids = []
         executor.layout = SimpleNamespace(buffers=("device",))
         executor.host_storage = SimpleNamespace(host_buffer="host")
         executor.write_stream = object()
         executor.transfer_backend = "dma"
         executor._write_acks = []
-        ranges = [(0, 64, 128, 32)]
-        executor._transfer_ranges = Mock(return_value=ranges)
+        executor._write_workspace = object()
+        executor._fill_workspace_ranges = Mock(return_value=(3, 32))
         start = Mock()
         finish = Mock()
 
@@ -211,9 +212,12 @@ class GroupAwareWireTest(unittest.TestCase):
             "d2h",
             executor.layout.buffers,
             executor.host_storage.host_buffer,
-            ranges,
+            (),
             executor.write_stream,
             backend="dma",
+            workspace=executor._write_workspace,
+            num_ranges=3,
+            max_bytes=32,
         )
         start.record.assert_called_once_with()
         start.wait.assert_called_once_with(executor.write_stream)
@@ -228,6 +232,7 @@ class GroupAwareWireTest(unittest.TestCase):
             self.skipTest(f"needs runtime dependencies: {exc}")
 
         executor = L2CacheExecutor.__new__(L2CacheExecutor)
+        executor.attn_tp_rank = 0
         executor._ready_load_op_ids = []
         executor._load_acks = []
         executor.load_stream = object()
@@ -235,6 +240,8 @@ class GroupAwareWireTest(unittest.TestCase):
         executor.layout = SimpleNamespace(buffers=("device",), consumers=(("field",),))
         executor.host_storage = SimpleNamespace(host_buffer="host")
         executor._transfer_ranges = Mock(return_value=[(0, 64, 128, 32)])
+        executor._load_workspace = object()
+        executor._fill_workspace_ranges = Mock(return_value=(2, 32))
         load_events = SimpleNamespace(start_event=Mock(), layer_done_events=[None])
         tracker = Mock()
         tracker.begin_load.return_value = 0
