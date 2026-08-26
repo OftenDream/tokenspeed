@@ -68,7 +68,9 @@ class HostTransferWorkspace:
         )
         if self._address_table is None or self._address_key != key:
             addresses = [int(buffer.data_ptr()) for buffer in device_buffers]
-            addresses.append(int(current_platform().device_visible_data_ptr(host_buffer)))
+            addresses.append(
+                int(current_platform().device_visible_data_ptr(host_buffer))
+            )
             self._address_table = torch.tensor(
                 addresses, dtype=torch.uint64, device=device
             )
@@ -95,9 +97,11 @@ class HostTransferWorkspace:
         ranges: Sequence[tuple[int, int, int, int]],
     ) -> tuple[int, int]:
         num_ranges = len(ranges)
+        if num_ranges <= 0:
+            return 0, 0
         host = self.ensure_range_host(num_ranges)
-        host[:num_ranges].copy_(torch.tensor(ranges, dtype=torch.int64))
-        return num_ranges, max(row[3] for row in ranges)
+        host[:num_ranges].copy_(torch.as_tensor(ranges, dtype=torch.int64))
+        return num_ranges, max(int(row[3]) for row in ranges)
 
     def host_rows(self, num_ranges: int) -> torch.Tensor:
         if self._range_host is None:

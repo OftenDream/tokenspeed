@@ -12,6 +12,14 @@ requires_cuda = pytest.mark.skipif(
 )
 
 
+def test_workspace_load_ranges_empty_is_noop():
+    from tokenspeed_kernel.ops.kvcache.host_transfer import HostTransferWorkspace
+
+    workspace = HostTransferWorkspace()
+    assert workspace.load_ranges(()) == (0, 0)
+    assert workspace._range_host is None
+
+
 def test_workspace_reuses_host_range_storage():
     from tokenspeed_kernel.ops.kvcache.host_transfer import HostTransferWorkspace
 

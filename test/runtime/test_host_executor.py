@@ -179,6 +179,50 @@ class GroupAwareWireTest(unittest.TestCase):
         self.assertEqual(op_ids, [7])
         self.assertEqual(transfers, [(0, 5, 9), (1, 5, 9)])
 
+    def test_fill_workspace_ranges_uses_one_batched_load(self):
+        try:
+            from tokenspeed.runtime.cache.l2.executor import L2CacheExecutor
+        except (ImportError, ModuleNotFoundError) as exc:
+            self.skipTest(f"needs runtime dependencies: {exc}")
+
+        field = SimpleNamespace(
+            field_id="k",
+            device_buffer_index=0,
+            device_block_zero_offset_bytes=8,
+            block_stride_bytes=8,
+            payload_bytes=4,
+        )
+        executor = L2CacheExecutor.__new__(L2CacheExecutor)
+        executor.layout = SimpleNamespace(groups=(SimpleNamespace(fields=(field,)),))
+        executor.host_storage = SimpleNamespace(
+            host_field_offset=lambda group, block, index: 100 + block * 10 + index
+        )
+        workspace = Mock()
+        workspace.load_ranges.return_value = (1, 4)
+        transfers = [(0, 1, 2)]
+
+        count, max_bytes = executor._fill_workspace_ranges(workspace, transfers)
+
+        workspace.load_ranges.assert_called_once_with(
+            executor._transfer_ranges(transfers)
+        )
+        self.assertEqual((count, max_bytes), (1, 4))
+
+    def test_fill_workspace_ranges_skips_empty_batch(self):
+        try:
+            from tokenspeed.runtime.cache.l2.executor import L2CacheExecutor
+        except (ImportError, ModuleNotFoundError) as exc:
+            self.skipTest(f"needs runtime dependencies: {exc}")
+
+        executor = L2CacheExecutor.__new__(L2CacheExecutor)
+        executor.layout = SimpleNamespace(groups=(SimpleNamespace(fields=()),))
+        workspace = Mock()
+
+        count, max_bytes = executor._fill_workspace_ranges(workspace, [])
+
+        workspace.load_ranges.assert_not_called()
+        self.assertEqual((count, max_bytes), (0, 0))
+
     def test_writeback_calls_transfer_with_compact_layout(self):
         try:
             import tokenspeed.runtime.cache.l2.executor as executor_module

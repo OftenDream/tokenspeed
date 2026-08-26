@@ -261,30 +261,10 @@ class L2CacheExecutor:
         transfers: Sequence[tuple[int, int, int]],
         field_ids: set[str] | None = None,
     ) -> tuple[int, int]:
-        max_fields = max((len(group.fields) for group in self.layout.groups), default=0)
-        capacity = max(len(transfers) * max_fields, 1)
-        host = workspace.ensure_range_host(capacity)
-        num_ranges = 0
-        max_bytes = 0
-        for group_index, device_block_id, host_block_id in transfers:
-            group = self.layout.groups[group_index]
-            for field_index, field in enumerate(group.fields):
-                if field_ids is not None and field.field_id not in field_ids:
-                    continue
-                payload = int(field.payload_bytes)
-                host[num_ranges, 0] = field.device_buffer_index
-                host[num_ranges, 1] = (
-                    field.device_block_zero_offset_bytes
-                    + device_block_id * field.block_stride_bytes
-                )
-                host[num_ranges, 2] = self.host_storage.host_field_offset(
-                    group_index, host_block_id, field_index
-                )
-                host[num_ranges, 3] = payload
-                if payload > max_bytes:
-                    max_bytes = payload
-                num_ranges += 1
-        return num_ranges, max_bytes
+        ranges = self._transfer_ranges(transfers, field_ids)
+        if not ranges:
+            return 0, 0
+        return workspace.load_ranges(ranges)
 
     def _start_writing(
         self,
