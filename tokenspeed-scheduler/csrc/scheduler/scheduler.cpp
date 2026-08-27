@@ -21,7 +21,6 @@
 #include "scheduler/scheduler.h"
 
 #include <algorithm>
-#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -411,9 +410,6 @@ std::int32_t Scheduler::RequestTokenSize(const std::string& id) const {
 }
 
 ExecutionPlan Scheduler::NextExecutionPlan() {
-    using Clock = std::chrono::steady_clock;
-    const auto started_at = Clock::now();
-
     std::erase_if(requests_, [this](const auto& item) {
         if (!item.second->template Is<fsm::Finished>()) {
             return false;
@@ -430,65 +426,24 @@ ExecutionPlan Scheduler::NextExecutionPlan() {
             candidates.push_back(request.get());
         }
     }
-    const std::size_t candidate_count = candidates.size();
-    const auto prepared_at = Clock::now();
-
     ExecutionPlan plan;
     std::vector<WriteBackOperation> write_back_operations;
     auto [forward_operations, load_back_operations] =
         buildForwardOperations(plan, std::move(candidates), write_back_operations);
-    const auto forward_built_at = Clock::now();
 
-    const auto forward_assemble_started_at = Clock::now();
-    const std::size_t forward_count = forward_operations.size();
     plan.With(ForwardBatch{std::move(forward_operations)});
-    const auto forward_assembled_at = Clock::now();
 
-    const auto pending_stores_started_at = Clock::now();
     if (config_.StreamsDeviceCacheToHost()) {
         if (auto store = tier_transfers_.StartPendingStores()) {
             write_back_operations.push_back(std::move(*store));
         }
     }
-    const auto pending_stores_finished_at = Clock::now();
 
-    const auto count_transfers = [](const auto& operations) {
-        std::size_t count = 0;
-        for (const auto& operation : operations) {
-            count += operation.transfers.size();
-        }
-        return count;
-    };
-    const std::size_t write_operation_count = write_back_operations.size();
-    const std::size_t write_transfer_count = count_transfers(write_back_operations);
-    const std::size_t load_operation_count = load_back_operations.size();
-    const std::size_t load_transfer_count = count_transfers(load_back_operations);
-
-    const auto cache_assemble_started_at = Clock::now();
     if (!write_back_operations.empty()) {
         plan.With(CacheOperation{WriteBackBatch{write_back_operations}});
     }
     if (!load_back_operations.empty()) {
         plan.With(CacheOperation{LoadBackBatch{load_back_operations}});
-    }
-    const auto finished_at = Clock::now();
-
-    const auto milliseconds = [](Clock::time_point begin, Clock::time_point end) {
-        return std::chrono::duration<double, std::milli>(end - begin).count();
-    };
-    const double prepare_ms = milliseconds(started_at, prepared_at);
-    const double build_forward_ms = milliseconds(prepared_at, forward_built_at);
-    const double pending_stores_ms = milliseconds(pending_stores_started_at, pending_stores_finished_at);
-    const double assemble_ms = milliseconds(forward_assemble_started_at, forward_assembled_at) +
-                               milliseconds(cache_assemble_started_at, finished_at);
-    const double total_ms = milliseconds(started_at, finished_at);
-    if (total_ms >= 10.0) {
-        spdlog::warn(
-            "[Scheduler] slow NextExecutionPlan: total_ms={:.3f} prepare_ms={:.3f} build_forward_ms={:.3f} "
-            "pending_stores_ms={:.3f} assemble_ms={:.3f} candidates={} forwards={} write_ops={} "
-            "write_transfers={} load_ops={} load_transfers={}",
-            total_ms, prepare_ms, build_forward_ms, pending_stores_ms, assemble_ms, candidate_count, forward_count,
-            write_operation_count, write_transfer_count, load_operation_count, load_transfer_count);
     }
     return plan;
 }

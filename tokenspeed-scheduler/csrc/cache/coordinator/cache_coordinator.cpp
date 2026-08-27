@@ -21,7 +21,6 @@
 #include "cache/coordinator/cache_coordinator.h"
 
 #include <algorithm>
-#include <chrono>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -544,8 +543,6 @@ CacheCoordinator::HostAllocationBatch CacheCoordinator::AcquireHostBlocks(std::s
         return indices.subspan(refs.size());
     };
 
-    using Clock = std::chrono::steady_clock;
-    const auto free_start = Clock::now();
     std::vector<std::int32_t> cache_blocks_per_group;
     cache_blocks_per_group.reserve(groups_.size());
     for (const CacheGroup& group : groups_) {
@@ -557,8 +554,6 @@ CacheCoordinator::HostAllocationBatch CacheCoordinator::AcquireHostBlocks(std::s
             unresolved_by_group[group_ids[i]].push_back(i);
         }
     }
-    batch.stats.free_allocation_ms = std::chrono::duration<double, std::milli>(Clock::now() - free_start).count();
-
     const auto value = [&](std::uint32_t candidate_group, CacheBlockLocation location) {
         const auto metadata = groups_[candidate_group].Index().MetadataFor(*host_pool_, location);
         _assert(metadata.has_value(), "evictable Host block has no cache metadata");
@@ -567,7 +562,6 @@ CacheCoordinator::HostAllocationBatch CacheCoordinator::AcquireHostBlocks(std::s
     };
     using HostCacheValue = decltype(value(std::uint32_t{}, CacheBlockLocation{}));
 
-    const auto same_group_start = Clock::now();
     for (std::uint32_t group_id : group_order) {
         std::vector<std::size_t>& unresolved = unresolved_by_group[group_id];
         if (unresolved.empty()) {
@@ -587,10 +581,6 @@ CacheCoordinator::HostAllocationBatch CacheCoordinator::AcquireHostBlocks(std::s
         const std::span<const std::size_t> remaining = assign(unresolved, std::move(refs));
         unresolved.erase(unresolved.begin(), unresolved.end() - static_cast<std::ptrdiff_t>(remaining.size()));
     }
-    batch.stats.same_group_eviction_ms =
-        std::chrono::duration<double, std::milli>(Clock::now() - same_group_start).count();
-
-    const auto cross_group_start = Clock::now();
     const bool has_unresolved = std::ranges::any_of(
         unresolved_by_group, [](const std::vector<std::size_t>& unresolved) { return !unresolved.empty(); });
     if (has_unresolved) {
@@ -653,8 +643,6 @@ CacheCoordinator::HostAllocationBatch CacheCoordinator::AcquireHostBlocks(std::s
             }
         }
     }
-    batch.stats.cross_group_eviction_ms =
-        std::chrono::duration<double, std::milli>(Clock::now() - cross_group_start).count();
     batch.stats.allocated = static_cast<std::size_t>(
         std::ranges::count_if(batch.blocks, [](const CacheBlockRef& block) { return static_cast<bool>(block); }));
     batch.stats.unallocated = batch.stats.requested - batch.stats.allocated;

@@ -182,9 +182,6 @@ public:
         CacheKey key;
     };
     struct HostAllocationStats {
-        double free_allocation_ms{0.0};
-        double same_group_eviction_ms{0.0};
-        double cross_group_eviction_ms{0.0};
         std::size_t requested{0};
         std::size_t allocated{0};
         std::size_t unallocated{0};

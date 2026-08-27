@@ -64,16 +64,6 @@ std::optional<WriteBackOperation> TierTransferManager::StartPendingStores() {
 
     CacheCoordinator::HostAllocationBatch host_allocation = coordinator_.AcquireHostBlocks(group_ids);
     _assert(host_allocation.blocks.size() == keys.size(), "Host allocation result must stay aligned");
-    const CacheCoordinator::HostAllocationStats& stats = host_allocation.stats;
-    const double total_ms = stats.free_allocation_ms + stats.same_group_eviction_ms + stats.cross_group_eviction_ms;
-    if (total_ms >= 10.0) {
-        spdlog::warn(
-            "[L2] slow Host allocation: total_ms={:.3f} free_alloc_ms={:.3f} "
-            "same_group_evict_ms={:.3f} cross_group_evict_ms={:.3f} "
-            "requested={} allocated={} unallocated={} same_group_scans={} cross_group_scans={}",
-            total_ms, stats.free_allocation_ms, stats.same_group_eviction_ms, stats.cross_group_eviction_ms,
-            stats.requested, stats.allocated, stats.unallocated, stats.same_group_scans, stats.cross_group_scans);
-    }
 
     std::vector<CacheTransfer> transfers;
     std::vector<StoreTicket> tickets;
