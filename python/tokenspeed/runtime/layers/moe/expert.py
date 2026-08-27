@@ -336,6 +336,9 @@ class MoELayer(torch.nn.Module):
         do_finalize: bool = True,
         low_latency: bool | None = None,
         overlap_fn: Callable[[], None] | None = None,
+        shared_input: torch.Tensor | None = None,
+        shared_weight: torch.Tensor | None = None,
+        shared_out: torch.Tensor | None = None,
     ):
         """Run the planned MoE kernel over this layer's weights.
 
@@ -356,6 +359,23 @@ class MoELayer(torch.nn.Module):
         if not do_finalize and not self.supports_deferred_finalize:
             raise AssertionError("MoELayer does not support do_finalize=False")
 
+        shared_tensors = (shared_input, shared_weight, shared_out)
+        if any(value is not None for value in shared_tensors) and not all(
+            value is not None for value in shared_tensors
+        ):
+            raise ValueError(
+                "joint shared projection requires input, weight, and output"
+            )
+        shared_kwargs = (
+            {
+                "shared_input": shared_input,
+                "shared_weight": shared_weight,
+                "shared_out": shared_out,
+            }
+            if all(value is not None for value in shared_tensors)
+            else {}
+        )
+
         if self.support_routing:
             return tokenspeed_kernel.moe_apply(
                 self.plan,
@@ -367,6 +387,7 @@ class MoELayer(torch.nn.Module):
                 do_finalize=do_finalize,
                 low_latency=low_latency,
                 overlap_fn=overlap_fn,
+                **shared_kwargs,
             )
         else:
             return tokenspeed_kernel.moe_apply(
@@ -381,4 +402,5 @@ class MoELayer(torch.nn.Module):
                 do_finalize=do_finalize,
                 low_latency=low_latency,
                 overlap_fn=overlap_fn,
+                **shared_kwargs,
             )
