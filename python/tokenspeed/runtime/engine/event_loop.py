@@ -1377,18 +1377,6 @@ def run_event_loop(
                 lambda _signum, _frame: shutdown_event.set(),
             )
 
-        if torch.cuda.is_available():
-            # Warm up CUPTI before EventLoop init captures any CUDA graph
-            # (decode/prefill/encoder). A profiler that first attaches AFTER
-            # capture invalidates the captured graphs — every later replay
-            # dies with cudaErrorLaunchFailure — which would forbid runtime
-            # /start_profile on graph-mode servers. One empty profiler
-            # session loads CUPTI ahead of every capture, making runtime
-            # attach/detach safe.
-            from torch.profiler._utils import _init_for_cuda_graphs
-
-            _init_for_cuda_graphs()
-
         event_loop = EventLoop(
             server_args,
             port_args,
