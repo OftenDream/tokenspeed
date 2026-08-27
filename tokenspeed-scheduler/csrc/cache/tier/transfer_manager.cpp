@@ -38,8 +38,9 @@ std::vector<std::pair<std::uint32_t, CacheBlockLocation>> TierTransferManager::D
 }
 
 std::optional<WriteBackOperation> TierTransferManager::StartPendingStores() {
-    std::vector<CacheTransfer> transfers;
-    std::vector<StoreTicket> tickets;
+    std::vector<CacheKey> keys;
+    std::vector<CacheBlockRef> device_block_refs;
+    std::vector<std::uint32_t> group_ids;
     std::unordered_set<CacheKey, CacheKeyHash> batch_keys;
     for (auto& candidate : coordinator_.TakePendingStores()) {
         if (coordinator_.ContainsHostCachedBlock(candidate.key) || store_keys_.contains(candidate.key) ||
@@ -51,19 +52,47 @@ std::optional<WriteBackOperation> TierTransferManager::StartPendingStores() {
         if (!device_block_ref) {
             continue;
         }
-        const GroupAllocator& manager = coordinator_.Allocator(static_cast<std::int32_t>(candidate.key.group_id));
-        CacheBlockRef host_block_ref = coordinator_.AcquireHostBlock(candidate.key.group_id);
+
+        group_ids.push_back(candidate.key.group_id);
+        keys.push_back(std::move(candidate.key));
+        device_block_refs.push_back(std::move(device_block_ref));
+    }
+
+    if (keys.empty()) {
+        return std::nullopt;
+    }
+
+    CacheCoordinator::HostAllocationBatch host_allocation = coordinator_.AcquireHostBlocks(group_ids);
+    _assert(host_allocation.blocks.size() == keys.size(), "Host allocation result must stay aligned");
+    const CacheCoordinator::HostAllocationStats& stats = host_allocation.stats;
+    const double total_ms = stats.free_allocation_ms + stats.same_group_eviction_ms + stats.cross_group_eviction_ms;
+    if (total_ms >= 10.0) {
+        spdlog::warn(
+            "[L2] slow Host allocation: total_ms={:.3f} free_alloc_ms={:.3f} "
+            "same_group_evict_ms={:.3f} cross_group_evict_ms={:.3f} "
+            "requested={} allocated={} unallocated={} same_group_scans={} cross_group_scans={}",
+            total_ms, stats.free_allocation_ms, stats.same_group_eviction_ms, stats.cross_group_eviction_ms,
+            stats.requested, stats.allocated, stats.unallocated, stats.same_group_scans, stats.cross_group_scans);
+    }
+
+    std::vector<CacheTransfer> transfers;
+    std::vector<StoreTicket> tickets;
+    transfers.reserve(host_allocation.stats.allocated);
+    tickets.reserve(host_allocation.stats.allocated);
+    for (std::size_t i = 0; i < keys.size(); ++i) {
+        CacheBlockRef& host_block_ref = host_allocation.blocks[i];
         if (!host_block_ref) {
             continue;
         }
+        const GroupAllocator& manager = coordinator_.Allocator(static_cast<std::int32_t>(group_ids[i]));
         transfers.push_back(CacheTransfer{
-            .group_id = candidate.key.group_id,
-            .source_page = manager.ResolveCacheBlockId(device_block_ref->Location()),
+            .group_id = group_ids[i],
+            .source_page = manager.ResolveCacheBlockId(device_block_refs[i]->Location()),
             .destination_page = manager.ResolveCacheBlockId(host_block_ref->Location()),
         });
         tickets.push_back(StoreTicket{
-            std::move(candidate.key),
-            std::move(device_block_ref),
+            std::move(keys[i]),
+            std::move(device_block_refs[i]),
             std::move(host_block_ref),
         });
     }
