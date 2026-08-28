@@ -46,6 +46,26 @@ The cost is one round of queue latency; the alternative risks a retraction
 cycle. One full chunk already saturates the GPU, so interleaving a newcomer
 into the same round buys no throughput to offset that risk.
 
+**Holding is a property of the *incomplete*, decided at plan-build time.** A
+chunk that reaches the end of its prompt moves the request to `PrefillDone`
+inside the same plan build (`SchedulePrefillEvent` picks the successor state
+by whether the window reaches `PrefillSize()`), so a prompt scheduled in full
+never holds the line. A round can therefore carry **several prefills that
+complete this round plus at most one truncated one — and the truncated one is
+necessarily last**, because `holdsHeadOfLine` seals the phase the moment it
+appears. With 6K of budget left and prompts of 2K / 1K / 10K waiting, the
+round schedules the 2K and the 1K in full and the first 3K chunk of the 10K
+prompt, then stops. The same rule makes the finishing round of a chunked
+prefill cheap: its final chunk releases the line *within* the round, so the
+prompts queued behind it start in that round, not the next.
+
+**Decodes are not part of the line.** In mixed mode the decode batch is built
+before the prefill phases and takes its token budget first (§3.3), so a round
+is *all decodes + the completing prefills + at most one truncated prefill*.
+Outside mixed mode, prefill and decode never share a round at all — decodes
+get the round only when no prefill scheduled — so head-of-line only ever
+orders prefills against each other, never a decode behind a prefill.
+
 ### 1.2 The one lookahead: the state-checkpoint tail
 
 The single place capacity is reserved beyond the current chunk. For mamba /
@@ -94,12 +114,12 @@ a stalled prefill exactly as stuck as an empty one.
 
 **Retract-and-grant, in one round.** The retraction serves a specific request —
 the first candidate whose admission failed for capacity
-(`context.capacity_blocker`). Victims are retracted and the blocked admission
-is **retried in the same plan build**, looping (retract → retry → retract)
-until it fits or the victims run out. The freed capacity therefore reaches the
-request it was freed for within the round; there is never a free page waiting
-for whoever asks first next round, which is what previously required a
-cross-round capacity barrier. Two edges of the loop:
+(`AdmissionFeedback::capacity_blocker`). Victims are retracted and the blocked
+admission is **retried in the same plan build**, looping (retract → retry →
+retract) until it fits or the victims run out. The freed capacity therefore
+reaches the request it was freed for within the round; there is never a free
+page waiting for whoever asks first next round, which is what previously
+required a cross-round capacity barrier. Two edges of the loop:
 
 - **The victim may BE the blocker** (a resident request blocked on its own
   next page is the preferred victim). It comes back through the readmission
@@ -162,6 +182,15 @@ what used to be a rank in a ladder is now the position of a phase in its
 builder, readable top to bottom. A round schedules each request at most once
 (`PlanBuild::Scheduled`), whatever states it moves through while the phases
 run.
+
+A pass's mutable state is split in two on a layer boundary. `PlanBuild` — the
+output plan, the batch under construction, budgets, and the composition flags —
+is held by the role grammars alone, and every operation enters the batch
+through one gate, `pushOperation`, where budget and flag accounting live. The
+per-request admission layer (`admit`, `schedulePrefill*`, `scheduleDecode`)
+sees none of that: it receives only the output plan (to record fresh pages to
+zero) and an `AdmissionFeedback` (`admission_failed`, `capacity_blocker`), so
+it can report outcomes but never compose the batch.
 
 ### 3.1 P — prefill worker
 
