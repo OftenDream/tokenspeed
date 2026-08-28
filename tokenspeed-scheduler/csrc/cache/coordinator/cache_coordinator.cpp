@@ -454,6 +454,9 @@ void CacheCoordinator::QueueCachedBlocksForStore(std::span<const std::string> pr
         return;
     }
     for (const CacheGroup& group : groups_) {
+        if (group.Spec().kind == AttnKind::kMambaState) {
+            continue;
+        }
         for (CacheKey& key : keysForGroup(prefix_hashes, group.Id())) {
             if (group.Index().Contains(pool_, key)) {
                 pending_stores_.push_back(StoreCandidate{.key = std::move(key)});
@@ -462,9 +465,28 @@ void CacheCoordinator::QueueCachedBlocksForStore(std::span<const std::string> pr
     }
 }
 
+void CacheCoordinator::QueueLatestSnapshotBlocksForStore(std::span<const std::string> prefix_hashes) {
+    if (host_pool_ == nullptr) {
+        return;
+    }
+    for (const CacheGroup& group : groups_) {
+        if (group.Spec().kind != AttnKind::kMambaState) {
+            continue;
+        }
+        std::vector<CacheKey> keys = keysForGroup(prefix_hashes, group.Id());
+        for (auto key = keys.rbegin(); key != keys.rend(); ++key) {
+            if (group.Index().Contains(pool_, *key)) {
+                pending_stores_.push_back(StoreCandidate{.key = std::move(*key)});
+                break;
+            }
+        }
+    }
+}
+
 void CacheCoordinator::CacheCompletedBlocks(std::span<BlockTable> tables, std::span<const std::string> prefix_hashes,
                                             std::uint64_t access_epoch, std::int32_t first_new_prefix_page,
-                                            std::int32_t num_computed_tokens, CacheBoundaryKind boundary_kind) {
+                                            std::int32_t num_computed_tokens, CacheBoundaryKind boundary_kind,
+                                            bool stream_completed_to_host) {
     _assert(tables.size() == groups_.size(), "tables/groups size mismatch");
     _assert(first_new_prefix_page >= 0 && static_cast<std::size_t>(first_new_prefix_page) < prefix_hashes.size(),
             "completed page range must be non-empty");
@@ -475,6 +497,7 @@ void CacheCoordinator::CacheCompletedBlocks(std::span<BlockTable> tables, std::s
             .new_prefix_hash_begin = first_new_prefix_page,
             .completed_boundary_kind = boundary_kind,
             .num_computed_tokens = num_computed_tokens,
+            .stream_completed_to_host = stream_completed_to_host,
         };
         cacheDeviceCompletedBlocksForGroup(i, demand, access_epoch);
     }
@@ -483,11 +506,15 @@ void CacheCoordinator::CacheCompletedBlocks(std::span<BlockTable> tables, std::s
 template <CacheTier Tier>
 void CacheCoordinator::cacheFullBlocksForGroup(std::size_t group_index, BlockTable& table,
                                                std::span<const CacheKey> keys, std::int32_t first_cache_block,
-                                               std::uint64_t access_epoch, CacheBoundaryKind boundary_kind) {
+                                               std::uint64_t access_epoch, CacheBoundaryKind boundary_kind,
+                                               bool stream_completed_to_host) {
     std::vector<std::pair<CacheKey, CacheBlockRef>> newly_cached;
+    const bool automatically_streams_to_host =
+        stream_device_cache_to_host_ &&
+        (groups_[group_index].Spec().kind == AttnKind::kSlidingWindow || stream_completed_to_host);
     auto* inserted = [&]() -> std::vector<std::pair<CacheKey, CacheBlockRef>>* {
         if constexpr (Tier == CacheTier::kDevice) {
-            return stream_device_cache_to_host_ || cache_mutation_sink_ ? &newly_cached : nullptr;
+            return automatically_streams_to_host || cache_mutation_sink_ ? &newly_cached : nullptr;
         }
         return nullptr;
     }();
@@ -500,7 +527,7 @@ void CacheCoordinator::cacheFullBlocksForGroup(std::size_t group_index, BlockTab
         if (cache_mutation_sink_) {
             cache_mutation_sink_(key, CacheMutation::kStored);
         }
-        if (!stream_device_cache_to_host_) {
+        if (!automatically_streams_to_host) {
             continue;
         }
         pending_stores_.push_back(StoreCandidate{
@@ -676,7 +703,7 @@ void CacheCoordinator::cacheCompletedBlocksForGroup(std::size_t group_index, con
                          groups_[group_index].Id());
         cacheFullBlocksForGroup<Tier>(group_index, *demand.table, keys,
                                       demand.new_prefix_hash_begin * pages_per_prefix_hash, access_epoch,
-                                      *demand.completed_boundary_kind);
+                                      *demand.completed_boundary_kind, demand.stream_completed_to_host);
         return;
     }
     if (demand.num_computed_tokens < 0) {
@@ -701,7 +728,8 @@ void CacheCoordinator::cacheCompletedBlocksForGroup(std::size_t group_index, con
     std::vector<CacheKey> keys = keysForGroup(demand.prefix_hashes, groups_[group_index].Id());
     cacheFullBlocksForGroup<Tier>(group_index, *demand.table,
                                   std::span<const CacheKey>{keys}.subspan(static_cast<std::size_t>(first_cache_block)),
-                                  first_cache_block, access_epoch, *demand.completed_boundary_kind);
+                                  first_cache_block, access_epoch, *demand.completed_boundary_kind,
+                                  demand.stream_completed_to_host);
 }
 
 void CacheCoordinator::cacheDeviceCompletedBlocksForGroup(std::size_t group_index, const GroupDemand& demand,
