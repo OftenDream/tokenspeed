@@ -134,7 +134,7 @@ private:
                                                      std::int32_t first_page);
     void discardUncachedKvEventPages(std::span<const CacheKey> keys);
     void handleCacheMutation(const CacheKey& key, CacheCoordinator::CacheMutation mutation);
-    void publishCompletedPages(Request& request);
+    std::optional<WriteBackOperation> publishCompletedPages(Request& request);
     void retractForCapacity(PlanBuildContext& context, const std::vector<Request*>& candidates,
                             std::vector<WriteBackOperation>& write_back_operations);
 
@@ -164,6 +164,7 @@ private:
     BlockPool host_pool_;
     CacheCoordinator coordinator_;
     TierTransferManager tier_transfers_;
+    std::vector<WriteBackOperation> pending_write_back_operations_;
     std::vector<std::string> cache_group_ids_;
     std::int32_t max_single_request_tokens_{0};
 

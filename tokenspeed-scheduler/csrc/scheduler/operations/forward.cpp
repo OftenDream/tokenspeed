@@ -426,6 +426,7 @@ std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
                                      .completed_boundary_kind = completed.boundary_kind,
                                      .num_computed_tokens = num_computed_tokens,
                                      .reserve_tokens = admission_reserve,
+                                     .stream_completed_to_host = config_.StreamsDeviceCacheToHost(),
                                  });
     if (request->PrefillSource() == fsm::PrefillSource::kLocal && !consumes_reserved_tail) {
         makeSnapshotStatePrefillSparse(demands, config_.cache_groups, coordinator_, first_pos + tokens_this_round);
@@ -462,14 +463,16 @@ std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(PlanBuildConte
         canConsumeReservedTokensInPlace(coordinator_, tables, reserve_tokens, num_computed_tokens)) {
         coordinator_.ConsumeReservedTokens(tables, reserve_tokens);
     } else {
-        std::vector<GroupDemand> demands =
-            makeGroupDemands(tables, GroupDemand{
-                                         .num_tokens = reserve_tokens,
-                                         .prefix_hashes = cache_progress.prefix_hashes,
-                                         .new_prefix_hash_begin = completed.first_new_prefix_page,
-                                         .completed_boundary_kind = completed.boundary_kind,
-                                         .num_computed_tokens = num_computed_tokens,
-                                     });
+        std::vector<GroupDemand> demands = makeGroupDemands(
+            tables,
+            GroupDemand{
+                .num_tokens = reserve_tokens,
+                .prefix_hashes = cache_progress.prefix_hashes,
+                .new_prefix_hash_begin = completed.first_new_prefix_page,
+                .completed_boundary_kind = completed.boundary_kind,
+                .num_computed_tokens = num_computed_tokens,
+                .stream_completed_to_host = config_.StreamsDeviceCacheToHost() && request->Is<fsm::PrefillDone>(),
+            });
         if (!admitWithKvEventTracking(context, *request, cache_progress, completed.first_new_prefix_page, demands)) {
             context.capacity_blocker = request->Id();
             return std::nullopt;
@@ -517,6 +520,7 @@ std::optional<WriteBackOperation> Scheduler::beginRetraction(Request& request) {
                                           num_computed_tokens, *completed.boundary_kind);
     }
     coordinator_.QueueCachedBlocksForStore(cache_progress.prefix_hashes);
+    coordinator_.QueueLatestSnapshotBlocksForStore(cache_progress.prefix_hashes);
     std::optional<WriteBackOperation> write_back = tier_transfers_.StartPendingStores();
     request.Apply(fsm::RetractionEvent{&coordinator_});
     recovery_queue_.push_back(request.Id());
