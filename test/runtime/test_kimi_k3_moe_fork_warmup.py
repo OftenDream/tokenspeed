@@ -34,17 +34,31 @@ startup deadlocked with the GPUs idle. It reproduced on gfx950 at TP8/EP1 --
 where the tensor-parallel MoE places a projection on the forked branch -- while
 TP8/EP8 captured cleanly, so the config coverage matters as much as the flag.
 
+The TP8/EP1 CI jobs that exercise the real failure are manual-trigger only, so
+this is the only per-commit signal guarding the contract. It is a deliberately
+narrow one: it pins the enable/overlap decision at the call site, not the effect
+on the auxiliary stream, so it would not catch a change to StreamFork's own
+semantics. Run the EP1 perf job for that.
+
 CPU-only: no real streams or capture, just the enable/overlap decision.
 """
 
 from __future__ import annotations
 
+import os
+import sys
 from types import SimpleNamespace
 from unittest import mock
 
 import torch
 
+# CI Registration (parsed via AST, runtime no-op)
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from ci_system.ci_register import register_cuda_ci
+
 from tokenspeed.runtime.models.kimi_k3 import KimiLinearMoE
+
+register_cuda_ci(est_time=5, suite="runtime-1gpu")
 
 
 class _SpyFork:
@@ -99,8 +113,14 @@ def _make_moe(fork: _SpyFork) -> SimpleNamespace:
         _topk_ready=None,
         routed_hidden=4,
         comm=comm,
+        # Stand in for TopKOutputFormat so the fake does not have to track the
+        # enum; only is_standard() is consulted on this path.
+        _routing_output_format=lambda ctx: SimpleNamespace(is_standard=lambda: True),
         gate=lambda hs: torch.zeros(2, 2),
-        topk=lambda hs, logits: (torch.zeros(2, 1), torch.zeros(2, 1)),
+        topk=lambda hs, logits, output_format=None: (
+            torch.zeros(2, 1),
+            torch.zeros(2, 1),
+        ),
         shared_experts=lambda hs, down_out=None: hs,
         routed_expert_down_proj=lambda hs: (hs, None),
         experts=SimpleNamespace(_situ_output_buffer=None),
