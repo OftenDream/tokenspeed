@@ -22,6 +22,7 @@
 
 from __future__ import annotations
 
+import threading
 from collections.abc import Iterable, Sequence
 from typing import NamedTuple
 
@@ -45,14 +46,15 @@ device_module = get_device_module()
 _HOST_MEM_HEADROOM_BYTES = 10 * (1024**3)
 
 
-def _cache_stream_priorities() -> tuple[int | None, int | None]:
+def _load_stream_priority() -> int | None:
     priority_range = getattr(device_module.Stream, "priority_range", None)
     if priority_range is None:
-        return None, None
+        return None
     try:
-        return priority_range()
+        _, load_priority = priority_range()
     except (RuntimeError, TypeError):
-        return None, None
+        return None
+    return load_priority
 
 
 def _new_cache_stream(priority: int | None = None):
@@ -154,20 +156,34 @@ class L2CacheExecutor:
             tracker = LayerwiseLoadTracker(len(layout.consumers))
             pool.register_layerwise_load_tracker(tracker)
             self._load_trackers.append((tracker, len(layout.consumers)))
-        write_priority, load_priority = _cache_stream_priorities()
-        self.write_stream = _new_cache_stream(write_priority)
-        self.load_stream = _new_cache_stream(load_priority)
+        # Write-backs run on the CALLER's current stream -- the forward
+        # thread's default stream, the same one that carries the plan's page
+        # zeroing and fences its forwards. That single-stream FIFO is the
+        # correctness story for retraction: the D2H snapshot copy reads the
+        # victim's pages after the victim's last forward wrote them and
+        # before anything later in the plan (zeroing, the granted request's
+        # work) can touch them. Loads keep their own stream: their consumers
+        # are fenced per layer by the tracker events.
+        self.load_stream = _new_cache_stream(_load_stream_priority())
 
+        # Submission runs on the forward thread and polling on the control
+        # plane (event queries only), so the completion queues below are the
+        # cross-thread handoff; the lock covers every mutation of them.
+        self._ack_lock = threading.Lock()
         self._write_acks: list[_Ack] = []
         self._load_acks: list[_Ack] = []
         self._ready_write_op_ids: list[int] = []
         self._ready_load_op_ids: list[int] = []
 
-    def submit_plan(self, plan) -> None:
-        write_op_ids: list[int] = []
-        write_transfers: list[tuple[int, int, int]] = []
-        load_op_ids: list[int] = []
-        load_transfers: list[tuple[int, int, int]] = []
+    def submit_write_backs(self, plan) -> None:
+        """Enqueue the plan's D2H snapshot copies on the current stream.
+
+        Must run BEFORE the plan's page zeroing: the scheduler may have
+        granted a snapshot's source pages to another request in the same
+        plan, and only the stream order keeps the copy reading the old bytes.
+        """
+        op_ids: list[int] = []
+        transfers: list[tuple[int, int, int]] = []
         for operation in plan.cache:
             if isinstance(operation, Cache.WriteBackOp):
                 self._append_transfers(
@@ -175,27 +191,30 @@ class L2CacheExecutor:
                     operation.group_ids,
                     operation.src_pages,
                     operation.dst_pages,
-                    collected_op_ids=write_op_ids,
-                    transfers=write_transfers,
+                    collected_op_ids=op_ids,
+                    transfers=transfers,
                     source_is_device=True,
                 )
-            elif isinstance(operation, Cache.LoadBackOp):
+        self._start_writing(op_ids, transfers)
+
+    def submit_load_backs(self, plan) -> None:
+        """Launch the plan's H2D loads; runs after the plan's page zeroing."""
+        op_ids: list[int] = []
+        transfers: list[tuple[int, int, int]] = []
+        for operation in plan.cache:
+            if isinstance(operation, Cache.LoadBackOp):
                 self._append_transfers(
                     operation.op_ids,
                     operation.group_ids,
                     operation.src_pages,
                     operation.dst_pages,
-                    collected_op_ids=load_op_ids,
-                    transfers=load_transfers,
+                    collected_op_ids=op_ids,
+                    transfers=transfers,
                     source_is_device=False,
                 )
-            else:
-                raise TypeError(f"unsupported cache op {type(operation).__name__}")
-
-        load_index = self._start_loading(load_op_ids, load_transfers)
+        load_index = self._start_loading(op_ids, transfers)
         for tracker, _ in self._load_trackers:
             tracker.set_consumers(load_index if load_index is not None else -1)
-        self._start_writing(write_op_ids, write_transfers)
 
     @staticmethod
     def _append_transfers(
@@ -257,30 +276,31 @@ class L2CacheExecutor:
             return
         op_ids = _ordered_unique(op_ids)
         if not transfers:
-            self._ready_write_op_ids.extend(op_ids)
+            with self._ack_lock:
+                self._ready_write_op_ids.extend(op_ids)
             return
         logger.info(
             "[L2] writeback started: operations=%d blocks=%d",
             len(op_ids),
             len(transfers),
         )
-        # Retraction is issued only after the scheduler has consumed every
-        # outstanding forward result. Still order this stream explicitly after
-        # current-stream work before reading the Device cache state.
-        start = torch.cuda.Event()
-        start.record()
-        start.wait(self.write_stream)
+        # On the caller's (forward thread's default) stream: the scheduler
+        # releases -- and may re-grant -- the source pages the moment it
+        # emits this op, and the single-stream FIFO is what keeps the copy
+        # ahead of the pages' next writer.
+        stream = torch.cuda.current_stream()
         transfer_cache_ranges(
             "d2h",
             self.layout.buffers,
             self.host_storage.host_buffer,
             self._transfer_ranges(transfers),
-            self.write_stream,
+            stream,
             backend=self.transfer_backend,
         )
         finish = torch.cuda.Event()
-        finish.record(self.write_stream)
-        self._write_acks.append(_Ack(finish, op_ids))
+        finish.record(stream)
+        with self._ack_lock:
+            self._write_acks.append(_Ack(finish, op_ids))
 
     def _start_loading(
         self,
@@ -293,7 +313,8 @@ class L2CacheExecutor:
             raise RuntimeError("Host cache load must run outside CUDA Graph capture")
         op_ids = _ordered_unique(op_ids)
         if not transfers:
-            self._ready_load_op_ids.extend(op_ids)
+            with self._ack_lock:
+                self._ready_load_op_ids.extend(op_ids)
             return None
         logger.info(
             "[L2] load started: operations=%d blocks=%d",
@@ -333,16 +354,20 @@ class L2CacheExecutor:
             consumer_offset += consumer_count
         if load_index is None or finish is None:
             raise RuntimeError("cache transfer layout has no layer consumers")
-        self._load_acks.append(_Ack(finish, op_ids))
+        with self._ack_lock:
+            self._load_acks.append(_Ack(finish, op_ids))
         return load_index
 
     def poll_results(self) -> list:
-        results = [self._write_done(op_id) for op_id in self._ready_write_op_ids]
-        self._ready_write_op_ids.clear()
-        results.extend(self._load_done(op_id) for op_id in self._ready_load_op_ids)
-        self._ready_load_op_ids.clear()
-        self._write_acks[:] = self._drain(self._write_acks, self._write_done, results)
-        self._load_acks[:] = self._drain(self._load_acks, self._load_done, results)
+        with self._ack_lock:
+            results = [self._write_done(op_id) for op_id in self._ready_write_op_ids]
+            self._ready_write_op_ids.clear()
+            results.extend(self._load_done(op_id) for op_id in self._ready_load_op_ids)
+            self._ready_load_op_ids.clear()
+            self._write_acks[:] = self._drain(
+                self._write_acks, self._write_done, results
+            )
+            self._load_acks[:] = self._drain(self._load_acks, self._load_done, results)
         return results
 
     @staticmethod
@@ -368,7 +393,9 @@ class L2CacheExecutor:
         return event
 
     def shutdown(self) -> None:
-        self.write_stream.synchronize()
+        # Write-backs ride the default stream (shared per device, so this
+        # thread's handle reaches them); only loads have their own stream.
+        torch.cuda.current_stream().synchronize()
         self.load_stream.synchronize()
 
     def reset(self) -> None:

@@ -329,11 +329,17 @@ def resolve_dspark_prefix_replay_tokens(
 
 
 def make_extend_result_event(
-    request_id: str, tokens: Sequence[int] = ()
+    request_id: str,
+    tokens: Sequence[int] = (),
+    spec_candidate_ids: Sequence[int] | None = None,
 ) -> "ForwardEvent.ExtendResult":
     fe = ForwardEvent.ExtendResult()
     fe.request_id = request_id
     fe.tokens = list(tokens)
+    if spec_candidate_ids:
+        # P-side final chunk: the drafter candidates ride to the scheduler so
+        # its remote-decode operation is self-contained.
+        fe.spec_candidate_ids = list(spec_candidate_ids)
     return fe
 
 
@@ -359,6 +365,29 @@ def make_update_reserve_tokens_event(request_id: str, new_reserve_num_tokens: in
     fe.request_id = request_id
     fe.reserve_num_tokens_in_next_schedule_event = new_reserve_num_tokens
     return fe
+
+
+def scheduler_cache_group_pages(scheduler):
+    """Return a ``group_id -> (total, available)`` page-count query.
+
+    Two counter reads, bound to the scheduler once, so the batch logger holds
+    a query rather than a reference to the loop that owns the scheduler.
+
+    Args:
+        scheduler: The engine's C++ scheduler.
+
+    Returns:
+        A callable taking a cache-group id and returning its total and
+        available page counts.
+    """
+
+    def pages(group_id: str) -> tuple[int, int]:
+        return (
+            scheduler.cache_group_total_pages(group_id),
+            scheduler.cache_group_available_pages(group_id),
+        )
+
+    return pages
 
 
 def advance_scheduler(scheduler, events: list) -> None:

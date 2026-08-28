@@ -322,9 +322,10 @@ Its responsibilities:
   prefix hits per group on both tiers, converged to the common prefix length
   across groups; `Admit` then allocates, pins the hit prefix, and produces
   host→device `load_pairs` plus each group's fresh pages. Probe and admit are
-  deliberately split so that a failed admission can be retried under a
-  hypothetical release (`CanAdmitAfterReleasing`) without mutating cache
-  state. `ProbeDecodeDevicePrefix` is the PD-decode variant: local history
+  deliberately split so the probe can be taken once and the admission retried
+  against it — the scheduler's same-round retract-and-grant re-runs a failed
+  admission after freeing a victim (see `scheduler.md`) without re-probing.
+  `ProbeDecodeDevicePrefix` is the PD-decode variant: local history
   pages are reused while final-state groups are restored from the remote
   endpoint snapshot.
 * **Prefix publication.** `CacheFullBlocks` / `CacheCompletedBlocks` register
@@ -423,16 +424,13 @@ still fit the recipe's reported token capacity. When that dynamic pool is
 overcommitted, admission can fail even though the batch still has a free
 sequence slot.
 
-For a fused scheduler without Host L2, such a failure may directly retract a
-resident request and release its Device pages. Direct retraction enters a
-capacity-drain phase: already-resident `Prefilling`, `PrefillDone`, and
-`Decoding` requests continue, while `Submitted` requests (including the
-requeued victim) cannot consume the released pages. Admission resumes
-automatically after that resident cohort finishes. This prevents an
-overcommitted workload from repeatedly rebuilding a prompt, decoding briefly,
-and retracting it again. Best-effort L2 writeback, PD Decode recovery, and
-ordinary capacity-fit continuous batching do not use this fused direct-drain
-path.
+When admission fails for capacity and no prefill can progress, the scheduler
+retracts a resident victim and grants the freed pages to the blocked request
+within the same plan build; what stops an overcommitted workload from
+repeatedly rebuilding, briefly decoding and re-retracting the same prompt is
+the escalating admission headroom each retraction adds to the victim's next
+admission. The protocol — victim choice, readmission order, why the release
+is safe before the L2 snapshot copies — is `scheduler.md` §2 and §4.
 
 ## Code placement
 
