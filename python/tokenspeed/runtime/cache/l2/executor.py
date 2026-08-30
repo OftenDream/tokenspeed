@@ -104,10 +104,12 @@ class L2CacheExecutor:
         host_size_gb: float,
         io_backend: str,
         attn_tp_rank: int = 0,
+        producer_stream=None,
     ):
         if io_backend not in ("direct", "kernel"):
             raise ValueError(f"unsupported KVStore IO backend {io_backend!r}")
         self.attn_tp_rank = attn_tp_rank
+        self.producer_stream = producer_stream
         self.transfer_backend = "dma" if io_backend == "direct" else "auto"
         target_layout = device_pool.cache_transfer_layout()
         draft_layout = (
@@ -283,11 +285,15 @@ class L2CacheExecutor:
                 len(op_ids),
                 len(transfers),
             )
-        # Retraction is issued only after the scheduler has consumed every
-        # outstanding forward result. Still order this stream explicitly after
-        # current-stream work before reading the Device cache state.
+        # KV is produced on the model execution stream, not the event-loop
+        # default stream. Wait for that producer (falling back to the current
+        # stream) before copying Device pages to Host.
         start = torch.cuda.Event()
-        start.record()
+        producer = getattr(self, "producer_stream", None)
+        if producer is not None:
+            start.record(producer)
+        else:
+            start.record()
         start.wait(self.write_stream)
         num_ranges, max_bytes = self._fill_workspace_ranges(
             self._write_workspace, transfers

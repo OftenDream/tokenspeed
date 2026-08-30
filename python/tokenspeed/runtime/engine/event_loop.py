@@ -311,6 +311,7 @@ class EventLoop:
                 host_size_gb=server_args.kvstore_size,
                 io_backend=server_args.kvstore_io_backend,
                 attn_tp_rank=attn_tp_rank,
+                producer_stream=self.model_executor.execution_stream,
             )
             num_host_pages = l2_cache_executor.num_host_pages
         else:

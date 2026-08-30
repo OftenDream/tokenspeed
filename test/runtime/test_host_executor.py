@@ -267,6 +267,39 @@ class GroupAwareWireTest(unittest.TestCase):
         start.wait.assert_called_once_with(executor.write_stream)
         finish.record.assert_called_once_with(executor.write_stream)
 
+    def test_writeback_waits_for_producer_stream_before_d2h(self):
+        try:
+            import tokenspeed.runtime.cache.l2.executor as executor_module
+
+            L2CacheExecutor = executor_module.L2CacheExecutor
+        except (ImportError, ModuleNotFoundError) as exc:
+            self.skipTest(f"needs runtime dependencies: {exc}")
+
+        executor = L2CacheExecutor.__new__(L2CacheExecutor)
+        executor.attn_tp_rank = 0
+        executor._ready_write_op_ids = []
+        executor.layout = SimpleNamespace(buffers=("device",))
+        executor.host_storage = SimpleNamespace(host_buffer="host")
+        executor.write_stream = object()
+        executor.producer_stream = object()
+        executor.transfer_backend = "dma"
+        executor._write_acks = []
+        executor._write_workspace = object()
+        executor._fill_workspace_ranges = Mock(return_value=(1, 8))
+        start = Mock()
+        finish = Mock()
+
+        with (
+            patch.object(
+                executor_module.torch.cuda, "Event", side_effect=(start, finish)
+            ),
+            patch.object(executor_module, "transfer_cache_ranges"),
+        ):
+            executor._start_writing([1], [(0, 2, 3)])
+
+        start.record.assert_called_once_with(executor.producer_stream)
+        start.wait.assert_called_once_with(executor.write_stream)
+
     def test_loadback_logs_non_empty_batch(self):
         try:
             import tokenspeed.runtime.cache.l2.executor as executor_module
