@@ -28,7 +28,10 @@ from typing import NamedTuple
 
 import psutil
 import torch
-from tokenspeed_kernel.ops.kvcache.host_transfer import transfer_cache_ranges
+from tokenspeed_kernel.ops.kvcache.host_transfer import (
+    HostTransferWorkspace,
+    transfer_cache_ranges,
+)
 from tokenspeed_scheduler import Cache
 
 from tokenspeed.runtime.cache.l2.layerwise_load import LayerwiseLoadTracker
@@ -102,9 +105,11 @@ class L2CacheExecutor:
         host_ratio: float,
         host_size_gb: float,
         io_backend: str,
+        attn_tp_rank: int = 0,
     ):
         if io_backend not in ("direct", "kernel"):
             raise ValueError(f"unsupported KVStore IO backend {io_backend!r}")
+        self.attn_tp_rank = attn_tp_rank
         self.transfer_backend = "dma" if io_backend == "direct" else "auto"
         target_layout = device_pool.cache_transfer_layout()
         draft_layout = (
@@ -165,6 +170,8 @@ class L2CacheExecutor:
         # work) can touch them. Loads keep their own stream: their consumers
         # are fenced per layer by the tracker events.
         self.load_stream = _new_cache_stream(_load_stream_priority())
+        self._write_workspace = HostTransferWorkspace()
+        self._load_workspace = HostTransferWorkspace()
 
         # Submission runs on the forward thread and polling on the control
         # plane (event queries only), so the completion queues below are the
@@ -267,6 +274,17 @@ class L2CacheExecutor:
                 )
         return ranges
 
+    def _fill_workspace_ranges(
+        self,
+        workspace: HostTransferWorkspace,
+        transfers: Sequence[tuple[int, int, int]],
+        field_ids: set[str] | None = None,
+    ) -> tuple[int, int]:
+        ranges = self._transfer_ranges(transfers, field_ids)
+        if not ranges:
+            return 0, 0
+        return workspace.load_ranges(ranges)
+
     def _start_writing(
         self,
         op_ids: Sequence[int],
@@ -279,23 +297,30 @@ class L2CacheExecutor:
             with self._ack_lock:
                 self._ready_write_op_ids.extend(op_ids)
             return
-        logger.info(
-            "[L2] writeback started: operations=%d blocks=%d",
-            len(op_ids),
-            len(transfers),
-        )
+        if self.attn_tp_rank == 0:
+            logger.info(
+                "[L2] writeback started: operations=%d blocks=%d",
+                len(op_ids),
+                len(transfers),
+            )
         # On the caller's (forward thread's default) stream: the scheduler
         # releases -- and may re-grant -- the source pages the moment it
         # emits this op, and the single-stream FIFO is what keeps the copy
         # ahead of the pages' next writer.
         stream = device_module.current_stream()
+        num_ranges, max_bytes = self._fill_workspace_ranges(
+            self._write_workspace, transfers
+        )
         transfer_cache_ranges(
             "d2h",
             self.layout.buffers,
             self.host_storage.host_buffer,
-            self._transfer_ranges(transfers),
+            (),
             stream,
             backend=self.transfer_backend,
+            workspace=self._write_workspace,
+            num_ranges=num_ranges,
+            max_bytes=max_bytes,
         )
         finish = device_module.Event()
         finish.record(stream)
@@ -316,11 +341,12 @@ class L2CacheExecutor:
             with self._ack_lock:
                 self._ready_load_op_ids.extend(op_ids)
             return None
-        logger.info(
-            "[L2] load started: operations=%d blocks=%d",
-            len(op_ids),
-            len(transfers),
-        )
+        if self.attn_tp_rank == 0:
+            logger.info(
+                "[L2] load started: operations=%d blocks=%d",
+                len(op_ids),
+                len(transfers),
+            )
 
         # EventLoop zeroes freshly allocated Device blocks before submitting the
         # load. Recording the start event here makes every layer-wise H2D
@@ -340,13 +366,19 @@ class L2CacheExecutor:
             load_events.start_event.wait(self.load_stream)
             for layer_index in range(consumer_count):
                 consumer = self.layout.consumers[consumer_offset + layer_index]
+                num_ranges, max_bytes = self._fill_workspace_ranges(
+                    self._load_workspace, transfers, set(consumer)
+                )
                 transfer_cache_ranges(
                     "h2d",
                     self.layout.buffers,
                     self.host_storage.host_buffer,
-                    self._transfer_ranges(transfers, set(consumer)),
+                    (),
                     self.load_stream,
                     backend=self.transfer_backend,
+                    workspace=self._load_workspace,
+                    num_ranges=num_ranges,
+                    max_bytes=max_bytes,
                 )
                 finish = device_module.Event()
                 finish.record(self.load_stream)
