@@ -430,11 +430,11 @@ ExecutionPlan Scheduler::NextExecutionPlan() {
             candidates.push_back(request.get());
         }
     }
-
     ExecutionPlan plan;
     std::vector<WriteBackOperation> write_back_operations;
     auto [forward_operations, load_back_operations] =
         buildForwardOperations(plan, std::move(candidates), write_back_operations);
+
     plan.With(ForwardBatch{std::move(forward_operations)});
 
     if (config_.StreamsDeviceCacheToHost()) {
@@ -442,6 +442,7 @@ ExecutionPlan Scheduler::NextExecutionPlan() {
             write_back_operations.push_back(std::move(*store));
         }
     }
+
     if (!write_back_operations.empty()) {
         plan.With(CacheOperation{WriteBackBatch{write_back_operations}});
     }
