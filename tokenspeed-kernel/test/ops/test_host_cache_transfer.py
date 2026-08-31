@@ -122,3 +122,67 @@ def test_cache_ranges_grid_stride_and_workspace_reuse():
     assert torch.equal(host[128:256], device[128:256].cpu())
     assert workspace._address_table.data_ptr() == address_ptr
     assert workspace._range_device.data_ptr() == range_ptr
+
+
+@requires_cuda
+def test_layerwise_workspace_reuse_preserves_small_h2d_after_large():
+    """Layer-wise loads refill the pinned range table between launches.
+
+    A non-blocking commit of that table races the next CPU refill and has been
+    observed to drop KDA field restores after large MLA range batches.
+    """
+
+    from tokenspeed_kernel.ops.kvcache.host_transfer import HostTransferWorkspace
+
+    device = torch.zeros(1 << 20, dtype=torch.uint8, device="cuda")
+    host = torch.arange(1 << 20, dtype=torch.uint8, pin_memory=True)
+    workspace = HostTransferWorkspace()
+    stream = torch.cuda.Stream()
+    # One large MLA-like batch, then several small KDA-like (conv, recurrent)
+    # pairs that reuse the same workspace without an intervening synchronize.
+    large = tuple((0, i * 64, i * 64, 64) for i in range(400))
+    small_batches = [
+        ((0, 800 * 64, 800 * 64, 32), (0, 801 * 64, 801 * 64, 48)),
+        ((0, 802 * 64, 802 * 64, 32), (0, 803 * 64, 803 * 64, 48)),
+        ((0, 804 * 64, 804 * 64, 32), (0, 805 * 64, 805 * 64, 48)),
+    ]
+    try:
+        count, max_bytes = workspace.load_ranges(large)
+        transfer_cache_ranges(
+            "h2d",
+            (device,),
+            host,
+            (),
+            stream,
+            backend="triton",
+            workspace=workspace,
+            num_ranges=count,
+            max_bytes=max_bytes,
+            grid_cap=64,
+        )
+        for batch in small_batches:
+            count, max_bytes = workspace.load_ranges(batch)
+            transfer_cache_ranges(
+                "h2d",
+                (device,),
+                host,
+                (),
+                stream,
+                backend="triton",
+                workspace=workspace,
+                num_ranges=count,
+                max_bytes=max_bytes,
+                grid_cap=64,
+            )
+    except RuntimeError as error:
+        message = str(error).lower()
+        if "unavailable" in message or "not device-mapped" in message:
+            pytest.skip(str(error))
+        raise
+    stream.synchronize()
+    for batch in small_batches:
+        for _, device_offset, host_offset, num_bytes in batch:
+            assert torch.equal(
+                device[device_offset : device_offset + num_bytes].cpu(),
+                host[host_offset : host_offset + num_bytes],
+            )
