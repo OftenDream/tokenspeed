@@ -87,8 +87,10 @@ class HostTransferWorkspace:
             self._range_device = torch.empty(
                 (capacity, 4), dtype=torch.int64, device=device
             )
+        # Sync: layerwise load rewrites this pinned table as soon as the call
+        # returns; async HtoD would race and corrupt later small KDA restores.
         self._range_device[:num_ranges].copy_(
-            self._range_host[:num_ranges], non_blocking=True
+            self._range_host[:num_ranges], non_blocking=False
         )
         return self._range_device
 
