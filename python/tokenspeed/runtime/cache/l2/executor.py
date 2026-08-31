@@ -171,7 +171,19 @@ class L2CacheExecutor:
         # are fenced per layer by the tracker events.
         self.load_stream = _new_cache_stream(_load_stream_priority())
         self._write_workspace = HostTransferWorkspace()
-        self._load_workspace = HostTransferWorkspace()
+        # A tracker waits for an event set's previous final-layer event before
+        # reusing its index. Aligning workspaces to those indices keeps each
+        # load's pinned and Device range tables immutable until all consumers
+        # of that table have completed.
+        load_workspace_count = len(self._load_trackers[0][0].event_sets)
+        if any(
+            len(tracker.event_sets) != load_workspace_count
+            for tracker, _ in self._load_trackers
+        ):
+            raise RuntimeError("target and draft Host-load event sets diverged")
+        self._load_workspaces = tuple(
+            HostTransferWorkspace() for _ in range(load_workspace_count)
+        )
 
         # Submission runs on the forward thread and polling on the control
         # plane (event queries only), so the completion queues below are the
@@ -353,8 +365,8 @@ class L2CacheExecutor:
         # copy wait for that zeroing; the per-layer load events then keep model
         # consumers from reading partially restored cache state.
         load_index = None
-        consumer_offset = 0
         finish = None
+        active_trackers = []
         for tracker, consumer_count in self._load_trackers:
             current_load_index = tracker.begin_load()
             if load_index is None:
@@ -364,27 +376,69 @@ class L2CacheExecutor:
             load_events = tracker.event_sets[current_load_index]
             load_events.start_event.record()
             load_events.start_event.wait(self.load_stream)
+            active_trackers.append((load_events, consumer_count))
+        if load_index is None:
+            raise RuntimeError("cache transfer layout has no layer consumers")
+
+        layer_ranges = []
+        for layer_index in range(sum(count for _, count in active_trackers)):
+            consumer = self.layout.consumers[layer_index]
+            layer_ranges.append(self._transfer_ranges(transfers, set(consumer)))
+
+        range_descriptors = None
+        workspace = None
+        device = None
+        if self.transfer_backend != "dma":
+            device = self.layout.buffers[0].device
+        if device is not None and device.type != "npu":
+            workspace = self._load_workspaces[load_index]
+            range_descriptors = workspace.load_range_batches(layer_ranges)
+            total_ranges = sum(descriptor[1] for descriptor in range_descriptors)
+            if total_ranges:
+                # All layer kernels below read slices of this one table. The
+                # indexed workspace is not refilled until this event set wraps.
+                with device_module.stream(self.load_stream):
+                    workspace.commit_ranges(
+                        total_ranges,
+                        device,
+                        non_blocking=True,
+                    )
+
+        flat_layer_index = 0
+        for load_events, consumer_count in active_trackers:
             for layer_index in range(consumer_count):
-                consumer = self.layout.consumers[consumer_offset + layer_index]
-                num_ranges, max_bytes = self._fill_workspace_ranges(
-                    self._load_workspace, transfers, set(consumer)
-                )
-                transfer_cache_ranges(
-                    "h2d",
-                    self.layout.buffers,
-                    self.host_storage.host_buffer,
-                    (),
-                    self.load_stream,
-                    backend=self.transfer_backend,
-                    workspace=self._load_workspace,
-                    num_ranges=num_ranges,
-                    max_bytes=max_bytes,
-                )
+                ranges = layer_ranges[flat_layer_index]
+                if range_descriptors is None:
+                    transfer_cache_ranges(
+                        "h2d",
+                        self.layout.buffers,
+                        self.host_storage.host_buffer,
+                        ranges,
+                        self.load_stream,
+                        backend=self.transfer_backend,
+                    )
+                else:
+                    range_offset, num_ranges, max_bytes = range_descriptors[
+                        flat_layer_index
+                    ]
+                    transfer_cache_ranges(
+                        "h2d",
+                        self.layout.buffers,
+                        self.host_storage.host_buffer,
+                        (),
+                        self.load_stream,
+                        backend=self.transfer_backend,
+                        workspace=workspace,
+                        num_ranges=num_ranges,
+                        max_bytes=max_bytes,
+                        range_offset=range_offset,
+                        ranges_committed=True,
+                    )
                 finish = device_module.Event()
                 finish.record(self.load_stream)
                 load_events.layer_done_events[layer_index] = finish
-            consumer_offset += consumer_count
-        if load_index is None or finish is None:
+                flat_layer_index += 1
+        if finish is None:
             raise RuntimeError("cache transfer layout has no layer consumers")
         with self._ack_lock:
             self._load_acks.append(_Ack(finish, op_ids))

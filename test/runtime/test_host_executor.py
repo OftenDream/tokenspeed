@@ -6,8 +6,9 @@ import os
 import sys
 import threading
 import unittest
+from contextlib import nullcontext
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ci_system.ci_register import register_cuda_ci
@@ -309,6 +310,96 @@ class GroupAwareWireTest(unittest.TestCase):
         log_info.assert_called_once_with(
             "[L2] load started: operations=%d blocks=%d", 1, 2
         )
+
+    def test_loadback_commits_one_immutable_table_and_launches_layer_slices(self):
+        try:
+            import tokenspeed.runtime.cache.l2.executor as executor_module
+
+            L2CacheExecutor = executor_module.L2CacheExecutor
+        except (ImportError, ModuleNotFoundError) as exc:
+            self.skipTest(f"needs runtime dependencies: {exc}")
+
+        executor = L2CacheExecutor.__new__(L2CacheExecutor)
+        executor._ack_lock = threading.Lock()
+        executor._verifier = None
+        executor.attn_tp_rank = 0
+        executor._ready_load_op_ids = []
+        executor._load_acks = []
+        executor.load_stream = object()
+        executor.transfer_backend = "auto"
+        device = SimpleNamespace(type="cuda")
+        device_buffer = SimpleNamespace(device=device)
+        executor.layout = SimpleNamespace(
+            buffers=(device_buffer,),
+            consumers=(("layer.0",), ("layer.1",)),
+        )
+        executor.host_storage = SimpleNamespace(host_buffer="host")
+        layer_ranges = [
+            [(0, 64, 128, 32), (1, 96, 160, 16)],
+            [(0, 192, 256, 48)],
+        ]
+        executor._transfer_ranges = Mock(side_effect=layer_ranges)
+        workspace = Mock()
+        workspace.load_range_batches.return_value = ((0, 2, 32), (2, 1, 48))
+        executor._load_workspaces = (workspace,)
+        load_events = SimpleNamespace(
+            start_event=Mock(), layer_done_events=[None, None]
+        )
+        tracker = Mock()
+        tracker.begin_load.return_value = 0
+        tracker.event_sets = [load_events]
+        executor._load_trackers = [(tracker, 2)]
+        finishes = [Mock(), Mock()]
+
+        with (
+            patch.object(executor_module, "get_is_capture_mode", return_value=False),
+            patch.object(
+                executor_module.device_module,
+                "stream",
+                return_value=nullcontext(),
+            ),
+            patch.object(executor_module.device_module, "Event", side_effect=finishes),
+            patch.object(executor_module, "transfer_cache_ranges") as transfer,
+        ):
+            executor._start_loading([9], [(0, 2, 1)])
+
+        workspace.load_range_batches.assert_called_once_with(layer_ranges)
+        workspace.commit_ranges.assert_called_once_with(3, device, non_blocking=True)
+        self.assertEqual(
+            transfer.call_args_list,
+            [
+                call(
+                    "h2d",
+                    executor.layout.buffers,
+                    executor.host_storage.host_buffer,
+                    (),
+                    executor.load_stream,
+                    backend="auto",
+                    workspace=workspace,
+                    num_ranges=2,
+                    max_bytes=32,
+                    range_offset=0,
+                    ranges_committed=True,
+                ),
+                call(
+                    "h2d",
+                    executor.layout.buffers,
+                    executor.host_storage.host_buffer,
+                    (),
+                    executor.load_stream,
+                    backend="auto",
+                    workspace=workspace,
+                    num_ranges=1,
+                    max_bytes=48,
+                    range_offset=2,
+                    ranges_committed=True,
+                ),
+            ],
+        )
+        finishes[0].record.assert_called_once_with(executor.load_stream)
+        finishes[1].record.assert_called_once_with(executor.load_stream)
+        self.assertIs(load_events.layer_done_events[0], finishes[0])
+        self.assertIs(load_events.layer_done_events[1], finishes[1])
 
 
 class CompactLayoutRoundTripTest(unittest.TestCase):

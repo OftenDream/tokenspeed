@@ -43,6 +43,8 @@ class HostTransferWorkspace:
         self._address_table: torch.Tensor | None = None
         self._range_host: torch.Tensor | None = None
         self._range_device: torch.Tensor | None = None
+        self._num_loaded_ranges = 0
+        self._num_committed_ranges = 0
 
     def ensure_range_host(self, num_ranges: int) -> torch.Tensor:
         if num_ranges <= 0:
@@ -77,8 +79,14 @@ class HostTransferWorkspace:
             self._address_key = key
         return self._address_table
 
-    def commit_ranges(self, num_ranges: int, device: torch.device) -> torch.Tensor:
-        if self._range_host is None or self._range_host.shape[0] < num_ranges:
+    def commit_ranges(
+        self,
+        num_ranges: int,
+        device: torch.device,
+        *,
+        non_blocking: bool = False,
+    ) -> torch.Tensor:
+        if self._range_host is None or self._num_loaded_ranges < num_ranges:
             raise ValueError("range host table is smaller than num_ranges")
         if self._range_device is None or self._range_device.shape[0] < num_ranges:
             capacity = num_ranges
@@ -87,11 +95,10 @@ class HostTransferWorkspace:
             self._range_device = torch.empty(
                 (capacity, 4), dtype=torch.int64, device=device
             )
-        # Sync: layerwise load rewrites this pinned table as soon as the call
-        # returns; async HtoD would race and corrupt later small KDA restores.
         self._range_device[:num_ranges].copy_(
-            self._range_host[:num_ranges], non_blocking=False
+            self._range_host[:num_ranges], non_blocking=non_blocking
         )
+        self._num_committed_ranges = num_ranges
         return self._range_device
 
     def load_ranges(
@@ -103,12 +110,52 @@ class HostTransferWorkspace:
             return 0, 0
         host = self.ensure_range_host(num_ranges)
         host[:num_ranges].copy_(torch.as_tensor(ranges, dtype=torch.int64))
+        self._num_loaded_ranges = num_ranges
         return num_ranges, max(int(row[3]) for row in ranges)
 
-    def host_rows(self, num_ranges: int) -> torch.Tensor:
+    def load_range_batches(
+        self,
+        batches: Sequence[Sequence[tuple[int, int, int, int]]],
+    ) -> tuple[tuple[int, int, int], ...]:
+        """Load immutable range batches into one pinned table.
+
+        Args:
+            batches: Per-launch range rows. Empty launches remain represented.
+
+        Returns:
+            One ``(range_offset, num_ranges, max_bytes)`` descriptor per batch.
+        """
+
+        descriptors = []
+        flat_ranges = []
+        range_offset = 0
+        for ranges in batches:
+            num_ranges = len(ranges)
+            max_bytes = max((int(row[3]) for row in ranges), default=0)
+            descriptors.append((range_offset, num_ranges, max_bytes))
+            flat_ranges.extend(ranges)
+            range_offset += num_ranges
+        if flat_ranges:
+            host = self.ensure_range_host(len(flat_ranges))
+            host[: len(flat_ranges)].copy_(
+                torch.as_tensor(flat_ranges, dtype=torch.int64)
+            )
+        self._num_loaded_ranges = len(flat_ranges)
+        return tuple(descriptors)
+
+    def host_rows(self, num_ranges: int, range_offset: int = 0) -> torch.Tensor:
         if self._range_host is None:
             raise ValueError("range host table is empty")
-        return self._range_host[:num_ranges]
+        if range_offset < 0 or range_offset + num_ranges > self._num_loaded_ranges:
+            raise ValueError("range host slice lies outside the table")
+        return self._range_host[range_offset : range_offset + num_ranges]
+
+    def device_rows(self, range_offset: int, num_ranges: int) -> torch.Tensor:
+        if self._range_device is None:
+            raise ValueError("range device table is empty")
+        if range_offset < 0 or range_offset + num_ranges > self._num_committed_ranges:
+            raise ValueError("range device slice lies outside the table")
+        return self._range_device[range_offset : range_offset + num_ranges]
 
 
 def _triton_is_unavailable(error: Exception) -> bool:
@@ -193,6 +240,8 @@ def transfer_cache_ranges(
     num_ranges: int | None = None,
     max_bytes: int | None = None,
     grid_cap: int | None = None,
+    range_offset: int = 0,
+    ranges_committed: bool = False,
 ) -> None:
     """Copy byte ranges between cache buffers and compact pinned Host memory.
 
@@ -210,6 +259,8 @@ def transfer_cache_ranges(
             ``workspace.ensure_range_host``.
         max_bytes: Largest ``num_bytes`` among those rows.
         grid_cap: Max Triton CTAs; defaults to ``TOKENSPEED_HOST_CACHE_GRID_CAP``.
+        range_offset: First row of an immutable, pre-filled workspace batch.
+        ranges_committed: Read the Device table slice without uploading metadata.
 
     Returns:
         None. Completion is observed by recording an event on ``stream``.
@@ -219,7 +270,13 @@ def transfer_cache_ranges(
         raise ValueError(f"unknown cache transfer direction {direction!r}")
     if backend not in ("auto", "triton", "dma"):
         raise ValueError(f"unknown cache transfer backend {backend!r}")
+    if range_offset < 0:
+        raise ValueError("range_offset must be non-negative")
+    if ranges_committed and (workspace is None or num_ranges is None):
+        raise ValueError("committed ranges require workspace and num_ranges")
     if num_ranges is None:
+        if range_offset != 0:
+            raise ValueError("range_offset requires pre-filled ranges")
         _validate_ranges(device_buffers, host_buffer, ranges)
         if not ranges:
             return
@@ -249,8 +306,10 @@ def transfer_cache_ranges(
                 if prepared_ranges is not None:
                     tables.load_ranges(prepared_ranges)
                 address_table = tables.bind_addresses(device_buffers, host_buffer)
-                range_table = tables.commit_ranges(
-                    prepared_count, device_buffers[0].device
+                range_table = (
+                    tables.device_rows(range_offset, prepared_count)
+                    if ranges_committed
+                    else tables.commit_ranges(prepared_count, device_buffers[0].device)
                 )
                 _transfer_cache_ranges_triton(
                     address_table,
@@ -277,7 +336,7 @@ def transfer_cache_ranges(
         if prepared_ranges is None:
             prepared_ranges = [
                 (int(row[0]), int(row[1]), int(row[2]), int(row[3]))
-                for row in workspace.host_rows(prepared_count)
+                for row in workspace.host_rows(prepared_count, range_offset)
             ]
         _transfer_dma(
             direction,
