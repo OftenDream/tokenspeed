@@ -32,10 +32,11 @@ def _load_host_transfer_contract_module():
                 pkg = types.ModuleType(name)
                 pkg.__path__ = [str(path)]
                 sys.modules[name] = pkg
-        sys.modules.setdefault(
+        triton_stub = sys.modules.setdefault(
             "tokenspeed_kernel.ops.kvcache.triton",
             MagicMock(name="kvcache_triton_stub"),
         )
+        triton_stub.HOST_CACHE_TRANSFER_CHUNK_BYTES = 4096
         return importlib.import_module(module_name)
 
 
@@ -467,7 +468,14 @@ def test_block_h2d_triton_uses_committed_tables_without_expanding_ranges(monkeyp
     geometry = _sample_geometry(host_transfer).bind(torch.device("cpu"))
     workspace = host_transfer.HostTransferWorkspace()
     num_blocks, _ = workspace.load_block_transfers(
-        ((0, 2, 1), (1, 3, 2)),
+        (
+            (0, 2, 1),
+            (0, 3, 2),
+            (0, 4, 3),
+            (0, 5, 4),
+            (1, 3, 2),
+            (1, 4, 1),
+        ),
         geometry=geometry,
     )
     workspace.commit_block_transfers(num_blocks, torch.device("cpu"))
@@ -509,14 +517,108 @@ def test_block_h2d_triton_uses_committed_tables_without_expanding_ranges(monkeyp
     assert args[2].data_ptr() == workspace._block_device.data_ptr()
     assert args[3].numel() == geometry.num_groups + 1
     assert kwargs == {
-        "num_blocks": num_blocks,
         "geometry_offset": 2,
         "num_geometry_rows": 1,
         "host_lcm_block_bytes": geometry.host_lcm_block_bytes,
-        "max_payload_bytes": 1000,
+        "work_items": 2,
         "num_device_buffers": 1,
         "grid_cap": 7,
     }
+
+
+def test_block_h2d_triton_uses_max_real_work_across_layer_groups(monkeypatch):
+    host_transfer = _load_host_transfer_contract_module()
+    geometry = host_transfer.build_host_transfer_geometry(
+        rows=(
+            (0, 0, 0, 8192, 6000, 0, 1, 5003),
+            (1, 0, 0, 64, 32, 0, 1, 32),
+        ),
+        layer_slices=((0, 2, 5003),),
+        group_packing=(1, 1),
+        host_lcm_block_bytes=6000,
+        num_host_lcm_blocks=8,
+        num_device_lcm_blocks=8,
+        num_device_buffers=1,
+    ).bind(torch.device("cpu"))
+    workspace = host_transfer.HostTransferWorkspace()
+    num_blocks, _ = workspace.load_block_transfers(
+        ((0, 1, 1), (0, 2, 2), (1, 1, 1), (1, 2, 2), (1, 3, 3)),
+        geometry=geometry,
+    )
+    workspace.commit_block_transfers(num_blocks, torch.device("cpu"))
+    workspace.bind_addresses = MagicMock(return_value=object())
+    triton_transfer = MagicMock()
+    monkeypatch.setattr(
+        host_transfer, "_transfer_cache_blocks_h2d_triton", triton_transfer
+    )
+    monkeypatch.setattr(host_transfer, "_mapped_host_triton_available", None)
+
+    host_transfer.transfer_cache_blocks_h2d(
+        (torch.empty(1, dtype=torch.uint8),),
+        torch.empty(1, dtype=torch.uint8),
+        geometry,
+        workspace,
+        stream=None,
+        num_blocks=num_blocks,
+        geometry_offset=0,
+        num_geometry_rows=2,
+        max_payload_bytes=5003,
+        backend="triton",
+    )
+
+    # Group 0: 2 blocks * 2 chunks = 4. Group 1: 3 blocks * 1 chunk = 3.
+    assert triton_transfer.call_args.kwargs["work_items"] == 4
+
+
+def test_block_h2d_triton_skips_layer_with_no_group_blocks(monkeypatch):
+    host_transfer = _load_host_transfer_contract_module()
+    geometry = _sample_geometry(host_transfer).bind(torch.device("cpu"))
+    workspace = host_transfer.HostTransferWorkspace()
+    num_blocks, _ = workspace.load_block_transfers(
+        ((0, 2, 1),),
+        geometry=geometry,
+    )
+    workspace.commit_block_transfers(num_blocks, torch.device("cpu"))
+    triton_transfer = MagicMock()
+    monkeypatch.setattr(
+        host_transfer, "_transfer_cache_blocks_h2d_triton", triton_transfer
+    )
+    monkeypatch.setattr(host_transfer, "_mapped_host_triton_available", None)
+
+    host_transfer.transfer_cache_blocks_h2d(
+        (torch.empty(1, dtype=torch.uint8),),
+        torch.empty(1, dtype=torch.uint8),
+        geometry,
+        workspace,
+        stream=None,
+        num_blocks=num_blocks,
+        geometry_offset=2,
+        num_geometry_rows=1,
+        max_payload_bytes=1000,
+        backend="triton",
+    )
+
+    triton_transfer.assert_not_called()
+
+
+def test_block_h2d_rejects_nonempty_slice_with_zero_max_payload():
+    host_transfer = _load_host_transfer_contract_module()
+    geometry = _sample_geometry(host_transfer)
+    workspace = host_transfer.HostTransferWorkspace()
+
+    with pytest.raises(ValueError, match="max_payload_bytes"):
+        host_transfer.transfer_cache_blocks_h2d(
+            (torch.empty(1, dtype=torch.uint8),),
+            torch.empty(1, dtype=torch.uint8),
+            geometry,
+            workspace,
+            stream=None,
+            num_blocks=1,
+            geometry_offset=0,
+            num_geometry_rows=1,
+            max_payload_bytes=0,
+            backend="dma",
+        )
 
 
 @pytest.mark.parametrize("requested_num_blocks", [1, 3])

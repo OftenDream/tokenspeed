@@ -30,9 +30,8 @@ from typing import Literal
 
 import torch
 from tokenspeed_kernel.ops.kvcache.triton import (
+    HOST_CACHE_TRANSFER_CHUNK_BYTES,
     transfer_cache_blocks_h2d as _transfer_cache_blocks_h2d_triton,
-)
-from tokenspeed_kernel.ops.kvcache.triton import (
     transfer_cache_ranges as _transfer_cache_ranges_triton,
 )
 from tokenspeed_kernel.platform import current_platform
@@ -657,6 +656,33 @@ def _make_h2d_ranges(
     return tuple(ranges)
 
 
+def _layer_block_work_items(
+    geometry: HostTransferGeometry,
+    workspace: HostTransferWorkspace,
+    *,
+    geometry_offset: int,
+    num_geometry_rows: int,
+) -> int:
+    """Return the largest real block/chunk count among one layer's fields."""
+
+    geometry_rows = geometry.host_rows[
+        geometry_offset : geometry_offset + num_geometry_rows
+    ].tolist()
+    group_offsets = workspace.block_group_offsets_host().tolist()
+    work_items = 0
+    for row in geometry_rows:
+        group_index = int(row[0])
+        payload_bytes = int(row[7])
+        group_blocks = int(
+            group_offsets[group_index + 1] - group_offsets[group_index]
+        )
+        num_chunks = (
+            payload_bytes + HOST_CACHE_TRANSFER_CHUNK_BYTES - 1
+        ) // HOST_CACHE_TRANSFER_CHUNK_BYTES
+        work_items = max(work_items, group_blocks * num_chunks)
+    return work_items
+
+
 def transfer_cache_blocks_h2d(
     device_buffers: Sequence[torch.Tensor],
     host_buffer: torch.Tensor,
@@ -698,6 +724,8 @@ def transfer_cache_blocks_h2d(
         raise ValueError("geometry slice lies outside the static table")
     if num_blocks < 0:
         raise ValueError("num_blocks must be non-negative")
+    if num_geometry_rows > 0 and max_payload_bytes <= 0:
+        raise ValueError("max_payload_bytes must be positive for a non-empty slice")
     if num_blocks == 0 or num_geometry_rows == 0:
         return
 
@@ -735,17 +763,24 @@ def transfer_cache_blocks_h2d(
         try:
             with stream_context:
                 block_rows, group_offsets = workspace.committed_block_tables(num_blocks)
+                work_items = _layer_block_work_items(
+                    geometry,
+                    workspace,
+                    geometry_offset=geometry_offset,
+                    num_geometry_rows=num_geometry_rows,
+                )
+                if work_items == 0:
+                    return
                 address_table = workspace.bind_addresses(device_buffers, host_buffer)
                 _transfer_cache_blocks_h2d_triton(
                     address_table,
                     geometry.device_rows,
                     block_rows,
                     group_offsets,
-                    num_blocks=num_blocks,
                     geometry_offset=geometry_offset,
                     num_geometry_rows=num_geometry_rows,
                     host_lcm_block_bytes=geometry.host_lcm_block_bytes,
-                    max_payload_bytes=max_payload_bytes,
+                    work_items=work_items,
                     num_device_buffers=len(device_buffers),
                     grid_cap=grid_cap,
                 )
