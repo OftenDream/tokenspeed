@@ -326,11 +326,6 @@ def resolve_runner_labels(labels: Iterable[str]) -> List[str]:
     return [resolve_runner_label(label) for label in labels]
 
 
-def resolve_runs_on(runner: str) -> str:
-    """Resolve the Actions label that executes a logical CI runner."""
-    return runner
-
-
 def find_task_files(root: Path) -> List[Path]:
     return sorted(root.rglob("*.yaml"))
 
@@ -414,9 +409,6 @@ def build_matrix(
                 "priority": effective,
                 "optional": is_optional,
             }
-            runs_on = resolve_runs_on(runner)
-            if runs_on != runner:
-                entry["runs_on"] = runs_on
             if task_workflow_stage is not None:
                 entry["workflow_stage"] = task_workflow_stage
             include.append(entry)
@@ -836,20 +828,21 @@ def setup_runner(
             dry_run=dry_run,
         )
 
-    if is_amd_runner(runner) and resolve_runs_on(runner) == runner:
-        # Best-effort: kill any GPU-holding processes left over by a
-        # previous pod scheduled on the same node. Cluster admins flagged
-        # a known race where the device plugin releases a GPU back to the
-        # pool before the previous pod's processes have actually
-        # relinquished VRAM, so we can land in a pod with ~0 GiB free
-        # VRAM. Cleanup script never fails the task.
-        shell_run(
-            "bash test/ci_system/cleanup_amd_gpu_state.sh",
-            env=local_env,
-            cwd=cwd,
-            dry_run=dry_run,
-            check=False,
-        )
+    if is_amd_runner(runner):
+        if runner != "amd-mi450-sim":
+            # Best-effort: kill any GPU-holding processes left over by a
+            # previous pod scheduled on the same node. Cluster admins flagged
+            # a known race where the device plugin releases a GPU back to the
+            # pool before the previous pod's processes have actually
+            # relinquished VRAM, so we can land in a pod with ~0 GiB free
+            # VRAM. Cleanup script never fails the task.
+            shell_run(
+                "bash test/ci_system/cleanup_amd_gpu_state.sh",
+                env=local_env,
+                cwd=cwd,
+                dry_run=dry_run,
+                check=False,
+            )
         return local_env, pgm
     if dry_run:
         return local_env, pgm
