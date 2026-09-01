@@ -7,7 +7,8 @@ import sys
 import threading
 import unittest
 from contextlib import nullcontext
-from types import SimpleNamespace
+from importlib import import_module, util
+from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock, call, patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -32,6 +33,79 @@ class _SyntheticPool:
 
     def register_layerwise_load_tracker(self, tracker):
         self.load_tracker = tracker
+
+
+def _load_executor_module_without_triton(*, force_isolated=False):
+    """Load executor orchestration when optional Triton is not installed."""
+
+    if not force_isolated:
+        executor_name = "tokenspeed.runtime.cache.l2.executor"
+        if executor_name in sys.modules or util.find_spec("tokenspeed_triton"):
+            return import_module("tokenspeed.runtime.cache.l2.executor")
+    host_transfer = ModuleType("tokenspeed_kernel.ops.kvcache.host_transfer")
+    host_transfer.HostTransferWorkspace = Mock
+    host_transfer.build_host_transfer_geometry = Mock()
+    host_transfer.transfer_cache_blocks_h2d = Mock()
+    host_transfer.transfer_cache_ranges = Mock()
+    scheduler = ModuleType("tokenspeed_scheduler")
+
+    class Cache:
+        class WriteBackOp:
+            pass
+
+        class LoadBackOp:
+            pass
+
+        class WriteBackDoneEvent:
+            pass
+
+        class LoadBackDoneEvent:
+            pass
+
+    scheduler.Cache = Cache
+    layerwise_load = ModuleType("tokenspeed.runtime.cache.l2.layerwise_load")
+    layerwise_load.LayerwiseLoadTracker = Mock
+    storage = ModuleType("tokenspeed.runtime.cache.l2.storage")
+    storage.HostCacheStorage = Mock
+    storage.compute_host_lcm_block_bytes = Mock(return_value=1)
+    layout = ModuleType("tokenspeed.runtime.cache.transfer.layout")
+    layout.combine_cache_transfer_layouts = lambda target, draft, group_ids=None: (
+        target if draft is None else draft
+    )
+    graph_wrapper = ModuleType("tokenspeed.runtime.execution.cuda_graph_wrapper")
+    graph_wrapper.get_is_capture_mode = Mock(return_value=False)
+    runtime_utils = ModuleType("tokenspeed.runtime.utils")
+    runtime_utils.get_colorful_logger = Mock(return_value=Mock())
+    runtime_utils.get_device_module = Mock(return_value=Mock())
+    fake_modules = {
+        "tokenspeed_kernel.ops.kvcache.host_transfer": host_transfer,
+        "tokenspeed_scheduler": scheduler,
+        "tokenspeed.runtime.cache.l2.layerwise_load": layerwise_load,
+        "tokenspeed.runtime.cache.l2.storage": storage,
+        "tokenspeed.runtime.cache.transfer.layout": layout,
+        "tokenspeed.runtime.execution.cuda_graph_wrapper": graph_wrapper,
+        "tokenspeed.runtime.utils": runtime_utils,
+    }
+    executor_path = os.path.abspath(
+        os.path.join(
+            os.path.dirname(__file__),
+            "..",
+            "..",
+            "python",
+            "tokenspeed",
+            "runtime",
+            "cache",
+            "l2",
+            "executor.py",
+        )
+    )
+    spec = util.spec_from_file_location("_isolated_l2_executor", executor_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load isolated executor from {executor_path}")
+    executor_module = util.module_from_spec(spec)
+    with patch.dict(sys.modules, fake_modules, clear=False):
+        spec.loader.exec_module(executor_module)
+    return executor_module
 
 
 class CacheEventPayloadTest(unittest.TestCase):
@@ -167,7 +241,7 @@ class GroupAwareWireTest(unittest.TestCase):
 
     def test_submit_load_backs_clears_layerwise_waits_without_load(self):
         try:
-            from tokenspeed.runtime.cache.l2.executor import L2CacheExecutor
+            L2CacheExecutor = _load_executor_module_without_triton().L2CacheExecutor
         except (ImportError, ModuleNotFoundError) as exc:
             self.skipTest(f"needs runtime dependencies: {exc}")
 
@@ -182,7 +256,7 @@ class GroupAwareWireTest(unittest.TestCase):
 
     def test_submit_preserves_group_identity(self):
         try:
-            from tokenspeed.runtime.cache.l2.executor import L2CacheExecutor
+            L2CacheExecutor = _load_executor_module_without_triton().L2CacheExecutor
         except (ImportError, ModuleNotFoundError) as exc:
             self.skipTest(f"needs runtime dependencies: {exc}")
 
@@ -202,7 +276,7 @@ class GroupAwareWireTest(unittest.TestCase):
 
     def test_fill_workspace_ranges_uses_one_batched_load(self):
         try:
-            from tokenspeed.runtime.cache.l2.executor import L2CacheExecutor
+            L2CacheExecutor = _load_executor_module_without_triton().L2CacheExecutor
         except (ImportError, ModuleNotFoundError) as exc:
             self.skipTest(f"needs runtime dependencies: {exc}")
 
@@ -231,7 +305,7 @@ class GroupAwareWireTest(unittest.TestCase):
 
     def test_fill_workspace_ranges_skips_empty_batch(self):
         try:
-            from tokenspeed.runtime.cache.l2.executor import L2CacheExecutor
+            L2CacheExecutor = _load_executor_module_without_triton().L2CacheExecutor
         except (ImportError, ModuleNotFoundError) as exc:
             self.skipTest(f"needs runtime dependencies: {exc}")
 
@@ -246,8 +320,7 @@ class GroupAwareWireTest(unittest.TestCase):
 
     def test_writeback_calls_transfer_with_compact_layout(self):
         try:
-            import tokenspeed.runtime.cache.l2.executor as executor_module
-
+            executor_module = _load_executor_module_without_triton()
             L2CacheExecutor = executor_module.L2CacheExecutor
         except (ImportError, ModuleNotFoundError) as exc:
             self.skipTest(f"needs runtime dependencies: {exc}")
@@ -292,8 +365,7 @@ class GroupAwareWireTest(unittest.TestCase):
 
     def test_loadback_logs_non_empty_batch(self):
         try:
-            import tokenspeed.runtime.cache.l2.executor as executor_module
-
+            executor_module = _load_executor_module_without_triton()
             L2CacheExecutor = executor_module.L2CacheExecutor
         except (ImportError, ModuleNotFoundError) as exc:
             self.skipTest(f"needs runtime dependencies: {exc}")
@@ -305,6 +377,7 @@ class GroupAwareWireTest(unittest.TestCase):
         executor._load_acks = []
         executor.load_stream = object()
         executor.transfer_backend = "dma"
+        executor._load_geometry = None
         executor.layout = SimpleNamespace(buffers=("device",), consumers=(("field",),))
         executor.host_storage = SimpleNamespace(host_buffer="host")
         executor._transfer_ranges = Mock(return_value=[(0, 64, 128, 32)])
@@ -320,19 +393,259 @@ class GroupAwareWireTest(unittest.TestCase):
         with (
             patch.object(executor_module, "get_is_capture_mode", return_value=False),
             patch.object(executor_module.device_module, "Event", return_value=finish),
-            patch.object(executor_module, "transfer_cache_ranges"),
+            patch.object(executor_module, "transfer_cache_ranges") as transfer,
             patch.object(executor_module.logger, "info") as log_info,
         ):
             executor._start_loading([9], [(0, 2, 1), (0, 5, 4)])
 
+        executor._transfer_ranges.assert_called_once_with(
+            [(0, 2, 1), (0, 5, 4)], {"field"}
+        )
+        transfer.assert_called_once_with(
+            "h2d",
+            executor.layout.buffers,
+            executor.host_storage.host_buffer,
+            [(0, 64, 128, 32)],
+            executor.load_stream,
+            backend="dma",
+        )
         log_info.assert_called_once_with(
             "[L2] load started: operations=%d blocks=%d", 1, 2
         )
 
-    def test_loadback_commits_one_immutable_table_and_launches_layer_slices(self):
+    def test_kernel_init_builds_consumer_ordered_static_geometry_once(self):
         try:
-            import tokenspeed.runtime.cache.l2.executor as executor_module
+            executor_module = _load_executor_module_without_triton()
+            L2CacheExecutor = executor_module.L2CacheExecutor
+        except (ImportError, ModuleNotFoundError) as exc:
+            self.skipTest(f"needs runtime dependencies: {exc}")
 
+        device = SimpleNamespace(type="cuda")
+        buffer = SimpleNamespace(device=device)
+        fields = {
+            "target.0.k": SimpleNamespace(
+                field_id="target.0.k",
+                device_buffer_index=0,
+                device_block_zero_offset_bytes=8,
+                block_stride_bytes=16,
+                payload_bytes=12,
+            ),
+            "target.2.state": SimpleNamespace(
+                field_id="target.2.state",
+                device_buffer_index=1,
+                device_block_zero_offset_bytes=32,
+                block_stride_bytes=64,
+                payload_bytes=20,
+            ),
+            "draft.0.k": SimpleNamespace(
+                field_id="draft.0.k",
+                device_buffer_index=0,
+                device_block_zero_offset_bytes=48,
+                block_stride_bytes=16,
+                payload_bytes=12,
+            ),
+        }
+        combined_layout = SimpleNamespace(
+            num_lcm_blocks=11,
+            buffers=(buffer, SimpleNamespace(device=device)),
+            groups=(
+                SimpleNamespace(
+                    cache_blocks_per_lcm_block=4,
+                    fields=(fields["target.2.state"],),
+                ),
+                SimpleNamespace(
+                    cache_blocks_per_lcm_block=8,
+                    fields=(fields["target.0.k"], fields["draft.0.k"]),
+                ),
+            ),
+            # Target layers precede draft layers, and empty layers are retained.
+            consumers=(
+                ("target.0.k",),
+                (),
+                ("target.2.state",),
+                ("draft.0.k",),
+            ),
+        )
+        target_layout = SimpleNamespace(
+            consumers=(("target.0.k",), (), ("target.2.state",))
+        )
+        draft_layout = SimpleNamespace(consumers=(("draft.0.k",),))
+        target_pool = Mock()
+        target_pool.cache_transfer_layout.return_value = target_layout
+        target_pool.arena.cache_group_specs = (SimpleNamespace(group_id="state"),)
+        draft_pool = Mock()
+        draft_pool.cache_transfer_layout.return_value = draft_layout
+        storage = SimpleNamespace(
+            host_cache_block_bytes=(20, 24),
+            host_field_offsets=((0,), (0, 12)),
+            host_lcm_block_bytes=192,
+            num_host_lcm_blocks=3,
+            host_buffer="host",
+        )
+        unbound_geometry = Mock()
+        bound_geometry = object()
+        unbound_geometry.bind.return_value = bound_geometry
+        trackers = []
+
+        def make_tracker(consumer_count):
+            tracker = Mock()
+            tracker.event_sets = [object(), object()]
+            trackers.append((consumer_count, tracker))
+            return tracker
+
+        with (
+            patch.object(
+                executor_module,
+                "combine_cache_transfer_layouts",
+                return_value=combined_layout,
+            ),
+            patch.object(
+                executor_module,
+                "compute_host_lcm_block_bytes",
+                return_value=storage.host_lcm_block_bytes,
+            ),
+            patch.object(executor_module, "HostCacheStorage", return_value=storage),
+            patch.object(
+                executor_module.psutil,
+                "virtual_memory",
+                return_value=SimpleNamespace(available=10**12),
+            ),
+            patch.object(
+                executor_module, "LayerwiseLoadTracker", side_effect=make_tracker
+            ),
+            patch.object(executor_module, "_new_cache_stream", return_value="load"),
+            patch.object(executor_module, "HostTransferWorkspace", side_effect=Mock),
+            patch.object(
+                executor_module,
+                "build_host_transfer_geometry",
+                return_value=unbound_geometry,
+            ) as build_geometry,
+            patch.object(
+                executor_module.device_module,
+                "stream",
+                return_value=nullcontext(),
+            ),
+        ):
+            executor = L2CacheExecutor(
+                target_pool,
+                draft_pool=draft_pool,
+                host_ratio=1.0,
+                host_size_gb=0,
+                io_backend="kernel",
+            )
+
+        build_geometry.assert_called_once_with(
+            rows=(
+                (1, 0, 8, 16, 24, 0, 8, 12),
+                (0, 1, 32, 64, 20, 0, 4, 20),
+                (1, 0, 48, 16, 24, 12, 8, 12),
+            ),
+            layer_slices=((0, 1, 12), (1, 0, 0), (1, 1, 20), (2, 1, 12)),
+            group_packing=(4, 8),
+            host_lcm_block_bytes=192,
+            num_host_lcm_blocks=3,
+            num_device_lcm_blocks=11,
+            num_device_buffers=2,
+        )
+        unbound_geometry.bind.assert_called_once_with(device, non_blocking=True)
+        self.assertIs(executor._load_geometry, bound_geometry)
+        self.assertEqual([count for count, _ in trackers], [3, 1])
+
+    def test_direct_and_npu_init_do_not_create_device_geometry(self):
+        try:
+            executor_module = _load_executor_module_without_triton()
+            L2CacheExecutor = executor_module.L2CacheExecutor
+        except (ImportError, ModuleNotFoundError) as exc:
+            self.skipTest(f"needs runtime dependencies: {exc}")
+
+        pool = Mock()
+        pool.arena.cache_group_specs = (SimpleNamespace(group_id="group"),)
+        storage = SimpleNamespace(
+            host_lcm_block_bytes=64,
+            num_host_lcm_blocks=2,
+            host_buffer="host",
+        )
+        tracker = Mock()
+        tracker.event_sets = [object()]
+
+        with (
+            patch.object(
+                executor_module,
+                "compute_host_lcm_block_bytes",
+                return_value=storage.host_lcm_block_bytes,
+            ),
+            patch.object(executor_module, "HostCacheStorage", return_value=storage),
+            patch.object(
+                executor_module.psutil,
+                "virtual_memory",
+                return_value=SimpleNamespace(available=10**12),
+            ),
+            patch.object(executor_module, "LayerwiseLoadTracker", return_value=tracker),
+            patch.object(executor_module, "_new_cache_stream", return_value="load"),
+            patch.object(executor_module, "HostTransferWorkspace", side_effect=Mock),
+            patch.object(
+                executor_module, "build_host_transfer_geometry"
+            ) as build_geometry,
+        ):
+            for io_backend, device_type in (("direct", "cuda"), ("kernel", "npu")):
+                with self.subTest(io_backend=io_backend, device_type=device_type):
+                    layout = SimpleNamespace(
+                        num_lcm_blocks=2,
+                        buffers=(
+                            SimpleNamespace(device=SimpleNamespace(type=device_type)),
+                        ),
+                        groups=(
+                            SimpleNamespace(
+                                cache_blocks_per_lcm_block=1,
+                                fields=(object(),),
+                            ),
+                        ),
+                        consumers=(("field",),),
+                    )
+                    pool.cache_transfer_layout.return_value = layout
+                    executor = L2CacheExecutor(
+                        pool,
+                        host_ratio=1.0,
+                        host_size_gb=0,
+                        io_backend=io_backend,
+                    )
+                    self.assertIsNone(executor._load_geometry)
+
+        build_geometry.assert_not_called()
+
+    def test_optional_dependency_shim_restores_existing_modules(self):
+        protected_names = (
+            "tokenspeed_kernel.ops.kvcache.host_transfer",
+            "tokenspeed_scheduler",
+            "tokenspeed.runtime.cache.l2.layerwise_load",
+            "tokenspeed.runtime.cache.l2.storage",
+            "tokenspeed.runtime.cache.transfer.layout",
+            "tokenspeed.runtime.execution.cuda_graph_wrapper",
+            "tokenspeed.runtime.utils",
+            "tokenspeed.runtime.cache.l2.executor",
+        )
+        sentinels = {name: ModuleType(name) for name in protected_names}
+
+        with patch.dict(sys.modules, sentinels, clear=False):
+            isolated = _load_executor_module_without_triton(force_isolated=True)
+
+            self.assertIsNot(isolated, sentinels[protected_names[-1]])
+            for name, sentinel in sentinels.items():
+                self.assertIs(sys.modules[name], sentinel)
+
+    def test_two_isolated_loads_preserve_imported_torch_modules(self):
+        first = _load_executor_module_without_triton(force_isolated=True)
+        first_torch = first.torch
+
+        self.assertIs(sys.modules["torch"], first_torch)
+        second = _load_executor_module_without_triton(force_isolated=True)
+
+        self.assertIs(second.torch, first_torch)
+        self.assertIs(sys.modules["torch"], first_torch)
+
+    def test_loadback_commits_block_ids_once_and_launches_geometry_slices(self):
+        try:
+            executor_module = _load_executor_module_without_triton()
             L2CacheExecutor = executor_module.L2CacheExecutor
         except (ImportError, ModuleNotFoundError) as exc:
             self.skipTest(f"needs runtime dependencies: {exc}")
@@ -349,25 +662,25 @@ class GroupAwareWireTest(unittest.TestCase):
         device_buffer = SimpleNamespace(device=device)
         executor.layout = SimpleNamespace(
             buffers=(device_buffer,),
-            consumers=(("layer.0",), ("layer.1",)),
+            consumers=(("layer.0",), (), ("layer.2",)),
         )
         executor.host_storage = SimpleNamespace(host_buffer="host")
-        layer_ranges = [
-            [(0, 64, 128, 32), (1, 96, 160, 16)],
-            [(0, 192, 256, 48)],
-        ]
-        executor._transfer_ranges = Mock(side_effect=layer_ranges)
+        executor._transfer_ranges = Mock(
+            side_effect=AssertionError("normal kernel H2D must not expand ranges")
+        )
+        geometry = SimpleNamespace(layer_slices=((0, 2, 64), (2, 0, 0), (2, 1, 32)))
+        executor._load_geometry = geometry
         workspace = Mock()
-        workspace.load_range_batches.return_value = ((0, 2, 32), (2, 1, 48))
+        workspace.load_block_transfers.return_value = (1, (0, 1))
         executor._load_workspaces = (workspace,)
         load_events = SimpleNamespace(
-            start_event=Mock(), layer_done_events=[None, None]
+            start_event=Mock(), layer_done_events=[None, None, None]
         )
         tracker = Mock()
         tracker.begin_load.return_value = 0
         tracker.event_sets = [load_events]
-        executor._load_trackers = [(tracker, 2)]
-        finishes = [Mock(), Mock()]
+        executor._load_trackers = [(tracker, 3)]
+        finishes = [Mock(), Mock(), Mock()]
 
         with (
             patch.object(executor_module, "get_is_capture_mode", return_value=False),
@@ -377,47 +690,211 @@ class GroupAwareWireTest(unittest.TestCase):
                 return_value=nullcontext(),
             ),
             patch.object(executor_module.device_module, "Event", side_effect=finishes),
-            patch.object(executor_module, "transfer_cache_ranges") as transfer,
+            patch.object(executor_module, "transfer_cache_blocks_h2d") as transfer,
         ):
             executor._start_loading([9], [(0, 2, 1)])
 
-        workspace.load_range_batches.assert_called_once_with(layer_ranges)
-        workspace.commit_ranges.assert_called_once_with(3, device, non_blocking=True)
+        workspace.load_block_transfers.assert_called_once_with(
+            [(0, 2, 1)], geometry=geometry
+        )
+        workspace.commit_block_transfers.assert_called_once_with(
+            1, device, non_blocking=True
+        )
+        executor._transfer_ranges.assert_not_called()
         self.assertEqual(
             transfer.call_args_list,
             [
                 call(
-                    "h2d",
                     executor.layout.buffers,
                     executor.host_storage.host_buffer,
-                    (),
+                    geometry,
+                    workspace,
                     executor.load_stream,
+                    num_blocks=1,
+                    geometry_offset=0,
+                    num_geometry_rows=2,
+                    max_payload_bytes=64,
                     backend="auto",
-                    workspace=workspace,
-                    num_ranges=2,
-                    max_bytes=32,
-                    range_offset=0,
-                    ranges_committed=True,
                 ),
                 call(
-                    "h2d",
                     executor.layout.buffers,
                     executor.host_storage.host_buffer,
-                    (),
+                    geometry,
+                    workspace,
                     executor.load_stream,
+                    num_blocks=1,
+                    geometry_offset=2,
+                    num_geometry_rows=0,
+                    max_payload_bytes=0,
                     backend="auto",
-                    workspace=workspace,
-                    num_ranges=1,
-                    max_bytes=48,
-                    range_offset=2,
-                    ranges_committed=True,
+                ),
+                call(
+                    executor.layout.buffers,
+                    executor.host_storage.host_buffer,
+                    geometry,
+                    workspace,
+                    executor.load_stream,
+                    num_blocks=1,
+                    geometry_offset=2,
+                    num_geometry_rows=1,
+                    max_payload_bytes=32,
+                    backend="auto",
                 ),
             ],
         )
         finishes[0].record.assert_called_once_with(executor.load_stream)
         finishes[1].record.assert_called_once_with(executor.load_stream)
+        finishes[2].record.assert_called_once_with(executor.load_stream)
         self.assertIs(load_events.layer_done_events[0], finishes[0])
         self.assertIs(load_events.layer_done_events[1], finishes[1])
+        self.assertIs(load_events.layer_done_events[2], finishes[2])
+        self.assertIs(executor._load_acks[0].finish_event, finishes[2])
+
+    def test_loadback_launch_failure_retires_all_target_and_draft_events(self):
+        try:
+            executor_module = _load_executor_module_without_triton()
+            L2CacheExecutor = executor_module.L2CacheExecutor
+        except (ImportError, ModuleNotFoundError) as exc:
+            self.skipTest(f"needs runtime dependencies: {exc}")
+
+        executor = L2CacheExecutor.__new__(L2CacheExecutor)
+        executor._ack_lock = threading.Lock()
+        executor.attn_tp_rank = 0
+        executor._ready_load_op_ids = []
+        executor._load_acks = []
+        executor.load_stream = Mock()
+        executor.transfer_backend = "auto"
+        device = SimpleNamespace(type="cuda")
+        executor.layout = SimpleNamespace(
+            buffers=(SimpleNamespace(device=device),),
+            consumers=(("target.0",), ("target.1",), ("draft.0",)),
+        )
+        executor.host_storage = SimpleNamespace(host_buffer="host")
+        geometry = SimpleNamespace(layer_slices=((0, 1, 8), (1, 1, 16), (2, 1, 32)))
+        executor._load_geometry = geometry
+        workspace = Mock()
+        workspace.load_block_transfers.return_value = (1, (0, 1))
+        executor._load_workspaces = (workspace,)
+        target_events = SimpleNamespace(
+            start_event=Mock(), layer_done_events=[Mock(), Mock()]
+        )
+        draft_events = SimpleNamespace(start_event=Mock(), layer_done_events=[Mock()])
+        target_tracker = Mock()
+        target_tracker.begin_load.return_value = 0
+        target_tracker.event_sets = [target_events]
+        draft_tracker = Mock()
+        draft_tracker.begin_load.return_value = 0
+        draft_tracker.event_sets = [draft_events]
+        executor._load_trackers = [(target_tracker, 2), (draft_tracker, 1)]
+        first_finish = Mock()
+        retirement = Mock()
+
+        with (
+            patch.object(executor_module, "get_is_capture_mode", return_value=False),
+            patch.object(
+                executor_module.device_module,
+                "stream",
+                return_value=nullcontext(),
+            ),
+            patch.object(
+                executor_module.device_module,
+                "Event",
+                side_effect=(first_finish, retirement),
+            ),
+            patch.object(
+                executor_module,
+                "transfer_cache_blocks_h2d",
+                side_effect=(None, RuntimeError("layer launch failed")),
+            ) as transfer,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "layer launch failed"):
+                executor._start_loading([9], [(0, 2, 1)])
+
+        self.assertEqual(transfer.call_count, 2)
+        retirement.record.assert_called_once_with(executor.load_stream)
+        self.assertEqual(
+            target_events.layer_done_events,
+            [retirement, retirement],
+        )
+        self.assertEqual(draft_events.layer_done_events, [retirement])
+        executor.load_stream.synchronize.assert_not_called()
+        self.assertEqual(executor._load_acks, [])
+
+    def test_failed_retirement_sync_poisons_executor_and_preserves_original_error(self):
+        try:
+            executor_module = _load_executor_module_without_triton()
+            L2CacheExecutor = executor_module.L2CacheExecutor
+        except (ImportError, ModuleNotFoundError) as exc:
+            self.skipTest(f"needs runtime dependencies: {exc}")
+
+        executor = L2CacheExecutor.__new__(L2CacheExecutor)
+        executor._ack_lock = threading.Lock()
+        executor._write_acks = []
+        executor._load_acks = []
+        executor._ready_write_op_ids = []
+        executor._ready_load_op_ids = []
+        executor.attn_tp_rank = 0
+        executor.load_stream = Mock()
+        executor.transfer_backend = "auto"
+        device = SimpleNamespace(type="cuda")
+        executor.layout = SimpleNamespace(
+            buffers=(SimpleNamespace(device=device),),
+            consumers=(("target.0",),),
+        )
+        executor.host_storage = SimpleNamespace(host_buffer="host")
+        geometry = SimpleNamespace(layer_slices=((0, 1, 8),))
+        executor._load_geometry = geometry
+        workspace = Mock()
+        workspace.load_block_transfers.return_value = (1, (0, 1))
+        executor._load_workspaces = (workspace,)
+        load_events = SimpleNamespace(start_event=Mock(), layer_done_events=[Mock()])
+        tracker = Mock()
+        tracker.begin_load.return_value = 0
+        tracker.event_sets = [load_events]
+        executor._load_trackers = [(tracker, 1)]
+        original_error = RuntimeError("original layer launch failed")
+        retirement = Mock()
+        retirement.record.side_effect = RuntimeError("retirement record failed")
+        executor.load_stream.synchronize.side_effect = RuntimeError(
+            "retirement sync failed"
+        )
+
+        with (
+            patch.object(executor_module, "get_is_capture_mode", return_value=False),
+            patch.object(
+                executor_module.device_module,
+                "stream",
+                return_value=nullcontext(),
+            ),
+            patch.object(
+                executor_module.device_module,
+                "Event",
+                return_value=retirement,
+            ),
+            patch.object(
+                executor_module,
+                "transfer_cache_blocks_h2d",
+                side_effect=original_error,
+            ),
+        ):
+            with self.assertRaises(RuntimeError) as raised:
+                executor._start_loading([9], [(0, 2, 1)])
+
+            self.assertIs(raised.exception, original_error)
+            self.assertEqual(str(raised.exception), "original layer launch failed")
+            self.assertTrue(executor._load_poisoned)
+            notes = getattr(raised.exception, "__notes__", ())
+            self.assertTrue(any("retirement record failed" in note for note in notes))
+            self.assertTrue(any("retirement sync failed" in note for note in notes))
+
+            executor.load_stream.synchronize.side_effect = None
+            executor.shutdown = Mock()
+            executor.reset()
+            self.assertTrue(executor._load_poisoned)
+            with self.assertRaisesRegex(RuntimeError, "poisoned"):
+                executor._start_loading([10], [(0, 3, 2)])
+
+        tracker.begin_load.assert_called_once_with()
 
 
 class CompactLayoutRoundTripTest(unittest.TestCase):
@@ -467,7 +944,7 @@ class CompactLayoutRoundTripTest(unittest.TestCase):
             tuple((field.field_id,) for field in fields),
         )
 
-    def test_real_transfer_restores_compact_multigroup_layout_byte_exactly(self):
+    def test_kernel_executor_round_trip_restores_compact_layout_byte_exactly(self):
         torch = self.torch
         first = torch.full((128,), 0xCC, dtype=torch.uint8, device="cuda")
         second = torch.full((128,), 0xCC, dtype=torch.uint8, device="cuda")
@@ -492,16 +969,26 @@ class CompactLayoutRoundTripTest(unittest.TestCase):
             consumers=(("layer.0.k", "layer.0.v"), ("layer.1.state",)),
         )
 
-        executor, pool, _ = self._make_executor(layout, io_backend="direct")
+        executor, pool, _ = self._make_executor(layout, io_backend="kernel")
 
         # Hand-derived Device ranges for blocks (full: 1, 4; state: 3).
-        first[16:20].fill_(0x11)
-        second[28:34].fill_(0x12)
-        first[40:44].fill_(0x41)
-        second[64:70].fill_(0x42)
-        first[94:99].fill_(0x73)
+        full_k_one = torch.tensor([0x11, 0x12, 0x13, 0x14], dtype=torch.uint8)
+        full_v_one = torch.tensor(
+            [0x21, 0x22, 0x23, 0x24, 0x25, 0x26], dtype=torch.uint8
+        )
+        full_k_four = torch.tensor([0x41, 0x42, 0x43, 0x44], dtype=torch.uint8)
+        full_v_four = torch.tensor(
+            [0x51, 0x52, 0x53, 0x54, 0x55, 0x56], dtype=torch.uint8
+        )
+        state_three = torch.tensor([0x71, 0x72, 0x73, 0x74, 0x75], dtype=torch.uint8)
+        first[16:20].copy_(full_k_one)
+        second[28:34].copy_(full_v_one)
+        first[40:44].copy_(full_k_four)
+        second[64:70].copy_(full_v_four)
+        first[94:99].copy_(state_three)
         torch.cuda.synchronize()
 
+        executor._transfer_ranges = Mock(wraps=executor._transfer_ranges)
         executor._start_writing(  # pylint: disable=protected-access
             [7],
             [(0, 1, 1), (0, 4, 4), (1, 3, 3)],
@@ -509,6 +996,8 @@ class CompactLayoutRoundTripTest(unittest.TestCase):
         torch.cuda.current_stream().synchronize()
         write_results = executor.poll_results()
         self.assertEqual([int(event.op_id) for event in write_results], [7])
+        executor._transfer_ranges.assert_called()
+        executor._transfer_ranges.reset_mock()
 
         # Destroy every Device byte so stale cache contents cannot make the
         # H2D half of the round trip pass accidentally.
@@ -527,23 +1016,18 @@ class CompactLayoutRoundTripTest(unittest.TestCase):
         torch.cuda.synchronize()
         load_results = executor.poll_results()
         self.assertEqual([int(event.op_id) for event in load_results], [9])
+        executor._transfer_ranges.assert_not_called()
 
         # Hand-derived destination ranges for blocks (full: 2, 5; state: 4).
-        self.assertTrue(
-            torch.equal(first[24:28].cpu(), torch.full((4,), 0x11, dtype=torch.uint8))
-        )
-        self.assertTrue(
-            torch.equal(second[40:46].cpu(), torch.full((6,), 0x12, dtype=torch.uint8))
-        )
-        self.assertTrue(
-            torch.equal(first[48:52].cpu(), torch.full((4,), 0x41, dtype=torch.uint8))
-        )
-        self.assertTrue(
-            torch.equal(second[76:82].cpu(), torch.full((6,), 0x42, dtype=torch.uint8))
-        )
-        self.assertTrue(
-            torch.equal(first[104:109].cpu(), torch.full((5,), 0x73, dtype=torch.uint8))
-        )
+        expected_first = torch.full((128,), 0xEE, dtype=torch.uint8)
+        expected_second = torch.full((128,), 0xEE, dtype=torch.uint8)
+        expected_first[24:28].copy_(full_k_one)
+        expected_second[40:46].copy_(full_v_one)
+        expected_first[48:52].copy_(full_k_four)
+        expected_second[76:82].copy_(full_v_four)
+        expected_first[104:109].copy_(state_three)
+        self.assertTrue(torch.equal(first.cpu(), expected_first))
+        self.assertTrue(torch.equal(second.cpu(), expected_second))
 
     def test_real_transfer_restores_merged_owner_draft_subset_once(self):
         torch = self.torch
