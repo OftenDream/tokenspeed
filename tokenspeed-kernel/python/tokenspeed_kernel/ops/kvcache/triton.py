@@ -56,6 +56,7 @@ __all__ = [
     "set_mla_kv_buffer_triton",
     "store_kv_cache",
     "store_sf_interleaved",
+    "transfer_cache_blocks_h2d",
     "transfer_cache_ranges",
     "transfer_kv_all_layer",
     "transfer_kv_all_layer_mla",
@@ -69,6 +70,125 @@ __all__ = [
 # -----------------------------------------------------------------------------
 # Compact Host Cache Transfer
 # -----------------------------------------------------------------------------
+
+
+@triton.jit
+def _transfer_cache_blocks_h2d_kernel(
+    buffer_addresses_ptr,
+    geometry_ptr,
+    block_pairs_ptr,
+    group_offsets_ptr,
+    num_geometry_rows,
+    geometry_offset,
+    host_lcm_block_bytes,
+    NUM_DEVICE_BUFFERS: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    nprogs = tl.num_programs(0)
+    host_address = tl.load(buffer_addresses_ptr + NUM_DEVICE_BUFFERS)
+
+    for row_delta in tl.range(0, num_geometry_rows):
+        row_offset = (geometry_offset + row_delta) * 8
+        group_index = tl.load(geometry_ptr + row_offset)
+        device_buffer_index = tl.load(geometry_ptr + row_offset + 1)
+        device_zero = tl.load(geometry_ptr + row_offset + 2)
+        device_stride = tl.load(geometry_ptr + row_offset + 3)
+        host_block_bytes = tl.load(geometry_ptr + row_offset + 4)
+        host_field_offset = tl.load(geometry_ptr + row_offset + 5)
+        packing = tl.load(geometry_ptr + row_offset + 6)
+        payload_bytes = tl.load(geometry_ptr + row_offset + 7)
+
+        group_start = tl.load(group_offsets_ptr + group_index)
+        group_end = tl.load(group_offsets_ptr + group_index + 1)
+        num_chunks = (payload_bytes + BLOCK_SIZE - 1) // BLOCK_SIZE
+        group_work_items = (group_end - group_start) * num_chunks
+        device_address = tl.load(buffer_addresses_ptr + device_buffer_index)
+
+        for work_id in tl.range(pid, group_work_items, nprogs):
+            pair_index = group_start + work_id // num_chunks
+            chunk_index = work_id % num_chunks
+            device_block_id = tl.load(block_pairs_ptr + pair_index * 2)
+            host_block_id = tl.load(block_pairs_ptr + pair_index * 2 + 1)
+            host_zero_based = host_block_id - 1
+            host_parent = host_zero_based // packing
+            host_child = host_zero_based % packing
+            device_offset = device_zero + device_block_id * device_stride
+            host_offset = (
+                host_parent * host_lcm_block_bytes
+                + host_child * host_block_bytes
+                + host_field_offset
+            )
+            byte_offsets = chunk_index * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+            mask = byte_offsets < payload_bytes
+            device_ptr = tl.cast(
+                device_address + device_offset,
+                tl.pointer_type(tl.uint8),
+            )
+            host_ptr = tl.cast(host_address + host_offset, tl.pointer_type(tl.uint8))
+            values = tl.load(
+                host_ptr + byte_offsets,
+                mask=mask,
+                cache_modifier=".cg",
+            )
+            tl.store(device_ptr + byte_offsets, values, mask=mask)
+
+
+def transfer_cache_blocks_h2d(
+    address_table: torch.Tensor,
+    geometry_table: torch.Tensor,
+    block_pairs: torch.Tensor,
+    group_offsets: torch.Tensor,
+    *,
+    num_blocks: int,
+    geometry_offset: int,
+    num_geometry_rows: int,
+    host_lcm_block_bytes: int,
+    max_payload_bytes: int,
+    num_device_buffers: int,
+    grid_cap: int | None = None,
+) -> None:
+    """Restore one layer from compact Host blocks using prepared metadata.
+
+    Args:
+        address_table: Device pointers followed by the mapped Host pointer.
+        geometry_table: Static int64 field rows.
+        block_pairs: Dynamic int64 ``(device_block_id, host_block_id)`` rows.
+        group_offsets: Valid group bucket offsets, with ``num_groups + 1`` entries.
+        num_blocks: Valid leading rows in ``block_pairs``.
+        geometry_offset: First static field row for this layer.
+        num_geometry_rows: Number of field rows for this layer.
+        host_lcm_block_bytes: Byte stride between compact Host LCM blocks.
+        max_payload_bytes: Largest payload in the requested geometry slice.
+        num_device_buffers: Count of Device pointers in ``address_table``.
+        grid_cap: Max CTAs. Defaults to ``TOKENSPEED_HOST_CACHE_GRID_CAP``.
+
+    Returns:
+        None; the Host-to-Device copies are enqueued on the current stream.
+    """
+
+    if num_blocks <= 0 or num_geometry_rows <= 0:
+        return
+    cap = _HOST_CACHE_GRID_CAP if grid_cap is None else int(grid_cap)
+    if cap <= 0:
+        raise ValueError("grid_cap must be positive")
+    work_items = num_blocks * triton.cdiv(
+        max_payload_bytes,
+        _HOST_CACHE_BLOCK_SIZE,
+    )
+    grid = (min(cap, work_items),)
+    _transfer_cache_blocks_h2d_kernel[grid](
+        address_table,
+        geometry_table,
+        block_pairs,
+        group_offsets,
+        num_geometry_rows,
+        geometry_offset,
+        host_lcm_block_bytes,
+        NUM_DEVICE_BUFFERS=num_device_buffers,
+        BLOCK_SIZE=_HOST_CACHE_BLOCK_SIZE,
+        num_warps=8,
+    )
 
 
 @triton.jit

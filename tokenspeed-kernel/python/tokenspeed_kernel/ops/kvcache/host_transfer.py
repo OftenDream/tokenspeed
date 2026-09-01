@@ -24,15 +24,215 @@ from __future__ import annotations
 
 import warnings
 from collections.abc import Sequence
+from contextlib import nullcontext
+from dataclasses import dataclass, replace
 from typing import Literal
 
 import torch
+from tokenspeed_kernel.ops.kvcache.triton import (
+    transfer_cache_blocks_h2d as _transfer_cache_blocks_h2d_triton,
+)
 from tokenspeed_kernel.ops.kvcache.triton import (
     transfer_cache_ranges as _transfer_cache_ranges_triton,
 )
 from tokenspeed_kernel.platform import current_platform
 
 _mapped_host_triton_available: bool | None = None
+
+_GEOMETRY_ROW_WIDTH = 8
+GeometryRow = tuple[int, int, int, int, int, int, int, int]
+LayerSlice = tuple[int, int, int]
+
+
+def _pinned_host_int64(shape: tuple[int, ...]) -> torch.Tensor:
+    if torch.cuda.is_available():
+        return torch.empty(shape, dtype=torch.int64, pin_memory=True)
+    return torch.empty(shape, dtype=torch.int64, device="cpu")
+
+
+@dataclass(frozen=True, slots=True)
+class HostTransferGeometry:
+    """Immutable field geometry for one executor lifetime."""
+
+    host_rows: torch.Tensor
+    device_rows: torch.Tensor | None
+    layer_slices: tuple[LayerSlice, ...]
+    group_packing: tuple[int, ...]
+    host_lcm_block_bytes: int
+    num_host_lcm_blocks: int
+    num_device_lcm_blocks: int
+
+    @property
+    def num_groups(self) -> int:
+        return len(self.group_packing)
+
+    @property
+    def num_field_rows(self) -> int:
+        return int(self.host_rows.shape[0])
+
+    def max_device_block_id(self, group_index: int) -> int:
+        return self.num_device_lcm_blocks * self.group_packing[group_index]
+
+    def max_host_block_id(self, group_index: int) -> int:
+        return self.num_host_lcm_blocks * self.group_packing[group_index]
+
+    def bind(
+        self,
+        device: torch.device,
+        *,
+        non_blocking: bool = False,
+    ) -> HostTransferGeometry:
+        if self.device_rows is not None:
+            if self.device_rows.device != device:
+                raise ValueError("geometry is already bound to another device")
+            return self
+        device_rows = torch.empty_like(self.host_rows, device=device)
+        device_rows.copy_(self.host_rows, non_blocking=non_blocking)
+        return replace(self, device_rows=device_rows)
+
+
+def _validate_geometry_row(
+    row: Sequence[int],
+    *,
+    row_index: int,
+    group_packing: Sequence[int],
+    num_device_buffers: int,
+    host_lcm_block_bytes: int,
+) -> None:
+    if len(row) != _GEOMETRY_ROW_WIDTH:
+        raise ValueError(
+            f"geometry row {row_index} must have {_GEOMETRY_ROW_WIDTH} columns, "
+            f"got {len(row)}"
+        )
+    (
+        group_index,
+        device_buffer_index,
+        device_block_zero_offset_bytes,
+        device_block_stride_bytes,
+        host_cache_block_bytes,
+        host_field_offset_bytes,
+        row_packing,
+        payload_bytes,
+    ) = (int(value) for value in row)
+    if not 0 <= group_index < len(group_packing):
+        raise IndexError(
+            f"geometry row {row_index} group {group_index} outside "
+            f"[0, {len(group_packing)})"
+        )
+    if not 0 <= device_buffer_index < num_device_buffers:
+        raise IndexError(
+            f"geometry row {row_index} device_buffer_index {device_buffer_index} "
+            f"outside [0, {num_device_buffers})"
+        )
+    if device_block_zero_offset_bytes < 0:
+        raise ValueError(
+            f"geometry row {row_index} device_block_zero_offset_bytes must be "
+            "non-negative"
+        )
+    if device_block_stride_bytes <= 0:
+        raise ValueError(
+            f"geometry row {row_index} device_block_stride_bytes must be positive"
+        )
+    if host_cache_block_bytes <= 0:
+        raise ValueError(
+            f"geometry row {row_index} host_cache_block_bytes must be positive"
+        )
+    if host_field_offset_bytes < 0:
+        raise ValueError(
+            f"geometry row {row_index} host_field_offset_bytes must be non-negative"
+        )
+    expected_packing = int(group_packing[group_index])
+    if row_packing != expected_packing:
+        raise ValueError(
+            f"geometry row {row_index} cache_blocks_per_lcm_block {row_packing} "
+            f"!= group packing {expected_packing}"
+        )
+    if payload_bytes <= 0:
+        raise ValueError(f"geometry row {row_index} payload_bytes must be positive")
+    if payload_bytes > device_block_stride_bytes:
+        raise ValueError(
+            f"geometry row {row_index} payload_bytes cannot exceed "
+            "device_block_stride_bytes"
+        )
+    if host_field_offset_bytes + payload_bytes > host_cache_block_bytes:
+        raise ValueError(
+            f"geometry row {row_index} field payload lies outside host cache block"
+        )
+    if row_packing * host_cache_block_bytes > host_lcm_block_bytes:
+        raise ValueError(
+            f"geometry row {row_index} packed group lies outside host LCM block"
+        )
+
+
+def build_host_transfer_geometry(
+    *,
+    rows: Sequence[GeometryRow],
+    layer_slices: Sequence[LayerSlice],
+    group_packing: Sequence[int],
+    host_lcm_block_bytes: int,
+    num_host_lcm_blocks: int,
+    num_device_lcm_blocks: int,
+    num_device_buffers: int,
+) -> HostTransferGeometry:
+    if not rows:
+        raise ValueError("geometry must contain at least one field row")
+    if not group_packing:
+        raise ValueError("geometry must contain at least one cache group")
+    if host_lcm_block_bytes <= 0:
+        raise ValueError("host_lcm_block_bytes must be positive")
+    if num_host_lcm_blocks <= 0:
+        raise ValueError("num_host_lcm_blocks must be positive")
+    if num_device_lcm_blocks <= 0:
+        raise ValueError("num_device_lcm_blocks must be positive")
+    if num_device_buffers <= 0:
+        raise ValueError("num_device_buffers must be positive")
+    if any(packing <= 0 for packing in group_packing):
+        raise ValueError("group_packing entries must be positive")
+
+    for row_index, row in enumerate(rows):
+        _validate_geometry_row(
+            row,
+            row_index=row_index,
+            group_packing=group_packing,
+            num_device_buffers=num_device_buffers,
+            host_lcm_block_bytes=host_lcm_block_bytes,
+        )
+
+    row_offset = 0
+    for layer_index, (slice_offset, num_rows, max_payload_bytes) in enumerate(
+        layer_slices
+    ):
+        if slice_offset != row_offset:
+            raise ValueError(
+                f"layer slice {layer_index} offset {slice_offset} != {row_offset}"
+            )
+        if num_rows < 0:
+            raise ValueError("layer slice row counts must be non-negative")
+        expected_max_payload = max(
+            (int(row[7]) for row in rows[slice_offset : slice_offset + num_rows]),
+            default=0,
+        )
+        if max_payload_bytes != expected_max_payload:
+            raise ValueError(
+                f"layer slice {layer_index} max payload {max_payload_bytes} "
+                f"!= {expected_max_payload}"
+            )
+        row_offset += num_rows
+    if row_offset != len(rows):
+        raise ValueError("layer slices do not cover all geometry rows")
+
+    host_rows = _pinned_host_int64((len(rows), _GEOMETRY_ROW_WIDTH))
+    host_rows.copy_(torch.tensor(rows, dtype=torch.int64, device="cpu"))
+
+    return HostTransferGeometry(
+        host_rows=host_rows,
+        device_rows=None,
+        layer_slices=tuple(layer_slices),
+        group_packing=tuple(group_packing),
+        host_lcm_block_bytes=int(host_lcm_block_bytes),
+        num_host_lcm_blocks=int(num_host_lcm_blocks),
+        num_device_lcm_blocks=int(num_device_lcm_blocks),
+    )
 
 
 class HostTransferWorkspace:
@@ -45,6 +245,33 @@ class HostTransferWorkspace:
         self._range_device: torch.Tensor | None = None
         self._num_loaded_ranges = 0
         self._num_committed_ranges = 0
+        self._block_host: torch.Tensor | None = None
+        self._block_device: torch.Tensor | None = None
+        self._block_group_offsets_host: torch.Tensor | None = None
+        self._block_group_offsets_device: torch.Tensor | None = None
+        self._num_loaded_blocks = 0
+        self._num_committed_blocks = 0
+        self._block_group_offsets_count = 0
+        self._block_load_generation = 0
+        self._block_commit_generation = -1
+
+    def _invalidate_block_commit(self) -> None:
+        self._block_load_generation += 1
+        self._num_committed_blocks = 0
+        self._block_group_offsets_count = 0
+        self._block_commit_generation = -1
+
+    def _require_committed_block_state(self) -> None:
+        if self._block_commit_generation != self._block_load_generation:
+            raise ValueError("block transfers are not committed for the current load")
+
+    def _require_loaded_block_state(self, num_blocks: int) -> None:
+        if self._block_commit_generation == self._block_load_generation:
+            raise ValueError("block transfers already committed for this load")
+        if num_blocks != self._num_loaded_blocks:
+            raise ValueError(
+                "num_blocks must equal the number of rows loaded for this generation"
+            )
 
     def ensure_range_host(self, num_ranges: int) -> torch.Tensor:
         if num_ranges <= 0:
@@ -53,9 +280,7 @@ class HostTransferWorkspace:
             capacity = num_ranges
             if self._range_host is not None:
                 capacity = max(capacity, self._range_host.shape[0] * 2)
-            self._range_host = torch.empty(
-                (capacity, 4), dtype=torch.int64, pin_memory=True
-            )
+            self._range_host = _pinned_host_int64((capacity, 4))
         return self._range_host
 
     def bind_addresses(
@@ -157,6 +382,218 @@ class HostTransferWorkspace:
             raise ValueError("range device slice lies outside the table")
         return self._range_device[range_offset : range_offset + num_ranges]
 
+    def _ensure_block_host(self, num_blocks: int) -> torch.Tensor:
+        if num_blocks <= 0:
+            raise ValueError("num_blocks must be positive")
+        if self._block_host is None or self._block_host.shape[0] < num_blocks:
+            capacity = num_blocks
+            if self._block_host is not None:
+                capacity = max(capacity, self._block_host.shape[0] * 2)
+            self._block_host = _pinned_host_int64((capacity, 2))
+        return self._block_host
+
+    def _ensure_block_group_offsets_host(self, num_groups: int) -> torch.Tensor:
+        needed = num_groups + 1
+        if (
+            self._block_group_offsets_host is None
+            or self._block_group_offsets_host.shape[0] < needed
+        ):
+            capacity = needed
+            if self._block_group_offsets_host is not None:
+                capacity = max(capacity, self._block_group_offsets_host.shape[0] * 2)
+            self._block_group_offsets_host = _pinned_host_int64((capacity,))
+        return self._block_group_offsets_host
+
+    def _validate_block_transfer(
+        self,
+        group_index: int,
+        device_block_id: int,
+        host_block_id: int,
+        *,
+        geometry: HostTransferGeometry,
+    ) -> None:
+        if not 0 <= group_index < geometry.num_groups:
+            raise IndexError(f"group {group_index} outside [0, {geometry.num_groups})")
+        if device_block_id <= 0 or host_block_id <= 0:
+            raise ValueError(
+                "device_block_id and host_block_id must be 1-based positive integers"
+            )
+        if device_block_id > geometry.max_device_block_id(group_index):
+            raise IndexError(
+                f"device_block_id {device_block_id} outside "
+                f"[1, {geometry.max_device_block_id(group_index)}] "
+                f"for group {group_index}"
+            )
+        max_host_block_id = geometry.max_host_block_id(group_index)
+        if host_block_id > max_host_block_id:
+            raise IndexError(
+                f"host_block_id {host_block_id} outside [1, {max_host_block_id}] "
+                f"for group {group_index}"
+            )
+
+    def load_block_transfers(
+        self,
+        transfers: Sequence[tuple[int, int, int]],
+        *,
+        geometry: HostTransferGeometry,
+    ) -> tuple[int, tuple[int, ...]]:
+        """Load dynamic block mappings bucketed stably by cache group.
+
+        Args:
+            transfers: ``(group_index, device_block_id, host_block_id)`` rows.
+            geometry: Static bounds used to validate 1-based block IDs.
+
+        Returns:
+            ``(num_blocks, group_offsets)`` where ``group_offsets`` has length
+            ``num_groups + 1`` and indexes the flattened host/device tables.
+        """
+
+        self._invalidate_block_commit()
+        group_offset_count = geometry.num_groups + 1
+
+        if not transfers:
+            offsets = tuple(0 for _ in range(group_offset_count))
+            self._num_loaded_blocks = 0
+            self._block_group_offsets_count = group_offset_count
+            host_offsets = self._ensure_block_group_offsets_host(geometry.num_groups)
+            host_offsets[:group_offset_count].copy_(
+                torch.tensor(offsets, dtype=torch.int64, device="cpu")
+            )
+            return 0, offsets
+
+        buckets: list[list[tuple[int, int]]] = [[] for _ in range(geometry.num_groups)]
+        for group_index, device_block_id, host_block_id in transfers:
+            self._validate_block_transfer(
+                int(group_index),
+                int(device_block_id),
+                int(host_block_id),
+                geometry=geometry,
+            )
+            buckets[int(group_index)].append((int(device_block_id), int(host_block_id)))
+
+        flat_rows: list[tuple[int, int]] = []
+        group_offsets: list[int] = [0]
+        for bucket in buckets:
+            flat_rows.extend(bucket)
+            group_offsets.append(len(flat_rows))
+
+        num_blocks = len(flat_rows)
+        host = self._ensure_block_host(num_blocks)
+        host[:num_blocks].copy_(
+            torch.tensor(flat_rows, dtype=torch.int64, device="cpu")
+        )
+        offsets = self._ensure_block_group_offsets_host(geometry.num_groups)
+        offsets[:group_offset_count].copy_(
+            torch.tensor(group_offsets, dtype=torch.int64, device="cpu")
+        )
+        self._num_loaded_blocks = num_blocks
+        self._block_group_offsets_count = group_offset_count
+        return num_blocks, tuple(group_offsets)
+
+    def commit_block_transfers(
+        self,
+        num_blocks: int,
+        device: torch.device,
+        *,
+        non_blocking: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        self._require_loaded_block_state(num_blocks)
+        if num_blocks <= 0:
+            raise ValueError("num_blocks must be positive")
+        if self._block_host is None:
+            raise ValueError("block host table is empty")
+        if self._block_group_offsets_host is None:
+            raise ValueError("block group offsets are empty")
+        if self._block_group_offsets_count <= 0:
+            raise ValueError("block group offsets are empty")
+
+        if self._block_device is None or self._block_device.shape[0] < num_blocks:
+            capacity = num_blocks
+            if self._block_device is not None:
+                capacity = max(capacity, self._block_device.shape[0] * 2)
+            self._block_device = torch.empty(
+                (capacity, 2), dtype=torch.int64, device=device
+            )
+
+        offset_count = self._block_group_offsets_count
+        if (
+            self._block_group_offsets_device is None
+            or self._block_group_offsets_device.shape[0] < offset_count
+        ):
+            capacity = offset_count
+            if self._block_group_offsets_device is not None:
+                capacity = max(capacity, self._block_group_offsets_device.shape[0] * 2)
+            self._block_group_offsets_device = torch.empty(
+                (capacity,), dtype=torch.int64, device=device
+            )
+
+        self._block_device[:num_blocks].copy_(
+            self._block_host[:num_blocks], non_blocking=non_blocking
+        )
+        self._block_group_offsets_device[:offset_count].copy_(
+            self._block_group_offsets_host[:offset_count],
+            non_blocking=non_blocking,
+        )
+        self._num_committed_blocks = num_blocks
+        self._block_commit_generation = self._block_load_generation
+        return (
+            self._block_device[:num_blocks],
+            self._block_group_offsets_device[:offset_count],
+        )
+
+    def device_block_rows(self, block_offset: int, num_blocks: int) -> torch.Tensor:
+        self._require_committed_block_state()
+        if self._block_device is None:
+            raise ValueError("block device table is empty")
+        if block_offset < 0 or block_offset + num_blocks > self._num_committed_blocks:
+            raise ValueError("block device slice lies outside the table")
+        return self._block_device[block_offset : block_offset + num_blocks]
+
+    def block_group_offsets_device(self) -> torch.Tensor:
+        self._require_committed_block_state()
+        if self._block_group_offsets_device is None:
+            raise ValueError("block group offsets are empty")
+        if self._block_group_offsets_count <= 0:
+            raise ValueError("block group offsets are empty")
+        return self._block_group_offsets_device[: self._block_group_offsets_count]
+
+    def committed_block_tables(
+        self,
+        num_blocks: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return one complete committed generation's Device metadata."""
+
+        self._require_committed_block_state()
+        if num_blocks != self._num_committed_blocks:
+            raise ValueError(
+                f"num_blocks {num_blocks} must equal committed block count "
+                f"{self._num_committed_blocks}"
+            )
+        return (
+            self.device_block_rows(0, num_blocks),
+            self.block_group_offsets_device(),
+        )
+
+    def host_block_rows(self, num_blocks: int) -> torch.Tensor:
+        """Return valid Host block-pair rows for the current load."""
+
+        if num_blocks != self._num_loaded_blocks:
+            raise ValueError(
+                "num_blocks must equal the number of rows loaded for this generation"
+            )
+        if self._block_host is None:
+            raise ValueError("block host table is empty")
+        return self._block_host[:num_blocks]
+
+    def block_group_offsets_host(self) -> torch.Tensor:
+        """Return only valid Host group offsets for the current load."""
+
+        if self._block_group_offsets_host is None:
+            raise ValueError("block group offsets are empty")
+        if self._block_group_offsets_count <= 0:
+            raise ValueError("block group offsets are empty")
+        return self._block_group_offsets_host[: self._block_group_offsets_count]
+
 
 def _triton_is_unavailable(error: Exception) -> bool:
     message = str(error).lower()
@@ -166,9 +603,166 @@ def _triton_is_unavailable(error: Exception) -> bool:
             "triton is not available",
             "hostgetdevicepointer",
             "mapped host access is not available",
+            "has no attribute 'transfer_cache_blocks_h2d'",
             "has no attribute 'transfer_cache_ranges'",
         )
     )
+
+
+def _make_h2d_ranges(
+    geometry: HostTransferGeometry,
+    workspace: HostTransferWorkspace,
+    *,
+    num_blocks: int,
+    geometry_offset: int,
+    num_geometry_rows: int,
+) -> tuple[tuple[int, int, int, int], ...]:
+    geometry_rows = geometry.host_rows[
+        geometry_offset : geometry_offset + num_geometry_rows
+    ].tolist()
+    block_rows = workspace.host_block_rows(num_blocks)
+    group_offsets = workspace.block_group_offsets_host()
+    group_block_rows = {}
+    ranges = []
+    for row in geometry_rows:
+        (
+            group_index,
+            device_buffer_index,
+            device_zero,
+            device_stride,
+            host_block_bytes,
+            host_field_offset,
+            packing,
+            payload_bytes,
+        ) = (int(value) for value in row)
+        if group_index not in group_block_rows:
+            group_start = int(group_offsets[group_index].item())
+            group_end = int(group_offsets[group_index + 1].item())
+            group_block_rows[group_index] = block_rows[group_start:group_end].tolist()
+        for device_block_id, host_block_id in group_block_rows[group_index]:
+            device_block_id = int(device_block_id)
+            host_block_id = int(host_block_id)
+            host_zero_based = host_block_id - 1
+            host_parent, host_child = divmod(host_zero_based, packing)
+            ranges.append(
+                (
+                    device_buffer_index,
+                    device_zero + device_block_id * device_stride,
+                    host_parent * geometry.host_lcm_block_bytes
+                    + host_child * host_block_bytes
+                    + host_field_offset,
+                    payload_bytes,
+                )
+            )
+    return tuple(ranges)
+
+
+def transfer_cache_blocks_h2d(
+    device_buffers: Sequence[torch.Tensor],
+    host_buffer: torch.Tensor,
+    geometry: HostTransferGeometry,
+    workspace: HostTransferWorkspace,
+    stream,
+    *,
+    num_blocks: int,
+    geometry_offset: int,
+    num_geometry_rows: int,
+    max_payload_bytes: int,
+    backend: Literal["auto", "triton", "dma"] = "auto",
+    grid_cap: int | None = None,
+) -> None:
+    """Restore one layer from compact Host blocks.
+
+    Args:
+        device_buffers: Device tensors referenced by static geometry rows.
+        host_buffer: Contiguous pinned uint8 compact Host allocation.
+        geometry: Immutable transfer geometry, already Device-bound for Triton.
+        workspace: Current dynamic block mapping; Triton requires it committed.
+        stream: Device stream ordering the asynchronous copies.
+        num_blocks: Number of valid dynamic block-pair rows.
+        geometry_offset: First static field row for this layer.
+        num_geometry_rows: Number of static field rows for this layer.
+        max_payload_bytes: Largest field payload in this layer, precomputed on CPU.
+        backend: Prefer mapped-Host Triton or expand this layer for DMA fallback.
+        grid_cap: Max Triton CTAs.
+
+    Returns:
+        None. Completion is observed by recording an event on ``stream``.
+    """
+
+    if backend not in ("auto", "triton", "dma"):
+        raise ValueError(f"unknown cache transfer backend {backend!r}")
+    if geometry_offset < 0 or num_geometry_rows < 0 or max_payload_bytes < 0:
+        raise ValueError("geometry slice values must be non-negative")
+    if geometry_offset + num_geometry_rows > geometry.num_field_rows:
+        raise ValueError("geometry slice lies outside the static table")
+    if num_blocks < 0:
+        raise ValueError("num_blocks must be non-negative")
+    if num_blocks == 0 or num_geometry_rows == 0:
+        return
+
+    def transfer_dma() -> None:
+        ranges = _make_h2d_ranges(
+            geometry,
+            workspace,
+            num_blocks=num_blocks,
+            geometry_offset=geometry_offset,
+            num_geometry_rows=num_geometry_rows,
+        )
+        transfer_cache_ranges(
+            "h2d",
+            device_buffers,
+            host_buffer,
+            ranges,
+            stream,
+            backend="dma",
+            grid_cap=grid_cap,
+        )
+
+    if backend == "dma":
+        transfer_dma()
+        return
+
+    global _mapped_host_triton_available
+    mapped_host_candidate = device_buffers[0].device.type != "npu"
+    if mapped_host_candidate and _mapped_host_triton_available is not False:
+        if geometry.device_rows is None:
+            raise ValueError("geometry must be bound before a Triton block transfer")
+        device_module = torch.get_device_module(device_buffers[0].device)
+        stream_context = (
+            device_module.stream(stream) if stream is not None else nullcontext()
+        )
+        try:
+            with stream_context:
+                block_rows, group_offsets = workspace.committed_block_tables(num_blocks)
+                address_table = workspace.bind_addresses(device_buffers, host_buffer)
+                _transfer_cache_blocks_h2d_triton(
+                    address_table,
+                    geometry.device_rows,
+                    block_rows,
+                    group_offsets,
+                    num_blocks=num_blocks,
+                    geometry_offset=geometry_offset,
+                    num_geometry_rows=num_geometry_rows,
+                    host_lcm_block_bytes=geometry.host_lcm_block_bytes,
+                    max_payload_bytes=max_payload_bytes,
+                    num_device_buffers=len(device_buffers),
+                    grid_cap=grid_cap,
+                )
+            _mapped_host_triton_available = True
+            return
+        except (AttributeError, RuntimeError) as error:
+            if backend == "triton" or not _triton_is_unavailable(error):
+                raise
+            _mapped_host_triton_available = False
+            warnings.warn(
+                "Mapped Host Triton block transfer is unavailable; falling back to DMA",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+    if backend == "triton":
+        raise RuntimeError("mapped Host Triton transfer is unavailable")
+    transfer_dma()
 
 
 def _validate_ranges(
