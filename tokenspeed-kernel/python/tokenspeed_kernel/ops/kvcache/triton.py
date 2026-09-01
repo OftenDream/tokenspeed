@@ -35,7 +35,7 @@ from tokenspeed_kernel.platform import current_platform, pdl_enabled
 _PER_LAYER_GRID_CAP = int(os.environ.get("TOKENSPEED_KV_GRID_CAP", "64"))
 _ALL_LAYER_GRID_CAP = int(os.environ.get("TOKENSPEED_KV_ALL_LAYER_GRID_CAP", "32"))
 _HOST_CACHE_GRID_CAP = int(os.environ.get("TOKENSPEED_HOST_CACHE_GRID_CAP", "64"))
-_HOST_CACHE_BLOCK_SIZE = 4096
+HOST_CACHE_TRANSFER_CHUNK_BYTES = 4096
 
 _is_nvidia = current_platform().is_nvidia
 
@@ -45,6 +45,7 @@ def _use_pdl(enable_pdl: bool | None) -> bool:
 
 
 __all__ = [
+    "HOST_CACHE_TRANSFER_CHUNK_BYTES",
     "compute_group_decode_locs",
     "copy_state_rows",
     "fused_fp8_set_kv_buffer",
@@ -140,11 +141,10 @@ def transfer_cache_blocks_h2d(
     block_pairs: torch.Tensor,
     group_offsets: torch.Tensor,
     *,
-    num_blocks: int,
     geometry_offset: int,
     num_geometry_rows: int,
     host_lcm_block_bytes: int,
-    max_payload_bytes: int,
+    work_items: int,
     num_device_buffers: int,
     grid_cap: int | None = None,
 ) -> None:
@@ -155,11 +155,10 @@ def transfer_cache_blocks_h2d(
         geometry_table: Static int64 field rows.
         block_pairs: Dynamic int64 ``(device_block_id, host_block_id)`` rows.
         group_offsets: Valid group bucket offsets, with ``num_groups + 1`` entries.
-        num_blocks: Valid leading rows in ``block_pairs``.
         geometry_offset: First static field row for this layer.
         num_geometry_rows: Number of field rows for this layer.
         host_lcm_block_bytes: Byte stride between compact Host LCM blocks.
-        max_payload_bytes: Largest payload in the requested geometry slice.
+        work_items: Largest block/chunk work count among this layer's fields.
         num_device_buffers: Count of Device pointers in ``address_table``.
         grid_cap: Max CTAs. Defaults to ``TOKENSPEED_HOST_CACHE_GRID_CAP``.
 
@@ -167,15 +166,11 @@ def transfer_cache_blocks_h2d(
         None; the Host-to-Device copies are enqueued on the current stream.
     """
 
-    if num_blocks <= 0 or num_geometry_rows <= 0:
+    if work_items <= 0 or num_geometry_rows <= 0:
         return
     cap = _HOST_CACHE_GRID_CAP if grid_cap is None else int(grid_cap)
     if cap <= 0:
         raise ValueError("grid_cap must be positive")
-    work_items = num_blocks * triton.cdiv(
-        max_payload_bytes,
-        _HOST_CACHE_BLOCK_SIZE,
-    )
     grid = (min(cap, work_items),)
     _transfer_cache_blocks_h2d_kernel[grid](
         address_table,
@@ -186,7 +181,7 @@ def transfer_cache_blocks_h2d(
         geometry_offset,
         host_lcm_block_bytes,
         NUM_DEVICE_BUFFERS=num_device_buffers,
-        BLOCK_SIZE=_HOST_CACHE_BLOCK_SIZE,
+        BLOCK_SIZE=HOST_CACHE_TRANSFER_CHUNK_BYTES,
         num_warps=8,
     )
 
@@ -263,7 +258,7 @@ def transfer_cache_ranges(
         raise ValueError("direction must be 0 (D2H) or 1 (H2D)")
     if num_ranges <= 0:
         return
-    block_size = _HOST_CACHE_BLOCK_SIZE
+    block_size = HOST_CACHE_TRANSFER_CHUNK_BYTES
     num_chunks = triton.cdiv(max_bytes, block_size)
     work_items = num_ranges * num_chunks
     cap = _HOST_CACHE_GRID_CAP if grid_cap is None else int(grid_cap)
