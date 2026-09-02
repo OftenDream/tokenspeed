@@ -503,12 +503,9 @@ class HostTransferWorkspace:
         self,
         num_layers: int,
         device: torch.device,
-        *,
-        non_blocking: bool = False,
     ) -> torch.Tensor:
         """Allocate or reuse zeroed per-layer ready flags and CTA counters."""
 
-        del non_blocking
         if num_layers <= 0:
             raise ValueError("num_layers must be positive")
         reusable = (

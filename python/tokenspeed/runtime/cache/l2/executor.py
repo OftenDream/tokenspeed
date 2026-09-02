@@ -449,11 +449,7 @@ class L2CacheExecutor:
                         device,
                         non_blocking=True,
                     )
-                    flags = workspace.prepare_layer_ready(
-                        len(layer_slices),
-                        device,
-                        non_blocking=True,
-                    )
+                    flags = workspace.prepare_layer_ready(len(layer_slices), device)
                 flag_offset = 0
                 for load_events, consumer_count in active_trackers:
                     load_events.layer_ready_flags = flags[
