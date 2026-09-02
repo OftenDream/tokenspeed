@@ -49,6 +49,7 @@ def host_transfer_contract():
         _triton_is_unavailable=module._triton_is_unavailable,
         _transfer_cache_ranges=module._transfer_cache_ranges,
         transfer_cache_blocks=module.transfer_cache_blocks,
+        wait_layer_ready=module.wait_layer_ready,
     )
 
 
@@ -110,8 +111,14 @@ def test_geometry_bind_uploads_device_rows_once(host_transfer_contract):
     second = first.bind(device)
 
     assert first.device_rows is not None
+    assert first.device_layer_slices is not None
     assert second.device_rows.data_ptr() == first.device_rows.data_ptr()
+    assert second.device_layer_slices.data_ptr() == first.device_layer_slices.data_ptr()
     assert torch.equal(first.device_rows, geometry.host_rows)
+    assert torch.equal(
+        first.device_layer_slices,
+        torch.tensor(((0, 2), (2, 0), (2, 1)), dtype=torch.int64),
+    )
 
 
 def test_build_geometry_validates_row_shape_and_fields(host_transfer_contract):
@@ -195,6 +202,20 @@ def test_per_group_device_block_id_bounds_with_unequal_packing(host_transfer_con
 
     with pytest.raises(IndexError, match="device_block_id 65"):
         workspace.load_block_transfers(((1, 65, 1),), geometry=geometry)
+
+
+def test_workspace_prepare_layer_ready_zeros_and_reuses(host_transfer_contract):
+    workspace = host_transfer_contract.HostTransferWorkspace()
+    device = torch.device("cpu")
+
+    first = workspace.prepare_layer_ready(3, device)
+    first[:] = 7
+    workspace.layer_cta_counts()[:] = 4
+    reused = workspace.prepare_layer_ready(3, device)
+
+    assert reused.data_ptr() == first.data_ptr()
+    assert reused.tolist() == [0, 0, 0]
+    assert workspace.layer_cta_counts().tolist() == [0, 0, 0]
 
 
 def test_workspace_reuses_block_mapping_storage(host_transfer_contract):
@@ -431,6 +452,48 @@ def test_block_h2d_triton_uses_committed_tables_without_expanding_ranges(monkeyp
         "num_device_buffers": 1,
         "grid_cap": 7,
     }
+
+
+def test_block_h2d_triton_layered_flags_launch_full_geometry_once(monkeypatch):
+    host_transfer = _load_host_transfer_contract_module()
+    geometry = _sample_geometry(host_transfer).bind(torch.device("cpu"))
+    workspace, num_blocks = _committed_block_workspace(
+        host_transfer,
+        geometry,
+        ((0, 2, 1), (1, 3, 2)),
+    )
+    flags = workspace.prepare_layer_ready(
+        len(geometry.layer_slices), torch.device("cpu")
+    )
+    triton_transfer, range_factory = _mock_triton_block_path(
+        monkeypatch, host_transfer, workspace
+    )
+
+    host_transfer.transfer_cache_blocks(
+        "h2d",
+        (torch.empty(1, dtype=torch.uint8),),
+        torch.empty(1, dtype=torch.uint8),
+        geometry,
+        workspace,
+        stream=None,
+        num_blocks=num_blocks,
+        geometry_offset=0,
+        num_geometry_rows=geometry.num_field_rows,
+        backend="triton",
+        layer_ready_flags=flags,
+    )
+
+    range_factory.assert_not_called()
+    triton_transfer.assert_called_once()
+    args, kwargs = triton_transfer.call_args
+    assert args[4] == 1
+    assert kwargs["geometry_offset"] == 0
+    assert kwargs["num_geometry_rows"] == geometry.num_field_rows
+    assert kwargs["layer_ready_flags"].data_ptr() == flags.data_ptr()
+    assert kwargs["layer_slices"].data_ptr() == geometry.device_layer_slices.data_ptr()
+    assert (
+        kwargs["layer_cta_counts"].data_ptr() == workspace.layer_cta_counts().data_ptr()
+    )
 
 
 def test_block_d2h_triton_reuses_geometry_without_expanding_ranges(monkeypatch):
@@ -827,9 +890,7 @@ def test_block_h2d_auto_capability_fallback_persists_across_layers(monkeypatch):
 
 @requires_cuda
 def test_cache_ranges_dma_round_trip_across_multiple_device_buffers():
-    transfer_cache_ranges = (
-        _load_host_transfer_contract_module()._transfer_cache_ranges
-    )
+    transfer_cache_ranges = _load_host_transfer_contract_module()._transfer_cache_ranges
 
     first = torch.arange(64, dtype=torch.uint8, device="cuda")
     second = torch.arange(48, dtype=torch.bfloat16, device="cuda")
@@ -851,6 +912,7 @@ def test_cache_ranges_dma_round_trip_across_multiple_device_buffers():
     assert torch.equal(
         second_bytes[16:48].cpu(), torch.full((32,), 9, dtype=torch.uint8)
     )
+
 
 @requires_cuda
 def test_geometry_block_transfer_is_byte_exact_for_packed_multigroup_fields():
@@ -983,3 +1045,62 @@ def test_geometry_block_transfer_is_byte_exact_for_packed_multigroup_fields():
                 device_offset : device_offset + payload
             ]
     assert torch.equal(host, expected_host)
+
+
+@requires_cuda
+def test_layered_h2d_sets_flags_and_copies_each_layer():
+    module = _load_host_transfer_contract_module()
+    geometry = module.build_host_transfer_geometry(
+        rows=(
+            (0, 0, 0, 16, 16, 0, 1, 8),
+            (0, 0, 8, 16, 16, 8, 1, 8),
+        ),
+        layer_slices=((0, 1), (1, 0), (1, 1)),
+        group_packing=(1,),
+        host_lcm_block_bytes=16,
+        num_host_lcm_blocks=2,
+        num_device_lcm_blocks=4,
+        num_device_buffers=1,
+    )
+    host = torch.arange(32, dtype=torch.uint8).pin_memory()
+    device = torch.full((64,), 0xA5, dtype=torch.uint8, device="cuda")
+    workspace = module.HostTransferWorkspace()
+    num_blocks, _ = workspace.load_block_transfers(((0, 1, 1),), geometry=geometry)
+    stream = torch.cuda.Stream()
+    compute = torch.cuda.Stream()
+
+    with torch.cuda.stream(stream):
+        bound = geometry.bind(device.device, non_blocking=True)
+        workspace.commit_block_transfers(num_blocks, device.device, non_blocking=True)
+        flags = workspace.prepare_layer_ready(3, device.device)
+    try:
+        module.transfer_cache_blocks(
+            "h2d",
+            (device,),
+            host,
+            bound,
+            workspace,
+            stream,
+            num_blocks=num_blocks,
+            geometry_offset=0,
+            num_geometry_rows=2,
+            backend="triton",
+            layer_ready_flags=flags,
+            grid_cap=2,
+        )
+        with torch.cuda.stream(compute):
+            module.wait_layer_ready(flags, 0)
+            module.wait_layer_ready(flags, 1)
+            module.wait_layer_ready(flags, 2)
+    except RuntimeError as error:
+        if (
+            module._triton_is_unavailable(error)
+            or "not device-mapped" in str(error).lower()
+        ):
+            pytest.skip(str(error))
+        raise
+    compute.synchronize()
+
+    assert flags.tolist() == [1, 1, 1]
+    assert device[16:24].cpu().tolist() == host[0:8].tolist()
+    assert device[24:32].cpu().tolist() == host[8:16].tolist()

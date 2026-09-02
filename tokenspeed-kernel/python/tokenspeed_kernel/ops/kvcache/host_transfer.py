@@ -32,6 +32,7 @@ import torch
 from tokenspeed_kernel.ops.kvcache.triton import (
     HOST_CACHE_TRANSFER_CHUNK_BYTES,
     transfer_cache_blocks as _transfer_cache_blocks_triton,
+    wait_layer_ready as _wait_layer_ready_triton,
 )
 from tokenspeed_kernel.platform import current_platform
 
@@ -59,6 +60,7 @@ class HostTransferGeometry:
     host_lcm_block_bytes: int
     num_host_lcm_blocks: int
     num_device_lcm_blocks: int
+    device_layer_slices: torch.Tensor | None = None
 
     @property
     def num_groups(self) -> int:
@@ -86,7 +88,18 @@ class HostTransferGeometry:
             return self
         device_rows = torch.empty_like(self.host_rows, device=device)
         device_rows.copy_(self.host_rows, non_blocking=non_blocking)
-        return replace(self, device_rows=device_rows)
+        layer_slice_host = torch.tensor(
+            self.layer_slices, dtype=torch.int64, device="cpu"
+        )
+        device_layer_slices = torch.empty(
+            layer_slice_host.shape, dtype=torch.int64, device=device
+        )
+        device_layer_slices.copy_(layer_slice_host, non_blocking=non_blocking)
+        return replace(
+            self,
+            device_rows=device_rows,
+            device_layer_slices=device_layer_slices,
+        )
 
 
 def _validate_geometry_row(
@@ -237,6 +250,9 @@ class HostTransferWorkspace:
         self._block_group_offsets_count = 0
         self._block_load_generation = 0
         self._block_commit_generation = -1
+        self._layer_ready_flags: torch.Tensor | None = None
+        self._layer_cta_counts: torch.Tensor | None = None
+        self._num_layer_ready = 0
 
     def _invalidate_block_commit(self) -> None:
         self._block_load_generation += 1
@@ -483,6 +499,46 @@ class HostTransferWorkspace:
             raise ValueError("block group offsets are empty")
         return self._block_group_offsets_host[: self._block_group_offsets_count]
 
+    def prepare_layer_ready(
+        self,
+        num_layers: int,
+        device: torch.device,
+        *,
+        non_blocking: bool = False,
+    ) -> torch.Tensor:
+        """Allocate or reuse zeroed per-layer ready flags and CTA counters."""
+
+        del non_blocking
+        if num_layers <= 0:
+            raise ValueError("num_layers must be positive")
+        reusable = (
+            self._layer_ready_flags is not None
+            and self._layer_cta_counts is not None
+            and self._layer_ready_flags.device == device
+            and self._layer_ready_flags.shape[0] >= num_layers
+            and self._layer_cta_counts.shape[0] >= num_layers
+        )
+        if not reusable:
+            capacity = num_layers
+            if self._layer_ready_flags is not None:
+                capacity = max(capacity, self._layer_ready_flags.shape[0] * 2)
+            self._layer_ready_flags = torch.zeros(
+                capacity, dtype=torch.int32, device=device
+            )
+            self._layer_cta_counts = torch.zeros(
+                capacity, dtype=torch.int32, device=device
+            )
+        else:
+            self._layer_ready_flags[:num_layers].zero_()
+            self._layer_cta_counts[:num_layers].zero_()
+        self._num_layer_ready = num_layers
+        return self._layer_ready_flags[:num_layers]
+
+    def layer_cta_counts(self) -> torch.Tensor:
+        if self._layer_cta_counts is None or self._num_layer_ready <= 0:
+            raise ValueError("layer-ready state has not been prepared")
+        return self._layer_cta_counts[: self._num_layer_ready]
+
 
 def _triton_is_unavailable(error: Exception) -> bool:
     message = str(error).lower()
@@ -582,6 +638,7 @@ def transfer_cache_blocks(
     num_geometry_rows: int,
     backend: Literal["auto", "triton", "dma"] = "auto",
     grid_cap: int | None = None,
+    layer_ready_flags: torch.Tensor | None = None,
 ) -> None:
     """Copy compact Host blocks using static geometry and dynamic block IDs.
 
@@ -597,6 +654,9 @@ def transfer_cache_blocks(
         num_geometry_rows: Number of static field rows for this layer.
         backend: Prefer mapped-Host Triton or lazily expand ranges for DMA.
         grid_cap: Max Triton CTAs.
+        layer_ready_flags: Optional per-layer Device flags. Triton copies every
+            layer slice in one grid and release-stores each flag; DMA fills
+            them after the full range copy.
 
     Returns:
         None. Completion is observed by recording an event on ``stream``.
@@ -612,8 +672,22 @@ def transfer_cache_blocks(
         raise ValueError("geometry slice lies outside the static table")
     if num_blocks < 0:
         raise ValueError("num_blocks must be non-negative")
-    if num_blocks == 0 or num_geometry_rows == 0:
+    if layer_ready_flags is not None:
+        if layer_ready_flags.dtype != torch.int32 or layer_ready_flags.ndim != 1:
+            raise ValueError("layer_ready_flags must be a 1-D int32 tensor")
+        if layer_ready_flags.numel() != len(geometry.layer_slices):
+            raise ValueError("layer_ready_flags must cover every geometry layer")
+    if num_blocks == 0:
         return
+    if layer_ready_flags is None and num_geometry_rows == 0:
+        return
+
+    def _publish_dma_flags() -> None:
+        if layer_ready_flags is None:
+            return
+        device_module = torch.get_device_module(device_buffers[0].device)
+        with device_module.stream(stream) if stream is not None else nullcontext():
+            layer_ready_flags.fill_(1)
 
     def transfer_dma() -> None:
         ranges = _make_block_ranges(
@@ -630,6 +704,7 @@ def transfer_cache_blocks(
             ranges,
             stream,
         )
+        _publish_dma_flags()
 
     if backend == "dma":
         transfer_dma()
@@ -653,21 +728,33 @@ def transfer_cache_blocks(
                     geometry_offset=geometry_offset,
                     num_geometry_rows=num_geometry_rows,
                 )
-                if work_items == 0:
+                if work_items == 0 and layer_ready_flags is None:
                     return
                 address_table = workspace.bind_addresses(device_buffers, host_buffer)
+                triton_kwargs = {
+                    "geometry_offset": geometry_offset,
+                    "num_geometry_rows": num_geometry_rows,
+                    "host_lcm_block_bytes": geometry.host_lcm_block_bytes,
+                    "work_items": work_items,
+                    "num_device_buffers": len(device_buffers),
+                    "grid_cap": grid_cap,
+                }
+                if layer_ready_flags is not None:
+                    if geometry.device_layer_slices is None:
+                        raise ValueError(
+                            "geometry layer slices must be bound before a "
+                            "flagged Triton transfer"
+                        )
+                    triton_kwargs["layer_ready_flags"] = layer_ready_flags
+                    triton_kwargs["layer_slices"] = geometry.device_layer_slices
+                    triton_kwargs["layer_cta_counts"] = workspace.layer_cta_counts()
                 _transfer_cache_blocks_triton(
                     address_table,
                     geometry.device_rows,
                     block_rows,
                     group_offsets,
                     0 if direction == "d2h" else 1,
-                    geometry_offset=geometry_offset,
-                    num_geometry_rows=num_geometry_rows,
-                    host_lcm_block_bytes=geometry.host_lcm_block_bytes,
-                    work_items=work_items,
-                    num_device_buffers=len(device_buffers),
-                    grid_cap=grid_cap,
+                    **triton_kwargs,
                 )
             _mapped_host_triton_available = True
             return
@@ -771,3 +858,14 @@ def _transfer_cache_ranges(
     device_module = torch.get_device_module(device_buffers[0].device)
     with device_module.stream(stream):
         _transfer_dma(direction, device_buffers, host_buffer, ranges)
+
+
+def wait_layer_ready(flags: torch.Tensor, layer_index: int) -> None:
+    """Wait on the current stream until layer ``layer_index`` is released.
+
+    Args:
+        flags: Device int32 per-layer completion flags.
+        layer_index: Consumer-local layer to wait for.
+    """
+
+    _wait_layer_ready_triton(flags, layer_index)

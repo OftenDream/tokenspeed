@@ -58,6 +58,7 @@ __all__ = [
     "store_kv_cache",
     "store_sf_interleaved",
     "transfer_cache_blocks",
+    "wait_layer_ready",
     "transfer_kv_all_layer",
     "transfer_kv_all_layer_mla",
     "transfer_kv_per_layer",
@@ -73,22 +74,21 @@ __all__ = [
 
 
 @triton.jit
-def _transfer_cache_blocks_kernel(
+def _copy_geometry_slice(
     buffer_addresses_ptr,
     geometry_ptr,
     block_pairs_ptr,
     group_offsets_ptr,
-    num_geometry_rows,
     geometry_offset,
+    num_geometry_rows,
     host_lcm_block_bytes,
+    pid,
+    nprogs,
     NUM_DEVICE_BUFFERS: tl.constexpr,
     DIRECTION: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
-    pid = tl.program_id(0)
-    nprogs = tl.num_programs(0)
     host_address = tl.load(buffer_addresses_ptr + NUM_DEVICE_BUFFERS)
-
     for row_delta in tl.range(0, num_geometry_rows):
         row_offset = (geometry_offset + row_delta) * 8
         group_index = tl.load(geometry_ptr + row_offset)
@@ -148,6 +148,146 @@ def _transfer_cache_blocks_kernel(
                 tl.store(device_ptr + byte_offsets, values, mask=mask)
 
 
+@triton.jit
+def _gpu_acq_rel_fence(dummy_ptr):
+    tl.inline_asm_elementwise(
+        "fence.acq_rel.gpu; mov.s32 $0, 0;",
+        "=r,l",
+        [dummy_ptr],
+        dtype=tl.int32,
+        is_pure=False,
+        pack=1,
+    )
+
+
+@triton.jit
+def _arrive_and_signal_layer(count_ptr, flag_ptr, last_cta_index):
+    tl.inline_asm_elementwise(
+        """
+        {
+            .reg .pred %pleader;
+            .reg .pred %plast;
+            .reg .b32 %tid;
+            .reg .s32 %old;
+            mov.u32 %tid, %tid.x;
+            setp.eq.u32 %pleader, %tid, 0;
+            mov.s32 %old, -1;
+            @%pleader atom.acq_rel.gpu.global.add.s32 %old, [$1], 1;
+            setp.eq.s32 %plast, %old, $3;
+            and.pred %plast, %plast, %pleader;
+            @%plast st.release.gpu.global.s32 [$2], 1;
+            mov.s32 $0, 0;
+        }
+        """,
+        "=r,l,l,r",
+        [count_ptr, flag_ptr, last_cta_index],
+        dtype=tl.int32,
+        is_pure=False,
+        pack=1,
+    )
+
+
+@triton.jit
+def _signal_layer_ready(count_ptr, flag_ptr, nprogs):
+    tl.debug_barrier()
+    _gpu_acq_rel_fence(count_ptr)
+    _arrive_and_signal_layer(count_ptr, flag_ptr, nprogs - 1)
+
+
+@triton.jit
+def _transfer_cache_blocks_kernel(
+    buffer_addresses_ptr,
+    geometry_ptr,
+    block_pairs_ptr,
+    group_offsets_ptr,
+    num_geometry_rows,
+    geometry_offset,
+    host_lcm_block_bytes,
+    layer_slices_ptr,
+    layer_ready_flags_ptr,
+    layer_cta_counts_ptr,
+    num_layers,
+    NUM_DEVICE_BUFFERS: tl.constexpr,
+    DIRECTION: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    SIGNAL_LAYERS: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    nprogs = tl.num_programs(0)
+    if SIGNAL_LAYERS:
+        for layer_index in tl.range(0, num_layers):
+            slice_offset = tl.load(layer_slices_ptr + layer_index * 2)
+            slice_rows = tl.load(layer_slices_ptr + layer_index * 2 + 1)
+            _copy_geometry_slice(
+                buffer_addresses_ptr,
+                geometry_ptr,
+                block_pairs_ptr,
+                group_offsets_ptr,
+                slice_offset,
+                slice_rows,
+                host_lcm_block_bytes,
+                pid,
+                nprogs,
+                NUM_DEVICE_BUFFERS,
+                DIRECTION,
+                BLOCK_SIZE,
+            )
+            _signal_layer_ready(
+                layer_cta_counts_ptr + layer_index,
+                layer_ready_flags_ptr + layer_index,
+                nprogs,
+            )
+        return
+    _copy_geometry_slice(
+        buffer_addresses_ptr,
+        geometry_ptr,
+        block_pairs_ptr,
+        group_offsets_ptr,
+        geometry_offset,
+        num_geometry_rows,
+        host_lcm_block_bytes,
+        pid,
+        nprogs,
+        NUM_DEVICE_BUFFERS,
+        DIRECTION,
+        BLOCK_SIZE,
+    )
+
+
+@triton.jit
+def _ld_acquire_i32(ptr):
+    return tl.inline_asm_elementwise(
+        "ld.acquire.gpu.global.s32 $0, [$1];",
+        "=r,l",
+        [ptr],
+        dtype=tl.int32,
+        is_pure=False,
+        pack=1,
+    )
+
+
+@triton.jit
+def _wait_layer_ready_kernel(flag_ptr, layer_index):
+    pending = _ld_acquire_i32(flag_ptr + layer_index)
+    while pending == 0:
+        pending = _ld_acquire_i32(flag_ptr + layer_index)
+
+
+def wait_layer_ready(flags: torch.Tensor, layer_index: int) -> None:
+    """Spin on the current stream until ``flags[layer_index]`` is released.
+
+    Args:
+        flags: Device int32 per-layer completion flags.
+        layer_index: Consumer-local layer to wait for.
+    """
+
+    if flags.dtype != torch.int32 or flags.ndim != 1:
+        raise ValueError("flags must be a 1-D int32 tensor")
+    if not 0 <= int(layer_index) < flags.numel():
+        raise IndexError(f"layer_index {layer_index} outside [0, {flags.numel()})")
+    _wait_layer_ready_kernel[(1,)](flags, int(layer_index), num_warps=1)
+
+
 def transfer_cache_blocks(
     address_table: torch.Tensor,
     geometry_table: torch.Tensor,
@@ -161,6 +301,9 @@ def transfer_cache_blocks(
     work_items: int,
     num_device_buffers: int,
     grid_cap: int | None = None,
+    layer_ready_flags: torch.Tensor | None = None,
+    layer_slices: torch.Tensor | None = None,
+    layer_cta_counts: torch.Tensor | None = None,
 ) -> None:
     """Copy compact Host blocks using prepared static and dynamic metadata.
 
@@ -176,6 +319,10 @@ def transfer_cache_blocks(
         work_items: Largest block/chunk work count among this layer's fields.
         num_device_buffers: Count of Device pointers in ``address_table``.
         grid_cap: Max CTAs. Defaults to ``TOKENSPEED_HOST_CACHE_GRID_CAP``.
+        layer_ready_flags: Optional per-layer completion flags. When set, one
+            grid copies every ``layer_slices`` row and release-stores each flag.
+        layer_slices: Device ``(offset, num_rows)`` table matching ``flags``.
+        layer_cta_counts: Device arrival counters, one int32 per layer.
 
     Returns:
         None; copies are enqueued on the current device stream.
@@ -183,12 +330,28 @@ def transfer_cache_blocks(
 
     if direction not in (0, 1):
         raise ValueError("direction must be 0 (D2H) or 1 (H2D)")
-    if work_items <= 0 or num_geometry_rows <= 0:
+    signal_layers = layer_ready_flags is not None
+    if signal_layers:
+        if layer_slices is None or layer_cta_counts is None:
+            raise ValueError("layered transfer requires layer slices and CTA counts")
+        if layer_ready_flags.dtype != torch.int32 or layer_ready_flags.ndim != 1:
+            raise ValueError("layer_ready_flags must be a 1-D int32 tensor")
+        if layer_slices.ndim != 2 or layer_slices.shape[1] != 2:
+            raise ValueError("layer_slices must have shape (num_layers, 2)")
+        if layer_cta_counts.dtype != torch.int32 or layer_cta_counts.ndim != 1:
+            raise ValueError("layer_cta_counts must be a 1-D int32 tensor")
+        if (
+            layer_ready_flags.numel() != layer_slices.shape[0]
+            or layer_cta_counts.numel() != layer_slices.shape[0]
+        ):
+            raise ValueError("layer ready tables must cover the same layers")
+    elif work_items <= 0 or num_geometry_rows <= 0:
         return
     cap = _HOST_CACHE_GRID_CAP if grid_cap is None else int(grid_cap)
     if cap <= 0:
         raise ValueError("grid_cap must be positive")
-    grid = (min(cap, work_items),)
+    grid = (max(1, min(cap, work_items if work_items > 0 else 1)),)
+    unused = geometry_table
     _transfer_cache_blocks_kernel[grid](
         address_table,
         geometry_table,
@@ -197,9 +360,14 @@ def transfer_cache_blocks(
         num_geometry_rows,
         geometry_offset,
         host_lcm_block_bytes,
+        layer_slices if signal_layers else unused,
+        layer_ready_flags if signal_layers else unused,
+        layer_cta_counts if signal_layers else unused,
+        int(layer_slices.shape[0]) if signal_layers else 0,
         NUM_DEVICE_BUFFERS=num_device_buffers,
         DIRECTION=direction,
         BLOCK_SIZE=HOST_CACHE_TRANSFER_CHUNK_BYTES,
+        SIGNAL_LAYERS=signal_layers,
         num_warps=8,
     )
 
@@ -502,9 +670,9 @@ def store_sf_interleaved(
         enable_pdl: Whether to use Programmatic Dependent Launch. Defaults to
             the platform policy; pass ``False`` to disable it explicitly.
     """
-    assert (
-        page_size % 128 == 0
-    ), f"interleaved SF layout requires page_size % 128 == 0, got {page_size}"
+    assert page_size % 128 == 0, (
+        f"interleaved SF layout requires page_size % 128 == 0, got {page_size}"
+    )
     num_tokens, nheads, sf_dim = sf_in.shape
     assert sf_dim == 4, f"expected sf_dim=4 (head_dim 128 / 32), got {sf_dim}"
     if num_tokens == 0:
@@ -1003,9 +1171,9 @@ def store_kv_cache(
         return
     n_kv_k = k_src.numel() // n_tokens
     n_kv_v = v_src.numel() // n_tokens
-    assert (
-        n_kv_k == n_kv_v
-    ), f"k/v must share per-token element count, got {n_kv_k} vs {n_kv_v}"
+    assert n_kv_k == n_kv_v, (
+        f"k/v must share per-token element count, got {n_kv_k} vs {n_kv_v}"
+    )
     assert k_src.stride(-1) == 1 and v_src.stride(-1) == 1
     assert k_dst.stride(-1) == 1 and v_dst.stride(-1) == 1
 
@@ -1233,34 +1401,34 @@ def fused_fp8_set_kv_buffer(
 
     if k_cache.ndim == 3:
         total_slots, num_kv_heads, head_dim = k_cache.shape
-        assert (
-            total_slots % page_size == 0
-        ), f"total_slots ({total_slots}) must be divisible by page_size ({page_size})"
+        assert total_slots % page_size == 0, (
+            f"total_slots ({total_slots}) must be divisible by page_size ({page_size})"
+        )
     elif k_cache.ndim == 4:
         _, ps, num_kv_heads, head_dim = k_cache.shape
-        assert (
-            ps == page_size
-        ), f"page_size mismatch: cache has {ps}, expected {page_size}"
+        assert ps == page_size, (
+            f"page_size mismatch: cache has {ps}, expected {page_size}"
+        )
     else:
         raise ValueError(f"Unsupported k_cache.ndim={k_cache.ndim}, expected 3 or 4")
 
     if k.ndim == 3:
-        assert (
-            k.shape[1] == num_kv_heads
-        ), f"num_kv_heads mismatch: k.shape[1]={k.shape[1]} vs cache={num_kv_heads}"
-        assert (
-            k.shape[2] == head_dim
-        ), f"head_dim mismatch: k.shape[2]={k.shape[2]} vs cache={head_dim}"
+        assert k.shape[1] == num_kv_heads, (
+            f"num_kv_heads mismatch: k.shape[1]={k.shape[1]} vs cache={num_kv_heads}"
+        )
+        assert k.shape[2] == head_dim, (
+            f"head_dim mismatch: k.shape[2]={k.shape[2]} vs cache={head_dim}"
+        )
         assert v.shape[1] == num_kv_heads and v.shape[2] == head_dim, "v shape mismatch"
         k_3d = k
         v_3d = v
     elif k.ndim == 2:
-        assert (
-            k.shape[1] == num_kv_heads * head_dim
-        ), f"k.shape[1]={k.shape[1]} != {num_kv_heads * head_dim}"
-        assert (
-            v.shape[1] == num_kv_heads * head_dim
-        ), f"v.shape[1]={v.shape[1]} != {num_kv_heads * head_dim}"
+        assert k.shape[1] == num_kv_heads * head_dim, (
+            f"k.shape[1]={k.shape[1]} != {num_kv_heads * head_dim}"
+        )
+        assert v.shape[1] == num_kv_heads * head_dim, (
+            f"v.shape[1]={v.shape[1]} != {num_kv_heads * head_dim}"
+        )
         k_3d = k.view(num_tokens, num_kv_heads, head_dim)
         v_3d = v.view(num_tokens, num_kv_heads, head_dim)
     else:

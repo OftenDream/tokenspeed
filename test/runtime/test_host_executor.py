@@ -9,7 +9,7 @@ import unittest
 from contextlib import nullcontext
 from importlib import import_module, util
 from types import ModuleType, SimpleNamespace
-from unittest.mock import Mock, call, patch
+from unittest.mock import MagicMock, Mock, patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ci_system.ci_register import register_cuda_ci
@@ -46,6 +46,7 @@ def _load_executor_module_without_triton(*, force_isolated=False):
     host_transfer.HostTransferWorkspace = Mock
     host_transfer.build_host_transfer_geometry = Mock()
     host_transfer.transfer_cache_blocks = Mock()
+    host_transfer.wait_layer_ready = Mock()
     scheduler = ModuleType("tokenspeed_scheduler")
 
     class Cache:
@@ -188,7 +189,7 @@ class GroupAwareWireTest(unittest.TestCase):
             device_rows=device_rows,
         )
         executor._transfer_geometry = geometry
-        workspace = Mock()
+        workspace = MagicMock()
         workspace.load_block_transfers.return_value = (1, (0, 1))
         executor._load_workspaces = (workspace,)
         return executor_module, executor, device, geometry, workspace
@@ -365,13 +366,11 @@ class GroupAwareWireTest(unittest.TestCase):
         finish.record.assert_called_once_with(stream)
 
     def test_loadback_logs_non_empty_batch(self):
-        executor_module, executor, _, geometry, workspace = (
-            self._make_load_executor(
-                consumers=(("field",),),
-                layer_slices=((0, 1),),
-                backend="dma",
-                device_rows=None,
-            )
+        executor_module, executor, _, geometry, workspace = self._make_load_executor(
+            consumers=(("field",),),
+            layer_slices=((0, 1),),
+            backend="dma",
+            device_rows=None,
         )
         workspace.load_block_transfers.return_value = (2, (0, 2))
         load_events = SimpleNamespace(start_event=Mock(), layer_done_events=[None])
@@ -632,7 +631,7 @@ class GroupAwareWireTest(unittest.TestCase):
         self.assertIs(second.torch, first_torch)
         self.assertIs(sys.modules["torch"], first_torch)
 
-    def test_loadback_commits_block_ids_once_and_launches_geometry_slices(self):
+    def test_loadback_commits_block_ids_once_and_launches_one_flagged_kernel(self):
         executor_module, executor, device, geometry, workspace = (
             self._make_load_executor(
                 consumers=(("layer.0",), (), ("layer.2",)),
@@ -640,15 +639,21 @@ class GroupAwareWireTest(unittest.TestCase):
                 device_rows=object(),
             )
         )
+        flags = Mock()
+        flags.__getitem__ = Mock(return_value=flags)
+        workspace.prepare_layer_ready.return_value = flags
         executor._verifier = None
         load_events = SimpleNamespace(
-            start_event=Mock(), layer_done_events=[None, None, None]
+            start_event=Mock(),
+            layer_done_events=[None, None, None],
+            layer_ready_flags=None,
+            wait_layer_ready=None,
         )
         tracker = Mock()
         tracker.begin_load.return_value = 0
         tracker.event_sets = [load_events]
         executor._load_trackers = [(tracker, 3)]
-        finishes = [Mock(), Mock(), Mock()]
+        finish = Mock()
 
         with (
             patch.object(executor_module, "get_is_capture_mode", return_value=False),
@@ -657,7 +662,7 @@ class GroupAwareWireTest(unittest.TestCase):
                 "stream",
                 return_value=nullcontext(),
             ),
-            patch.object(executor_module.device_module, "Event", side_effect=finishes),
+            patch.object(executor_module.device_module, "Event", return_value=finish),
             patch.object(executor_module, "transfer_cache_blocks") as transfer,
         ):
             executor._start_loading([9], [(0, 2, 1)])
@@ -668,54 +673,27 @@ class GroupAwareWireTest(unittest.TestCase):
         workspace.commit_block_transfers.assert_called_once_with(
             1, device, non_blocking=True
         )
-        self.assertEqual(
-            transfer.call_args_list,
-            [
-                call(
-                    "h2d",
-                    executor.layout.buffers,
-                    executor.host_storage.host_buffer,
-                    geometry,
-                    workspace,
-                    executor.load_stream,
-                    num_blocks=1,
-                    geometry_offset=0,
-                    num_geometry_rows=2,
-                    backend="auto",
-                ),
-                call(
-                    "h2d",
-                    executor.layout.buffers,
-                    executor.host_storage.host_buffer,
-                    geometry,
-                    workspace,
-                    executor.load_stream,
-                    num_blocks=1,
-                    geometry_offset=2,
-                    num_geometry_rows=0,
-                    backend="auto",
-                ),
-                call(
-                    "h2d",
-                    executor.layout.buffers,
-                    executor.host_storage.host_buffer,
-                    geometry,
-                    workspace,
-                    executor.load_stream,
-                    num_blocks=1,
-                    geometry_offset=2,
-                    num_geometry_rows=1,
-                    backend="auto",
-                ),
-            ],
+        workspace.prepare_layer_ready.assert_called_once_with(
+            3, device, non_blocking=True
         )
-        finishes[0].record.assert_called_once_with(executor.load_stream)
-        finishes[1].record.assert_called_once_with(executor.load_stream)
-        finishes[2].record.assert_called_once_with(executor.load_stream)
-        self.assertIs(load_events.layer_done_events[0], finishes[0])
-        self.assertIs(load_events.layer_done_events[1], finishes[1])
-        self.assertIs(load_events.layer_done_events[2], finishes[2])
-        self.assertIs(executor._load_acks[0].finish_event, finishes[2])
+        transfer.assert_called_once_with(
+            "h2d",
+            executor.layout.buffers,
+            executor.host_storage.host_buffer,
+            geometry,
+            workspace,
+            executor.load_stream,
+            num_blocks=1,
+            geometry_offset=0,
+            num_geometry_rows=3,
+            backend="auto",
+            layer_ready_flags=flags,
+        )
+        finish.record.assert_called_once_with(executor.load_stream)
+        self.assertEqual(load_events.layer_done_events, [finish, finish, finish])
+        self.assertIs(load_events.layer_ready_flags, flags)
+        self.assertIs(load_events.wait_layer_ready, executor_module.wait_layer_ready)
+        self.assertIs(executor._load_acks[0].finish_event, finish)
 
     def test_loadback_launch_failure_retires_all_target_and_draft_events(self):
         executor_module, executor, _, _, _ = self._make_load_executor(
@@ -735,7 +713,6 @@ class GroupAwareWireTest(unittest.TestCase):
         draft_tracker.begin_load.return_value = 0
         draft_tracker.event_sets = [draft_events]
         executor._load_trackers = [(target_tracker, 2), (draft_tracker, 1)]
-        first_finish = Mock()
         retirement = Mock()
 
         with (
@@ -748,18 +725,18 @@ class GroupAwareWireTest(unittest.TestCase):
             patch.object(
                 executor_module.device_module,
                 "Event",
-                side_effect=(first_finish, retirement),
+                return_value=retirement,
             ),
             patch.object(
                 executor_module,
                 "transfer_cache_blocks",
-                side_effect=(None, RuntimeError("layer launch failed")),
+                side_effect=RuntimeError("layer launch failed"),
             ) as transfer,
         ):
             with self.assertRaisesRegex(RuntimeError, "layer launch failed"):
                 executor._start_loading([9], [(0, 2, 1)])
 
-        self.assertEqual(transfer.call_count, 2)
+        self.assertEqual(transfer.call_count, 1)
         retirement.record.assert_called_once_with(executor.load_stream)
         self.assertEqual(
             target_events.layer_done_events,
