@@ -167,10 +167,10 @@ def _arrive_and_signal_layer(count_ptr, flag_ptr, last_cta_index):
         {
             .reg .pred %pleader;
             .reg .pred %plast;
-            .reg .b32 %tid;
+            .reg .b32 %tidx;
             .reg .s32 %old;
-            mov.u32 %tid, %tid.x;
-            setp.eq.u32 %pleader, %tid, 0;
+            mov.u32 %tidx, %tid.x;
+            setp.eq.u32 %pleader, %tidx, 0;
             mov.s32 %old, -1;
             @%pleader atom.acq_rel.gpu.global.add.s32 %old, [$1], 1;
             setp.eq.s32 %plast, %old, $3;

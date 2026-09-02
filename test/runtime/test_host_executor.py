@@ -673,9 +673,7 @@ class GroupAwareWireTest(unittest.TestCase):
         workspace.commit_block_transfers.assert_called_once_with(
             1, device, non_blocking=True
         )
-        workspace.prepare_layer_ready.assert_called_once_with(
-            3, device, non_blocking=True
-        )
+        workspace.prepare_layer_ready.assert_called_once_with(3, device)
         transfer.assert_called_once_with(
             "h2d",
             executor.layout.buffers,
