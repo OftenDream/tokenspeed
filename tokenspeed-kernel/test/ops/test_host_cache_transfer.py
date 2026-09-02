@@ -47,8 +47,8 @@ def host_transfer_contract():
         HostTransferWorkspace=module.HostTransferWorkspace,
         build_host_transfer_geometry=module.build_host_transfer_geometry,
         _triton_is_unavailable=module._triton_is_unavailable,
+        _transfer_cache_ranges=module._transfer_cache_ranges,
         transfer_cache_blocks=module.transfer_cache_blocks,
-        transfer_cache_ranges=module.transfer_cache_ranges,
     )
 
 
@@ -69,7 +69,7 @@ def _sample_geometry(
             (0, 0, 100, 96, 80, 40, 4, 40),
             (1, 1, 200, 2048, 1200, 0, 1, 1000),
         ),
-        layer_slices=((0, 2, 40), (2, 0, 0), (2, 1, 1000)),
+        layer_slices=((0, 2), (2, 0), (2, 1)),
         group_packing=(4, 1),
         host_lcm_block_bytes=1280,
         num_host_lcm_blocks=num_host_lcm_blocks,
@@ -98,7 +98,7 @@ def _mock_triton_block_path(monkeypatch, host_transfer, workspace):
 def test_geometry_layer_slices_preserve_empty_layers(host_transfer_contract):
     geometry = _sample_geometry(host_transfer_contract)
 
-    assert geometry.layer_slices == ((0, 2, 40), (2, 0, 0), (2, 1, 1000))
+    assert geometry.layer_slices == ((0, 2), (2, 0), (2, 1))
     assert geometry.num_field_rows == 3
 
 
@@ -118,7 +118,7 @@ def test_build_geometry_validates_row_shape_and_fields(host_transfer_contract):
     build = host_transfer_contract.build_host_transfer_geometry
     base = dict(
         rows=((0, 0, 100, 96, 80, 0, 4, 40),),
-        layer_slices=((0, 1, 40),),
+        layer_slices=((0, 1),),
         group_packing=(4,),
         host_lcm_block_bytes=320,
         num_host_lcm_blocks=2,
@@ -178,7 +178,7 @@ def test_per_group_device_block_id_bounds_with_unequal_packing(host_transfer_con
             (0, 0, 0, 64, 32, 0, 4, 32),
             (1, 0, 0, 128, 64, 0, 8, 64),
         ),
-        layer_slices=((0, 2, 64),),
+        layer_slices=((0, 2),),
         group_packing=(4, 8),
         host_lcm_block_bytes=512,
         num_host_lcm_blocks=2,
@@ -278,7 +278,7 @@ def test_empty_load_invalidates_committed_block_state(host_transfer_contract):
     workspace.load_block_transfers((), geometry=geometry)
 
     with pytest.raises(ValueError, match="not committed"):
-        workspace.device_block_rows(0, 1)
+        workspace.committed_block_tables(1)
     with pytest.raises(ValueError, match="not committed"):
         workspace.block_group_offsets_device()
 
@@ -290,7 +290,7 @@ def test_accessor_rejects_uncommitted_load(host_transfer_contract):
     workspace.load_block_transfers(((0, 2, 1), (1, 3, 2)), geometry=geometry)
 
     with pytest.raises(ValueError, match="not committed"):
-        workspace.device_block_rows(0, 1)
+        workspace.committed_block_tables(2)
     with pytest.raises(ValueError, match="not committed"):
         workspace.block_group_offsets_device()
 
@@ -306,7 +306,7 @@ def test_new_load_invalidates_previous_commit(host_transfer_contract):
     workspace.load_block_transfers(((0, 4, 3),), geometry=geometry)
 
     with pytest.raises(ValueError, match="not committed"):
-        workspace.device_block_rows(0, first_count)
+        workspace.committed_block_tables(first_count)
 
 
 def test_commit_rejects_wrong_num_blocks(host_transfer_contract):
@@ -335,10 +335,10 @@ def test_commit_rejects_duplicate_upload(host_transfer_contract):
         workspace.commit_block_transfers(num_blocks, device)
 
 
-def test_committed_rows_shared_without_reupload(host_transfer_contract):
+def test_committed_tables_are_shared_without_reupload(host_transfer_contract):
     geometry = _sample_geometry(host_transfer_contract)
     workspace = host_transfer_contract.HostTransferWorkspace()
-    num_blocks, group_offsets = workspace.load_block_transfers(
+    num_blocks, _ = workspace.load_block_transfers(
         ((0, 2, 1), (0, 5, 4), (1, 3, 2)),
         geometry=geometry,
     )
@@ -347,16 +347,9 @@ def test_committed_rows_shared_without_reupload(host_transfer_contract):
     block_ptr = workspace._block_device.data_ptr()
     offset_ptr = workspace._block_group_offsets_device.data_ptr()
 
-    layer0 = workspace.device_block_rows(
-        group_offsets[0], group_offsets[1] - group_offsets[0]
-    )
-    layer1 = workspace.device_block_rows(
-        group_offsets[1], group_offsets[2] - group_offsets[1]
-    )
-    offsets = workspace.block_group_offsets_device()
+    committed_blocks, offsets = workspace.committed_block_tables(num_blocks)
 
-    assert layer0.data_ptr() == block_table[: group_offsets[1]].data_ptr()
-    assert layer1.data_ptr() == block_table[group_offsets[1] :].data_ptr()
+    assert committed_blocks.data_ptr() == block_table.data_ptr()
     assert offsets.data_ptr() == returned_offsets.data_ptr()
     assert workspace._block_device.data_ptr() == block_ptr
     assert workspace._block_group_offsets_device.data_ptr() == offset_ptr
@@ -384,7 +377,6 @@ def test_block_transfer_rejects_unknown_direction():
             num_blocks=0,
             geometry_offset=0,
             num_geometry_rows=0,
-            max_payload_bytes=0,
         )
 
 
@@ -418,7 +410,6 @@ def test_block_h2d_triton_uses_committed_tables_without_expanding_ranges(monkeyp
         num_blocks=num_blocks,
         geometry_offset=2,
         num_geometry_rows=1,
-        max_payload_bytes=1000,
         backend="triton",
         grid_cap=7,
     )
@@ -468,7 +459,6 @@ def test_block_d2h_triton_reuses_geometry_without_expanding_ranges(monkeypatch):
         num_blocks=num_blocks,
         geometry_offset=0,
         num_geometry_rows=geometry.num_field_rows,
-        max_payload_bytes=1000,
         backend="triton",
     )
 
@@ -486,7 +476,7 @@ def test_block_h2d_triton_uses_max_real_work_across_layer_groups(monkeypatch):
             (0, 0, 0, 8192, 6000, 0, 1, 5003),
             (1, 0, 0, 64, 32, 0, 1, 32),
         ),
-        layer_slices=((0, 2, 5003),),
+        layer_slices=((0, 2),),
         group_packing=(1, 1),
         host_lcm_block_bytes=6000,
         num_host_lcm_blocks=8,
@@ -514,7 +504,6 @@ def test_block_h2d_triton_uses_max_real_work_across_layer_groups(monkeypatch):
         num_blocks=num_blocks,
         geometry_offset=0,
         num_geometry_rows=2,
-        max_payload_bytes=5003,
         backend="triton",
     )
 
@@ -545,32 +534,10 @@ def test_block_h2d_triton_skips_layer_with_no_group_blocks(monkeypatch):
         num_blocks=num_blocks,
         geometry_offset=2,
         num_geometry_rows=1,
-        max_payload_bytes=1000,
         backend="triton",
     )
 
     triton_transfer.assert_not_called()
-
-
-def test_block_h2d_rejects_nonempty_slice_with_zero_max_payload():
-    host_transfer = _load_host_transfer_contract_module()
-    geometry = _sample_geometry(host_transfer)
-    workspace = host_transfer.HostTransferWorkspace()
-
-    with pytest.raises(ValueError, match="max_payload_bytes"):
-        host_transfer.transfer_cache_blocks(
-            "h2d",
-            (torch.empty(1, dtype=torch.uint8),),
-            torch.empty(1, dtype=torch.uint8),
-            geometry,
-            workspace,
-            stream=None,
-            num_blocks=1,
-            geometry_offset=0,
-            num_geometry_rows=1,
-            max_payload_bytes=0,
-            backend="dma",
-        )
 
 
 @pytest.mark.parametrize("requested_num_blocks", [1, 3])
@@ -605,7 +572,6 @@ def test_block_h2d_triton_requires_exact_committed_block_count(
             num_blocks=requested_num_blocks,
             geometry_offset=0,
             num_geometry_rows=2,
-            max_payload_bytes=40,
             backend="triton",
         )
     workspace.bind_addresses.assert_not_called()
@@ -626,7 +592,7 @@ def test_block_dma_expands_ranges_without_binding_device_metadata(
     range_factory = MagicMock(return_value=ranges)
     range_transfer = MagicMock()
     monkeypatch.setattr(host_transfer, "_make_block_ranges", range_factory)
-    monkeypatch.setattr(host_transfer, "transfer_cache_ranges", range_transfer)
+    monkeypatch.setattr(host_transfer, "_transfer_cache_ranges", range_transfer)
     workspace.bind_addresses = MagicMock(
         side_effect=AssertionError("DMA must not bind addresses")
     )
@@ -644,7 +610,6 @@ def test_block_dma_expands_ranges_without_binding_device_metadata(
         num_blocks=num_blocks,
         geometry_offset=2,
         num_geometry_rows=1,
-        max_payload_bytes=1000,
         backend="dma",
     )
 
@@ -738,7 +703,7 @@ def test_block_h2d_auto_only_expands_after_capability_failure(monkeypatch):
     range_factory = MagicMock(return_value=ranges)
     range_transfer = MagicMock()
     monkeypatch.setattr(host_transfer, "_make_block_ranges", range_factory)
-    monkeypatch.setattr(host_transfer, "transfer_cache_ranges", range_transfer)
+    monkeypatch.setattr(host_transfer, "_transfer_cache_ranges", range_transfer)
     monkeypatch.setattr(host_transfer, "_mapped_host_triton_available", None)
     monkeypatch.setattr(
         host_transfer,
@@ -757,7 +722,6 @@ def test_block_h2d_auto_only_expands_after_capability_failure(monkeypatch):
             num_blocks=num_blocks,
             geometry_offset=0,
             num_geometry_rows=2,
-            max_payload_bytes=40,
             backend="auto",
         )
 
@@ -783,7 +747,6 @@ def test_block_h2d_auto_only_expands_after_capability_failure(monkeypatch):
             num_blocks=num_blocks,
             geometry_offset=0,
             num_geometry_rows=2,
-            max_payload_bytes=40,
             backend="auto",
         )
     range_factory.assert_not_called()
@@ -812,7 +775,7 @@ def test_block_h2d_auto_capability_fallback_persists_across_layers(monkeypatch):
     range_transfer = MagicMock()
     monkeypatch.setattr(host_transfer, "_transfer_cache_blocks_triton", triton_transfer)
     monkeypatch.setattr(host_transfer, "_make_block_ranges", range_factory)
-    monkeypatch.setattr(host_transfer, "transfer_cache_ranges", range_transfer)
+    monkeypatch.setattr(host_transfer, "_transfer_cache_ranges", range_transfer)
     monkeypatch.setattr(host_transfer, "_mapped_host_triton_available", None)
 
     with pytest.warns(RuntimeWarning, match="falling back"):
@@ -826,7 +789,6 @@ def test_block_h2d_auto_capability_fallback_persists_across_layers(monkeypatch):
             num_blocks=num_blocks,
             geometry_offset=0,
             num_geometry_rows=2,
-            max_payload_bytes=40,
             backend="auto",
         )
     host_transfer.transfer_cache_blocks(
@@ -839,7 +801,6 @@ def test_block_h2d_auto_capability_fallback_persists_across_layers(monkeypatch):
         num_blocks=num_blocks,
         geometry_offset=2,
         num_geometry_rows=1,
-        max_payload_bytes=1000,
         backend="auto",
     )
 
@@ -866,7 +827,9 @@ def test_block_h2d_auto_capability_fallback_persists_across_layers(monkeypatch):
 
 @requires_cuda
 def test_cache_ranges_dma_round_trip_across_multiple_device_buffers():
-    transfer_cache_ranges = _load_host_transfer_contract_module().transfer_cache_ranges
+    transfer_cache_ranges = (
+        _load_host_transfer_contract_module()._transfer_cache_ranges
+    )
 
     first = torch.arange(64, dtype=torch.uint8, device="cuda")
     second = torch.arange(48, dtype=torch.bfloat16, device="cuda")
@@ -899,7 +862,7 @@ def test_geometry_block_transfer_is_byte_exact_for_packed_multigroup_fields():
             (1, 1, 17, 53, 19, 0, 3, 13),
             (1, 0, 29, 47, 19, 13, 3, 5),
         ),
-        layer_slices=((0, 4, 5003),),
+        layer_slices=((0, 4),),
         group_packing=(2, 3),
         host_lcm_block_bytes=10028,
         num_host_lcm_blocks=2,
@@ -937,7 +900,6 @@ def test_geometry_block_transfer_is_byte_exact_for_packed_multigroup_fields():
             num_blocks=num_blocks,
             geometry_offset=0,
             num_geometry_rows=4,
-            max_payload_bytes=5003,
             backend="triton",
             grid_cap=2,
         )
@@ -992,7 +954,6 @@ def test_geometry_block_transfer_is_byte_exact_for_packed_multigroup_fields():
         num_blocks=num_blocks,
         geometry_offset=0,
         num_geometry_rows=4,
-        max_payload_bytes=5003,
         backend="triton",
         grid_cap=2,
     )

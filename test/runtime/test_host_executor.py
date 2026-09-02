@@ -174,6 +174,7 @@ class GroupAwareWireTest(unittest.TestCase):
         executor.attn_tp_rank = 0
         executor._ready_load_op_ids = []
         executor._load_acks = []
+        executor._load_poisoned = False
         executor.load_stream = object() if load_stream is None else load_stream
         executor.transfer_backend = backend
         device = SimpleNamespace(type="cuda")
@@ -325,7 +326,7 @@ class GroupAwareWireTest(unittest.TestCase):
         executor._write_workspace.load_block_transfers.return_value = (1, (0, 1))
         executor._transfer_geometry = SimpleNamespace(
             device_rows=object(),
-            layer_slices=((0, 2, 32), (2, 1, 16)),
+            layer_slices=((0, 2), (2, 1)),
             num_field_rows=3,
         )
         stream = object()
@@ -359,7 +360,6 @@ class GroupAwareWireTest(unittest.TestCase):
             num_blocks=1,
             geometry_offset=0,
             num_geometry_rows=3,
-            max_payload_bytes=32,
             backend="auto",
         )
         finish.record.assert_called_once_with(stream)
@@ -368,7 +368,7 @@ class GroupAwareWireTest(unittest.TestCase):
         executor_module, executor, _, geometry, workspace = (
             self._make_load_executor(
                 consumers=(("field",),),
-                layer_slices=((0, 1, 32),),
+                layer_slices=((0, 1),),
                 backend="dma",
                 device_rows=None,
             )
@@ -517,7 +517,7 @@ class GroupAwareWireTest(unittest.TestCase):
                 (0, 1, 32, 64, 20, 0, 4, 20),
                 (1, 0, 48, 16, 24, 12, 8, 12),
             ),
-            layer_slices=((0, 1, 12), (1, 0, 0), (1, 1, 20), (2, 1, 12)),
+            layer_slices=((0, 1), (1, 0), (1, 1), (2, 1)),
             group_packing=(4, 8),
             host_lcm_block_bytes=192,
             num_host_lcm_blocks=3,
@@ -636,7 +636,7 @@ class GroupAwareWireTest(unittest.TestCase):
         executor_module, executor, device, geometry, workspace = (
             self._make_load_executor(
                 consumers=(("layer.0",), (), ("layer.2",)),
-                layer_slices=((0, 2, 64), (2, 0, 0), (2, 1, 32)),
+                layer_slices=((0, 2), (2, 0), (2, 1)),
                 device_rows=object(),
             )
         )
@@ -681,7 +681,6 @@ class GroupAwareWireTest(unittest.TestCase):
                     num_blocks=1,
                     geometry_offset=0,
                     num_geometry_rows=2,
-                    max_payload_bytes=64,
                     backend="auto",
                 ),
                 call(
@@ -694,7 +693,6 @@ class GroupAwareWireTest(unittest.TestCase):
                     num_blocks=1,
                     geometry_offset=2,
                     num_geometry_rows=0,
-                    max_payload_bytes=0,
                     backend="auto",
                 ),
                 call(
@@ -707,7 +705,6 @@ class GroupAwareWireTest(unittest.TestCase):
                     num_blocks=1,
                     geometry_offset=2,
                     num_geometry_rows=1,
-                    max_payload_bytes=32,
                     backend="auto",
                 ),
             ],
@@ -723,7 +720,7 @@ class GroupAwareWireTest(unittest.TestCase):
     def test_loadback_launch_failure_retires_all_target_and_draft_events(self):
         executor_module, executor, _, _, _ = self._make_load_executor(
             consumers=(("target.0",), ("target.1",), ("draft.0",)),
-            layer_slices=((0, 1, 8), (1, 1, 16), (2, 1, 32)),
+            layer_slices=((0, 1), (1, 1), (2, 1)),
             device_rows=object(),
             load_stream=Mock(),
         )
@@ -775,7 +772,7 @@ class GroupAwareWireTest(unittest.TestCase):
     def test_failed_retirement_sync_poisons_executor_and_preserves_original_error(self):
         executor_module, executor, _, _, _ = self._make_load_executor(
             consumers=(("target.0",),),
-            layer_slices=((0, 1, 8),),
+            layer_slices=((0, 1),),
             device_rows=object(),
             load_stream=Mock(),
         )
