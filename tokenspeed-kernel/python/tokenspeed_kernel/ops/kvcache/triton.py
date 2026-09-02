@@ -58,7 +58,6 @@ __all__ = [
     "store_kv_cache",
     "store_sf_interleaved",
     "transfer_cache_blocks",
-    "transfer_cache_ranges",
     "transfer_kv_all_layer",
     "transfer_kv_all_layer_mla",
     "transfer_kv_per_layer",
@@ -201,97 +200,6 @@ def transfer_cache_blocks(
         NUM_DEVICE_BUFFERS=num_device_buffers,
         DIRECTION=direction,
         BLOCK_SIZE=HOST_CACHE_TRANSFER_CHUNK_BYTES,
-        num_warps=8,
-    )
-
-
-@triton.jit
-def _transfer_cache_ranges_kernel(
-    buffer_addresses_ptr,
-    ranges_ptr,
-    num_ranges,
-    num_chunks,
-    NUM_DEVICE_BUFFERS: tl.constexpr,
-    DIRECTION: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
-):
-    work_items = num_ranges * num_chunks
-    pid = tl.program_id(0)
-    nprogs = tl.num_programs(0)
-    for work_id in tl.range(pid, work_items, nprogs):
-        range_id = work_id // num_chunks
-        chunk_id = work_id - range_id * num_chunks
-        range_offset = range_id * 4
-        device_buffer_index = tl.load(ranges_ptr + range_offset)
-        device_offset = tl.load(ranges_ptr + range_offset + 1)
-        host_offset = tl.load(ranges_ptr + range_offset + 2)
-        num_bytes = tl.load(ranges_ptr + range_offset + 3)
-        byte_offsets = chunk_id * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-
-        device_address = tl.load(buffer_addresses_ptr + device_buffer_index)
-        host_address = tl.load(buffer_addresses_ptr + NUM_DEVICE_BUFFERS)
-        device_ptr = tl.cast(device_address + device_offset, tl.pointer_type(tl.uint8))
-        host_ptr = tl.cast(host_address + host_offset, tl.pointer_type(tl.uint8))
-        mask = byte_offsets < num_bytes
-        if DIRECTION == 0:
-            values = tl.load(device_ptr + byte_offsets, mask=mask, cache_modifier=".cg")
-            tl.store(
-                host_ptr + byte_offsets,
-                values,
-                mask=mask,
-                cache_modifier=".cs",
-            )
-        else:
-            values = tl.load(host_ptr + byte_offsets, mask=mask, cache_modifier=".cg")
-            tl.store(device_ptr + byte_offsets, values, mask=mask)
-
-
-def transfer_cache_ranges(
-    address_table: torch.Tensor,
-    range_table: torch.Tensor,
-    direction: int,
-    *,
-    num_ranges: int,
-    max_bytes: int,
-    num_device_buffers: int,
-    grid_cap: int | None = None,
-) -> None:
-    """Copy prepared Host-cache ranges with a capped grid-stride launch.
-
-    Args:
-        address_table: Device ``uint64`` table of device-buffer pointers
-            followed by the mapped Host pointer.
-        range_table: Device ``int64`` rows
-            ``(device_buffer_index, device_offset, host_offset, num_bytes)``.
-        direction: ``0`` for device-to-Host and ``1`` for Host-to-device.
-        num_ranges: Valid leading rows in ``range_table``.
-        max_bytes: Largest ``num_bytes`` among those rows.
-        num_device_buffers: Count of device pointers in ``address_table``.
-        grid_cap: Max CTAs. Defaults to ``TOKENSPEED_HOST_CACHE_GRID_CAP`` (64).
-
-    Returns:
-        None; the copy is enqueued on the current device stream.
-    """
-
-    if direction not in (0, 1):
-        raise ValueError("direction must be 0 (D2H) or 1 (H2D)")
-    if num_ranges <= 0:
-        return
-    block_size = HOST_CACHE_TRANSFER_CHUNK_BYTES
-    num_chunks = triton.cdiv(max_bytes, block_size)
-    work_items = num_ranges * num_chunks
-    cap = _HOST_CACHE_GRID_CAP if grid_cap is None else int(grid_cap)
-    if cap <= 0:
-        raise ValueError("grid_cap must be positive")
-    grid = (min(cap, work_items),)
-    _transfer_cache_ranges_kernel[grid](
-        address_table,
-        range_table,
-        num_ranges,
-        num_chunks,
-        NUM_DEVICE_BUFFERS=num_device_buffers,
-        DIRECTION=direction,
-        BLOCK_SIZE=block_size,
         num_warps=8,
     )
 

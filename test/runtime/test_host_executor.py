@@ -46,7 +46,6 @@ def _load_executor_module_without_triton(*, force_isolated=False):
     host_transfer.HostTransferWorkspace = Mock
     host_transfer.build_host_transfer_geometry = Mock()
     host_transfer.transfer_cache_blocks = Mock()
-    host_transfer.transfer_cache_ranges = Mock()
     scheduler = ModuleType("tokenspeed_scheduler")
 
     class Cache:
@@ -152,6 +151,47 @@ class CacheEventPayloadTest(unittest.TestCase):
 
 
 class GroupAwareWireTest(unittest.TestCase):
+    def _executor_module(self):
+        try:
+            return _load_executor_module_without_triton()
+        except (ImportError, ModuleNotFoundError) as exc:
+            self.skipTest(f"needs runtime dependencies: {exc}")
+
+    def _make_load_executor(
+        self,
+        *,
+        consumers,
+        layer_slices,
+        backend="auto",
+        device_rows=None,
+        load_stream=None,
+    ):
+        executor_module = self._executor_module()
+        executor = executor_module.L2CacheExecutor.__new__(
+            executor_module.L2CacheExecutor
+        )
+        executor._ack_lock = threading.Lock()
+        executor.attn_tp_rank = 0
+        executor._ready_load_op_ids = []
+        executor._load_acks = []
+        executor.load_stream = object() if load_stream is None else load_stream
+        executor.transfer_backend = backend
+        device = SimpleNamespace(type="cuda")
+        executor.layout = SimpleNamespace(
+            buffers=(SimpleNamespace(device=device),),
+            consumers=consumers,
+        )
+        executor.host_storage = SimpleNamespace(host_buffer="host")
+        geometry = SimpleNamespace(
+            layer_slices=layer_slices,
+            device_rows=device_rows,
+        )
+        executor._transfer_geometry = geometry
+        workspace = Mock()
+        workspace.load_block_transfers.return_value = (1, (0, 1))
+        executor._load_workspaces = (workspace,)
+        return executor_module, executor, device, geometry, workspace
+
     def test_hybrid_state_access_waits_for_layer_load(self):
         try:
             from tokenspeed.runtime.layers.attention.kv_cache.hybrid_kda import (
@@ -240,10 +280,7 @@ class GroupAwareWireTest(unittest.TestCase):
         )
 
     def test_submit_load_backs_clears_layerwise_waits_without_load(self):
-        try:
-            L2CacheExecutor = _load_executor_module_without_triton().L2CacheExecutor
-        except (ImportError, ModuleNotFoundError) as exc:
-            self.skipTest(f"needs runtime dependencies: {exc}")
+        L2CacheExecutor = self._executor_module().L2CacheExecutor
 
         tracker = Mock()
         executor = L2CacheExecutor.__new__(L2CacheExecutor)
@@ -255,10 +292,7 @@ class GroupAwareWireTest(unittest.TestCase):
         tracker.set_consumers.assert_called_once_with(-1)
 
     def test_submit_preserves_group_identity(self):
-        try:
-            L2CacheExecutor = _load_executor_module_without_triton().L2CacheExecutor
-        except (ImportError, ModuleNotFoundError) as exc:
-            self.skipTest(f"needs runtime dependencies: {exc}")
+        L2CacheExecutor = self._executor_module().L2CacheExecutor
 
         op_ids = []
         transfers = []
@@ -275,11 +309,8 @@ class GroupAwareWireTest(unittest.TestCase):
         self.assertEqual(transfers, [(0, 5, 9), (1, 5, 9)])
 
     def test_writeback_reuses_static_geometry_on_the_caller_stream(self):
-        try:
-            executor_module = _load_executor_module_without_triton()
-            L2CacheExecutor = executor_module.L2CacheExecutor
-        except (ImportError, ModuleNotFoundError) as exc:
-            self.skipTest(f"needs runtime dependencies: {exc}")
+        executor_module = self._executor_module()
+        L2CacheExecutor = executor_module.L2CacheExecutor
 
         executor = L2CacheExecutor.__new__(L2CacheExecutor)
         executor._ack_lock = threading.Lock()
@@ -334,33 +365,15 @@ class GroupAwareWireTest(unittest.TestCase):
         finish.record.assert_called_once_with(stream)
 
     def test_loadback_logs_non_empty_batch(self):
-        try:
-            executor_module = _load_executor_module_without_triton()
-            L2CacheExecutor = executor_module.L2CacheExecutor
-        except (ImportError, ModuleNotFoundError) as exc:
-            self.skipTest(f"needs runtime dependencies: {exc}")
-
-        executor = L2CacheExecutor.__new__(L2CacheExecutor)
-        executor._ack_lock = threading.Lock()
-        executor.attn_tp_rank = 0
-        executor._ready_load_op_ids = []
-        executor._load_acks = []
-        executor.load_stream = object()
-        executor.transfer_backend = "dma"
-        device = SimpleNamespace(type="cuda")
-        executor.layout = SimpleNamespace(
-            buffers=(SimpleNamespace(device=device),),
-            consumers=(("field",),),
+        executor_module, executor, _, geometry, workspace = (
+            self._make_load_executor(
+                consumers=(("field",),),
+                layer_slices=((0, 1, 32),),
+                backend="dma",
+                device_rows=None,
+            )
         )
-        executor.host_storage = SimpleNamespace(host_buffer="host")
-        geometry = SimpleNamespace(
-            device_rows=None,
-            layer_slices=((0, 1, 32),),
-        )
-        executor._transfer_geometry = geometry
-        workspace = Mock()
         workspace.load_block_transfers.return_value = (2, (0, 2))
-        executor._load_workspaces = (workspace,)
         load_events = SimpleNamespace(start_event=Mock(), layer_done_events=[None])
         tracker = Mock()
         tracker.begin_load.return_value = 0
@@ -380,29 +393,14 @@ class GroupAwareWireTest(unittest.TestCase):
             [(0, 2, 1), (0, 5, 4)], geometry=geometry
         )
         workspace.commit_block_transfers.assert_not_called()
-        transfer.assert_called_once_with(
-            "h2d",
-            executor.layout.buffers,
-            executor.host_storage.host_buffer,
-            geometry,
-            workspace,
-            executor.load_stream,
-            num_blocks=2,
-            geometry_offset=0,
-            num_geometry_rows=1,
-            max_payload_bytes=32,
-            backend="dma",
-        )
+        transfer.assert_called_once()
         log_info.assert_called_once_with(
             "[L2] load started: operations=%d blocks=%d", 1, 2
         )
 
     def test_kernel_init_builds_consumer_ordered_static_geometry_once(self):
-        try:
-            executor_module = _load_executor_module_without_triton()
-            L2CacheExecutor = executor_module.L2CacheExecutor
-        except (ImportError, ModuleNotFoundError) as exc:
-            self.skipTest(f"needs runtime dependencies: {exc}")
+        executor_module = self._executor_module()
+        L2CacheExecutor = executor_module.L2CacheExecutor
 
         device = SimpleNamespace(type="cuda")
         buffer = SimpleNamespace(device=device)
@@ -531,11 +529,8 @@ class GroupAwareWireTest(unittest.TestCase):
         self.assertEqual([count for count, _ in trackers], [3, 1])
 
     def test_direct_and_npu_init_keep_geometry_on_the_host(self):
-        try:
-            executor_module = _load_executor_module_without_triton()
-            L2CacheExecutor = executor_module.L2CacheExecutor
-        except (ImportError, ModuleNotFoundError) as exc:
-            self.skipTest(f"needs runtime dependencies: {exc}")
+        executor_module = self._executor_module()
+        L2CacheExecutor = executor_module.L2CacheExecutor
 
         pool = Mock()
         pool.arena.cache_group_specs = (SimpleNamespace(group_id="group"),)
@@ -638,33 +633,14 @@ class GroupAwareWireTest(unittest.TestCase):
         self.assertIs(sys.modules["torch"], first_torch)
 
     def test_loadback_commits_block_ids_once_and_launches_geometry_slices(self):
-        try:
-            executor_module = _load_executor_module_without_triton()
-            L2CacheExecutor = executor_module.L2CacheExecutor
-        except (ImportError, ModuleNotFoundError) as exc:
-            self.skipTest(f"needs runtime dependencies: {exc}")
-
-        executor = L2CacheExecutor.__new__(L2CacheExecutor)
-        executor._ack_lock = threading.Lock()
-        executor._verifier = None
-        executor.attn_tp_rank = 0
-        executor._ready_load_op_ids = []
-        executor._load_acks = []
-        executor.load_stream = object()
-        executor.transfer_backend = "auto"
-        device = SimpleNamespace(type="cuda")
-        device_buffer = SimpleNamespace(device=device)
-        executor.layout = SimpleNamespace(
-            buffers=(device_buffer,),
-            consumers=(("layer.0",), (), ("layer.2",)),
+        executor_module, executor, device, geometry, workspace = (
+            self._make_load_executor(
+                consumers=(("layer.0",), (), ("layer.2",)),
+                layer_slices=((0, 2, 64), (2, 0, 0), (2, 1, 32)),
+                device_rows=object(),
+            )
         )
-        executor.host_storage = SimpleNamespace(host_buffer="host")
-        geometry = SimpleNamespace(layer_slices=((0, 2, 64), (2, 0, 0), (2, 1, 32)))
-        geometry.device_rows = object()
-        executor._transfer_geometry = geometry
-        workspace = Mock()
-        workspace.load_block_transfers.return_value = (1, (0, 1))
-        executor._load_workspaces = (workspace,)
+        executor._verifier = None
         load_events = SimpleNamespace(
             start_event=Mock(), layer_done_events=[None, None, None]
         )
@@ -745,31 +721,12 @@ class GroupAwareWireTest(unittest.TestCase):
         self.assertIs(executor._load_acks[0].finish_event, finishes[2])
 
     def test_loadback_launch_failure_retires_all_target_and_draft_events(self):
-        try:
-            executor_module = _load_executor_module_without_triton()
-            L2CacheExecutor = executor_module.L2CacheExecutor
-        except (ImportError, ModuleNotFoundError) as exc:
-            self.skipTest(f"needs runtime dependencies: {exc}")
-
-        executor = L2CacheExecutor.__new__(L2CacheExecutor)
-        executor._ack_lock = threading.Lock()
-        executor.attn_tp_rank = 0
-        executor._ready_load_op_ids = []
-        executor._load_acks = []
-        executor.load_stream = Mock()
-        executor.transfer_backend = "auto"
-        device = SimpleNamespace(type="cuda")
-        executor.layout = SimpleNamespace(
-            buffers=(SimpleNamespace(device=device),),
+        executor_module, executor, _, _, _ = self._make_load_executor(
             consumers=(("target.0",), ("target.1",), ("draft.0",)),
+            layer_slices=((0, 1, 8), (1, 1, 16), (2, 1, 32)),
+            device_rows=object(),
+            load_stream=Mock(),
         )
-        executor.host_storage = SimpleNamespace(host_buffer="host")
-        geometry = SimpleNamespace(layer_slices=((0, 1, 8), (1, 1, 16), (2, 1, 32)))
-        geometry.device_rows = object()
-        executor._transfer_geometry = geometry
-        workspace = Mock()
-        workspace.load_block_transfers.return_value = (1, (0, 1))
-        executor._load_workspaces = (workspace,)
         target_events = SimpleNamespace(
             start_event=Mock(), layer_done_events=[Mock(), Mock()]
         )
@@ -816,33 +773,14 @@ class GroupAwareWireTest(unittest.TestCase):
         self.assertEqual(executor._load_acks, [])
 
     def test_failed_retirement_sync_poisons_executor_and_preserves_original_error(self):
-        try:
-            executor_module = _load_executor_module_without_triton()
-            L2CacheExecutor = executor_module.L2CacheExecutor
-        except (ImportError, ModuleNotFoundError) as exc:
-            self.skipTest(f"needs runtime dependencies: {exc}")
-
-        executor = L2CacheExecutor.__new__(L2CacheExecutor)
-        executor._ack_lock = threading.Lock()
-        executor._write_acks = []
-        executor._load_acks = []
-        executor._ready_write_op_ids = []
-        executor._ready_load_op_ids = []
-        executor.attn_tp_rank = 0
-        executor.load_stream = Mock()
-        executor.transfer_backend = "auto"
-        device = SimpleNamespace(type="cuda")
-        executor.layout = SimpleNamespace(
-            buffers=(SimpleNamespace(device=device),),
+        executor_module, executor, _, _, _ = self._make_load_executor(
             consumers=(("target.0",),),
+            layer_slices=((0, 1, 8),),
+            device_rows=object(),
+            load_stream=Mock(),
         )
-        executor.host_storage = SimpleNamespace(host_buffer="host")
-        geometry = SimpleNamespace(layer_slices=((0, 1, 8),))
-        geometry.device_rows = object()
-        executor._transfer_geometry = geometry
-        workspace = Mock()
-        workspace.load_block_transfers.return_value = (1, (0, 1))
-        executor._load_workspaces = (workspace,)
+        executor._write_acks = []
+        executor._ready_write_op_ids = []
         load_events = SimpleNamespace(start_event=Mock(), layer_done_events=[Mock()])
         tracker = Mock()
         tracker.begin_load.return_value = 0
