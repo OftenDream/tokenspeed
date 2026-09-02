@@ -32,6 +32,7 @@ from tokenspeed_kernel.ops.kvcache.host_transfer import (
     HostTransferWorkspace,
     build_host_transfer_geometry,
     transfer_cache_blocks,
+    wait_layer_ready,
 )
 from tokenspeed_scheduler import Cache
 
@@ -407,11 +408,12 @@ class L2CacheExecutor:
             )
 
         # EventLoop zeroes freshly allocated Device blocks before submitting the
-        # load. Recording the start event here makes every layer-wise H2D
-        # copy wait for that zeroing; the per-layer load events then keep model
-        # consumers from reading partially restored cache state.
+        # load. Recording the start event here makes the H2D copy wait for that
+        # zeroing; per-layer ready flags (Triton) or events (DMA) then keep
+        # model consumers from reading partially restored cache state.
         load_index = None
         finish = None
+        flags = None
         active_trackers = []
         try:
             for tracker, consumer_count in self._load_trackers:
@@ -435,38 +437,73 @@ class L2CacheExecutor:
             num_blocks, _ = workspace.load_block_transfers(
                 transfers, geometry=self._transfer_geometry
             )
+            layer_slices = self._transfer_geometry.layer_slices
+            num_field_rows = sum(num_rows for _, num_rows in layer_slices)
+            use_layer_flags = self._transfer_geometry.device_rows is not None
             # All layer kernels below read slices of this one table. The
             # indexed workspace is not refilled until this event set wraps.
-            if self._transfer_geometry.device_rows is not None:
+            if use_layer_flags:
                 with device_module.stream(self.load_stream):
                     workspace.commit_block_transfers(
                         num_blocks,
                         device,
                         non_blocking=True,
                     )
-
-            flat_layer_index = 0
-            for load_events, consumer_count in active_trackers:
-                for layer_index in range(consumer_count):
-                    geometry_offset, num_geometry_rows = (
-                        self._transfer_geometry.layer_slices[flat_layer_index]
+                    flags = workspace.prepare_layer_ready(
+                        len(layer_slices),
+                        device,
+                        non_blocking=True,
                     )
-                    transfer_cache_blocks(
-                        "h2d",
-                        self.layout.buffers,
-                        self.host_storage.host_buffer,
-                        self._transfer_geometry,
-                        workspace,
-                        self.load_stream,
-                        num_blocks=num_blocks,
-                        geometry_offset=geometry_offset,
-                        num_geometry_rows=num_geometry_rows,
-                        backend=self.transfer_backend,
-                    )
-                    finish = device_module.Event()
-                    finish.record(self.load_stream)
-                    load_events.layer_done_events[layer_index] = finish
-                    flat_layer_index += 1
+                flag_offset = 0
+                for load_events, consumer_count in active_trackers:
+                    load_events.layer_ready_flags = flags[
+                        flag_offset : flag_offset + consumer_count
+                    ]
+                    load_events.wait_layer_ready = wait_layer_ready
+                    flag_offset += consumer_count
+                transfer_cache_blocks(
+                    "h2d",
+                    self.layout.buffers,
+                    self.host_storage.host_buffer,
+                    self._transfer_geometry,
+                    workspace,
+                    self.load_stream,
+                    num_blocks=num_blocks,
+                    geometry_offset=0,
+                    num_geometry_rows=num_field_rows,
+                    backend=self.transfer_backend,
+                    layer_ready_flags=flags,
+                )
+                finish = device_module.Event()
+                finish.record(self.load_stream)
+                for load_events, consumer_count in active_trackers:
+                    load_events.layer_done_events[:] = [finish] * consumer_count
+            else:
+                for load_events, _ in active_trackers:
+                    load_events.layer_ready_flags = None
+                    load_events.wait_layer_ready = None
+                flat_layer_index = 0
+                for load_events, consumer_count in active_trackers:
+                    for layer_index in range(consumer_count):
+                        geometry_offset, num_geometry_rows = layer_slices[
+                            flat_layer_index
+                        ]
+                        transfer_cache_blocks(
+                            "h2d",
+                            self.layout.buffers,
+                            self.host_storage.host_buffer,
+                            self._transfer_geometry,
+                            workspace,
+                            self.load_stream,
+                            num_blocks=num_blocks,
+                            geometry_offset=geometry_offset,
+                            num_geometry_rows=num_geometry_rows,
+                            backend=self.transfer_backend,
+                        )
+                        finish = device_module.Event()
+                        finish.record(self.load_stream)
+                        load_events.layer_done_events[layer_index] = finish
+                        flat_layer_index += 1
             if finish is None:
                 raise RuntimeError("cache transfer layout has no layer consumers")
             with self._ack_lock:
@@ -475,6 +512,9 @@ class L2CacheExecutor:
         except BaseException as original_error:
             if active_trackers:
                 try:
+                    if flags is not None:
+                        with device_module.stream(self.load_stream):
+                            flags.fill_(1)
                     retirement = device_module.Event()
                     retirement.record(self.load_stream)
                     for load_events, _ in active_trackers:

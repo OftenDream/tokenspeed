@@ -33,8 +33,16 @@ class _LayerwiseLoadEvents:
     def __init__(self, num_layers: int):
         self.layer_done_events = [device_module.Event() for _ in range(num_layers)]
         self.start_event = device_module.Event()
+        self.layer_ready_flags = None
+        self.wait_layer_ready = None
 
     def wait_for_layer(self, layer_index: int) -> None:
+        if self.layer_ready_flags is not None:
+            waiter = self.wait_layer_ready
+            if waiter is None:
+                raise RuntimeError("layer-ready flags bound without a waiter")
+            waiter(self.layer_ready_flags, layer_index)
+            return
         device_module.current_stream().wait_event(self.layer_done_events[layer_index])
 
     @property
@@ -79,3 +87,6 @@ class LayerwiseLoadTracker:
     def reset(self) -> None:
         self.current_load_index = -1
         self.consumer_indices = ()
+        for events in self.event_sets:
+            events.layer_ready_flags = None
+            events.wait_layer_ready = None
