@@ -191,7 +191,6 @@ class L2CacheExecutor:
         consumed_fields = set()
         for consumer in self.layout.consumers:
             layer_offset = len(rows)
-            max_payload_bytes = 0
             for field_id in consumer:
                 if field_id in consumed_fields:
                     raise ValueError(
@@ -216,10 +215,7 @@ class L2CacheExecutor:
                         field.payload_bytes,
                     )
                 )
-                max_payload_bytes = max(max_payload_bytes, field.payload_bytes)
-            layer_slices.append(
-                (layer_offset, len(rows) - layer_offset, max_payload_bytes)
-            )
+            layer_slices.append((layer_offset, len(rows) - layer_offset))
         missing_fields = set(fields_by_id) - consumed_fields
         if missing_fields:
             raise ValueError(
@@ -378,9 +374,6 @@ class L2CacheExecutor:
             num_blocks=num_blocks,
             geometry_offset=0,
             num_geometry_rows=self._transfer_geometry.num_field_rows,
-            max_payload_bytes=max(
-                layer_slice[2] for layer_slice in self._transfer_geometry.layer_slices
-            ),
             backend=self.transfer_backend,
         )
         finish = device_module.Event()
@@ -455,7 +448,7 @@ class L2CacheExecutor:
             flat_layer_index = 0
             for load_events, consumer_count in active_trackers:
                 for layer_index in range(consumer_count):
-                    geometry_offset, num_geometry_rows, max_payload_bytes = (
+                    geometry_offset, num_geometry_rows = (
                         self._transfer_geometry.layer_slices[flat_layer_index]
                     )
                     transfer_cache_blocks(
@@ -468,7 +461,6 @@ class L2CacheExecutor:
                         num_blocks=num_blocks,
                         geometry_offset=geometry_offset,
                         num_geometry_rows=num_geometry_rows,
-                        max_payload_bytes=max_payload_bytes,
                         backend=self.transfer_backend,
                     )
                     finish = device_module.Event()

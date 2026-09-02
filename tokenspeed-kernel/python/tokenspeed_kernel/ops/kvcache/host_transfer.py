@@ -39,7 +39,7 @@ _mapped_host_triton_available: bool | None = None
 
 _GEOMETRY_ROW_WIDTH = 8
 GeometryRow = tuple[int, int, int, int, int, int, int, int]
-LayerSlice = tuple[int, int, int]
+LayerSlice = tuple[int, int]
 
 
 def _pinned_host_int64(shape: tuple[int, ...]) -> torch.Tensor:
@@ -197,24 +197,13 @@ def build_host_transfer_geometry(
         )
 
     row_offset = 0
-    for layer_index, (slice_offset, num_rows, max_payload_bytes) in enumerate(
-        layer_slices
-    ):
+    for layer_index, (slice_offset, num_rows) in enumerate(layer_slices):
         if slice_offset != row_offset:
             raise ValueError(
                 f"layer slice {layer_index} offset {slice_offset} != {row_offset}"
             )
         if num_rows < 0:
             raise ValueError("layer slice row counts must be non-negative")
-        expected_max_payload = max(
-            (int(row[7]) for row in rows[slice_offset : slice_offset + num_rows]),
-            default=0,
-        )
-        if max_payload_bytes != expected_max_payload:
-            raise ValueError(
-                f"layer slice {layer_index} max payload {max_payload_bytes} "
-                f"!= {expected_max_payload}"
-            )
         row_offset += num_rows
     if row_offset != len(rows):
         raise ValueError("layer slices do not cover all geometry rows")
@@ -447,14 +436,6 @@ class HostTransferWorkspace:
             self._block_group_offsets_device[:offset_count],
         )
 
-    def device_block_rows(self, block_offset: int, num_blocks: int) -> torch.Tensor:
-        self._require_committed_block_state()
-        if self._block_device is None:
-            raise ValueError("block device table is empty")
-        if block_offset < 0 or block_offset + num_blocks > self._num_committed_blocks:
-            raise ValueError("block device slice lies outside the table")
-        return self._block_device[block_offset : block_offset + num_blocks]
-
     def block_group_offsets_device(self) -> torch.Tensor:
         self._require_committed_block_state()
         if self._block_group_offsets_device is None:
@@ -475,8 +456,10 @@ class HostTransferWorkspace:
                 f"num_blocks {num_blocks} must equal committed block count "
                 f"{self._num_committed_blocks}"
             )
+        if self._block_device is None:
+            raise ValueError("block device table is empty")
         return (
-            self.device_block_rows(0, num_blocks),
+            self._block_device[:num_blocks],
             self.block_group_offsets_device(),
         )
 
@@ -509,7 +492,6 @@ def _triton_is_unavailable(error: Exception) -> bool:
             "triton is not available",
             "hostgetdevicepointer",
             "mapped host access is not available",
-            "has no attribute 'transfer_cache_blocks'",
         )
     )
 
@@ -598,7 +580,6 @@ def transfer_cache_blocks(
     num_blocks: int,
     geometry_offset: int,
     num_geometry_rows: int,
-    max_payload_bytes: int,
     backend: Literal["auto", "triton", "dma"] = "auto",
     grid_cap: int | None = None,
 ) -> None:
@@ -614,7 +595,6 @@ def transfer_cache_blocks(
         num_blocks: Number of valid dynamic block-pair rows.
         geometry_offset: First static field row for this layer.
         num_geometry_rows: Number of static field rows for this layer.
-        max_payload_bytes: Largest field payload in this geometry slice.
         backend: Prefer mapped-Host Triton or lazily expand ranges for DMA.
         grid_cap: Max Triton CTAs.
 
@@ -626,14 +606,12 @@ def transfer_cache_blocks(
         raise ValueError(f"unknown cache transfer direction {direction!r}")
     if backend not in ("auto", "triton", "dma"):
         raise ValueError(f"unknown cache transfer backend {backend!r}")
-    if geometry_offset < 0 or num_geometry_rows < 0 or max_payload_bytes < 0:
+    if geometry_offset < 0 or num_geometry_rows < 0:
         raise ValueError("geometry slice values must be non-negative")
     if geometry_offset + num_geometry_rows > geometry.num_field_rows:
         raise ValueError("geometry slice lies outside the static table")
     if num_blocks < 0:
         raise ValueError("num_blocks must be non-negative")
-    if num_geometry_rows > 0 and max_payload_bytes <= 0:
-        raise ValueError("max_payload_bytes must be positive for a non-empty slice")
     if num_blocks == 0 or num_geometry_rows == 0:
         return
 
@@ -645,7 +623,7 @@ def transfer_cache_blocks(
             geometry_offset=geometry_offset,
             num_geometry_rows=num_geometry_rows,
         )
-        transfer_cache_ranges(
+        _transfer_cache_ranges(
             direction,
             device_buffers,
             host_buffer,
@@ -764,7 +742,7 @@ def _transfer_dma(
         destination.copy_(source, non_blocking=True)
 
 
-def transfer_cache_ranges(
+def _transfer_cache_ranges(
     direction: Literal["d2h", "h2d"],
     device_buffers: Sequence[torch.Tensor],
     host_buffer: torch.Tensor,
