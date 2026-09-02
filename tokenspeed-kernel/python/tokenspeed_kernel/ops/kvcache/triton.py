@@ -57,7 +57,7 @@ __all__ = [
     "set_mla_kv_buffer_triton",
     "store_kv_cache",
     "store_sf_interleaved",
-    "transfer_cache_blocks_h2d",
+    "transfer_cache_blocks",
     "transfer_cache_ranges",
     "transfer_kv_all_layer",
     "transfer_kv_all_layer_mla",
@@ -74,7 +74,7 @@ __all__ = [
 
 
 @triton.jit
-def _transfer_cache_blocks_h2d_kernel(
+def _transfer_cache_blocks_kernel(
     buffer_addresses_ptr,
     geometry_ptr,
     block_pairs_ptr,
@@ -83,6 +83,7 @@ def _transfer_cache_blocks_h2d_kernel(
     geometry_offset,
     host_lcm_block_bytes,
     NUM_DEVICE_BUFFERS: tl.constexpr,
+    DIRECTION: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     pid = tl.program_id(0)
@@ -127,19 +128,33 @@ def _transfer_cache_blocks_h2d_kernel(
                 tl.pointer_type(tl.uint8),
             )
             host_ptr = tl.cast(host_address + host_offset, tl.pointer_type(tl.uint8))
-            values = tl.load(
-                host_ptr + byte_offsets,
-                mask=mask,
-                cache_modifier=".cg",
-            )
-            tl.store(device_ptr + byte_offsets, values, mask=mask)
+            if DIRECTION == 0:
+                values = tl.load(
+                    device_ptr + byte_offsets,
+                    mask=mask,
+                    cache_modifier=".cg",
+                )
+                tl.store(
+                    host_ptr + byte_offsets,
+                    values,
+                    mask=mask,
+                    cache_modifier=".cs",
+                )
+            else:
+                values = tl.load(
+                    host_ptr + byte_offsets,
+                    mask=mask,
+                    cache_modifier=".cg",
+                )
+                tl.store(device_ptr + byte_offsets, values, mask=mask)
 
 
-def transfer_cache_blocks_h2d(
+def transfer_cache_blocks(
     address_table: torch.Tensor,
     geometry_table: torch.Tensor,
     block_pairs: torch.Tensor,
     group_offsets: torch.Tensor,
+    direction: int,
     *,
     geometry_offset: int,
     num_geometry_rows: int,
@@ -148,13 +163,14 @@ def transfer_cache_blocks_h2d(
     num_device_buffers: int,
     grid_cap: int | None = None,
 ) -> None:
-    """Restore one layer from compact Host blocks using prepared metadata.
+    """Copy compact Host blocks using prepared static and dynamic metadata.
 
     Args:
         address_table: Device pointers followed by the mapped Host pointer.
         geometry_table: Static int64 field rows.
         block_pairs: Dynamic int64 ``(device_block_id, host_block_id)`` rows.
         group_offsets: Valid group bucket offsets, with ``num_groups + 1`` entries.
+        direction: ``0`` for Device-to-Host and ``1`` for Host-to-Device.
         geometry_offset: First static field row for this layer.
         num_geometry_rows: Number of field rows for this layer.
         host_lcm_block_bytes: Byte stride between compact Host LCM blocks.
@@ -163,16 +179,18 @@ def transfer_cache_blocks_h2d(
         grid_cap: Max CTAs. Defaults to ``TOKENSPEED_HOST_CACHE_GRID_CAP``.
 
     Returns:
-        None; the Host-to-Device copies are enqueued on the current stream.
+        None; copies are enqueued on the current device stream.
     """
 
+    if direction not in (0, 1):
+        raise ValueError("direction must be 0 (D2H) or 1 (H2D)")
     if work_items <= 0 or num_geometry_rows <= 0:
         return
     cap = _HOST_CACHE_GRID_CAP if grid_cap is None else int(grid_cap)
     if cap <= 0:
         raise ValueError("grid_cap must be positive")
     grid = (min(cap, work_items),)
-    _transfer_cache_blocks_h2d_kernel[grid](
+    _transfer_cache_blocks_kernel[grid](
         address_table,
         geometry_table,
         block_pairs,
@@ -181,6 +199,7 @@ def transfer_cache_blocks_h2d(
         geometry_offset,
         host_lcm_block_bytes,
         NUM_DEVICE_BUFFERS=num_device_buffers,
+        DIRECTION=direction,
         BLOCK_SIZE=HOST_CACHE_TRANSFER_CHUNK_BYTES,
         num_warps=8,
     )

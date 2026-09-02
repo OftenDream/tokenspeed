@@ -31,8 +31,7 @@ import torch
 from tokenspeed_kernel.ops.kvcache.host_transfer import (
     HostTransferWorkspace,
     build_host_transfer_geometry,
-    transfer_cache_blocks_h2d,
-    transfer_cache_ranges,
+    transfer_cache_blocks,
 )
 from tokenspeed_scheduler import Cache
 
@@ -172,78 +171,77 @@ class L2CacheExecutor:
         # work) can touch them. Loads keep their own stream: their consumers
         # are fenced per layer by the tracker events.
         self.load_stream = _new_cache_stream(_load_stream_priority())
-        self._load_geometry = None
         device = self.layout.buffers[0].device
-        if io_backend == "kernel" and device.type != "npu":
-            fields_by_id = {}
-            for group_index, group in enumerate(self.layout.groups):
-                for field_index, field in enumerate(group.fields):
-                    if field.field_id in fields_by_id:
-                        raise ValueError(
-                            f"cache transfer field {field.field_id!r} appears twice"
-                        )
-                    fields_by_id[field.field_id] = (
+        fields_by_id = {}
+        for group_index, group in enumerate(self.layout.groups):
+            for field_index, field in enumerate(group.fields):
+                if field.field_id in fields_by_id:
+                    raise ValueError(
+                        f"cache transfer field {field.field_id!r} appears twice"
+                    )
+                fields_by_id[field.field_id] = (
+                    group_index,
+                    field_index,
+                    group,
+                    field,
+                )
+
+        rows = []
+        layer_slices = []
+        consumed_fields = set()
+        for consumer in self.layout.consumers:
+            layer_offset = len(rows)
+            max_payload_bytes = 0
+            for field_id in consumer:
+                if field_id in consumed_fields:
+                    raise ValueError(
+                        f"cache transfer field {field_id!r} has two consumers"
+                    )
+                try:
+                    group_index, field_index, group, field = fields_by_id[field_id]
+                except KeyError as exc:
+                    raise ValueError(
+                        f"cache consumer references unknown field {field_id!r}"
+                    ) from exc
+                consumed_fields.add(field_id)
+                rows.append(
+                    (
                         group_index,
-                        field_index,
-                        group,
-                        field,
+                        field.device_buffer_index,
+                        field.device_block_zero_offset_bytes,
+                        field.block_stride_bytes,
+                        self.host_storage.host_cache_block_bytes[group_index],
+                        self.host_storage.host_field_offsets[group_index][field_index],
+                        group.cache_blocks_per_lcm_block,
+                        field.payload_bytes,
                     )
-
-            rows = []
-            layer_slices = []
-            consumed_fields = set()
-            for consumer in self.layout.consumers:
-                layer_offset = len(rows)
-                max_payload_bytes = 0
-                for field_id in consumer:
-                    if field_id in consumed_fields:
-                        raise ValueError(
-                            f"cache transfer field {field_id!r} has two consumers"
-                        )
-                    try:
-                        group_index, field_index, group, field = fields_by_id[field_id]
-                    except KeyError as exc:
-                        raise ValueError(
-                            f"cache consumer references unknown field {field_id!r}"
-                        ) from exc
-                    consumed_fields.add(field_id)
-                    rows.append(
-                        (
-                            group_index,
-                            field.device_buffer_index,
-                            field.device_block_zero_offset_bytes,
-                            field.block_stride_bytes,
-                            self.host_storage.host_cache_block_bytes[group_index],
-                            self.host_storage.host_field_offsets[group_index][
-                                field_index
-                            ],
-                            group.cache_blocks_per_lcm_block,
-                            field.payload_bytes,
-                        )
-                    )
-                    max_payload_bytes = max(max_payload_bytes, field.payload_bytes)
-                layer_slices.append(
-                    (layer_offset, len(rows) - layer_offset, max_payload_bytes)
                 )
-            missing_fields = set(fields_by_id) - consumed_fields
-            if missing_fields:
-                raise ValueError(
-                    f"cache transfer fields have no consumer {sorted(missing_fields)}"
-                )
-
-            geometry = build_host_transfer_geometry(
-                rows=tuple(rows),
-                layer_slices=tuple(layer_slices),
-                group_packing=tuple(
-                    group.cache_blocks_per_lcm_block for group in self.layout.groups
-                ),
-                host_lcm_block_bytes=self.host_storage.host_lcm_block_bytes,
-                num_host_lcm_blocks=self.host_storage.num_host_lcm_blocks,
-                num_device_lcm_blocks=self.layout.num_lcm_blocks,
-                num_device_buffers=len(self.layout.buffers),
+                max_payload_bytes = max(max_payload_bytes, field.payload_bytes)
+            layer_slices.append(
+                (layer_offset, len(rows) - layer_offset, max_payload_bytes)
             )
-            with device_module.stream(self.load_stream):
-                self._load_geometry = geometry.bind(device, non_blocking=True)
+        missing_fields = set(fields_by_id) - consumed_fields
+        if missing_fields:
+            raise ValueError(
+                f"cache transfer fields have no consumer {sorted(missing_fields)}"
+            )
+
+        geometry = build_host_transfer_geometry(
+            rows=tuple(rows),
+            layer_slices=tuple(layer_slices),
+            group_packing=tuple(
+                group.cache_blocks_per_lcm_block for group in self.layout.groups
+            ),
+            host_lcm_block_bytes=self.host_storage.host_lcm_block_bytes,
+            num_host_lcm_blocks=self.host_storage.num_host_lcm_blocks,
+            num_device_lcm_blocks=self.layout.num_lcm_blocks,
+            num_device_buffers=len(self.layout.buffers),
+        )
+        if io_backend == "kernel" and device.type != "npu":
+            # Both the caller stream (D2H) and load stream (H2D) consume this
+            # immutable table, so publish it synchronously once at init.
+            geometry = geometry.bind(device)
+        self._transfer_geometry = geometry
         self._write_workspace = HostTransferWorkspace()
         # A tracker waits for an event set's previous final-layer event before
         # reusing its index. Aligning workspaces to those indices keeps each
@@ -337,41 +335,6 @@ class L2CacheExecutor:
                 )
                 transfers.append((int(group), int(device_block_id), int(host_block_id)))
 
-    def _transfer_ranges(
-        self,
-        transfers: Sequence[tuple[int, int, int]],
-        field_ids: set[str] | None = None,
-    ) -> list[tuple[int, int, int, int]]:
-        ranges = []
-        for group_index, device_block_id, host_block_id in transfers:
-            group = self.layout.groups[group_index]
-            for field_index, field in enumerate(group.fields):
-                if field_ids is not None and field.field_id not in field_ids:
-                    continue
-                ranges.append(
-                    (
-                        field.device_buffer_index,
-                        field.device_block_zero_offset_bytes
-                        + device_block_id * field.block_stride_bytes,
-                        self.host_storage.host_field_offset(
-                            group_index, host_block_id, field_index
-                        ),
-                        field.payload_bytes,
-                    )
-                )
-        return ranges
-
-    def _fill_workspace_ranges(
-        self,
-        workspace: HostTransferWorkspace,
-        transfers: Sequence[tuple[int, int, int]],
-        field_ids: set[str] | None = None,
-    ) -> tuple[int, int]:
-        ranges = self._transfer_ranges(transfers, field_ids)
-        if not ranges:
-            return 0, 0
-        return workspace.load_ranges(ranges)
-
     def _start_writing(
         self,
         op_ids: Sequence[int],
@@ -395,19 +358,30 @@ class L2CacheExecutor:
         # emits this op, and the single-stream FIFO is what keeps the copy
         # ahead of the pages' next writer.
         stream = device_module.current_stream()
-        num_ranges, max_bytes = self._fill_workspace_ranges(
-            self._write_workspace, transfers
+        num_blocks, _ = self._write_workspace.load_block_transfers(
+            transfers, geometry=self._transfer_geometry
         )
-        transfer_cache_ranges(
+        if self._transfer_geometry.device_rows is not None:
+            # The single write workspace can be refilled by the next plan as
+            # soon as this method returns, so finish staging before releasing
+            # the caller thread. Device-table reuse remains ordered by stream.
+            self._write_workspace.commit_block_transfers(
+                num_blocks, self.layout.buffers[0].device
+            )
+        transfer_cache_blocks(
             "d2h",
             self.layout.buffers,
             self.host_storage.host_buffer,
-            (),
+            self._transfer_geometry,
+            self._write_workspace,
             stream,
+            num_blocks=num_blocks,
+            geometry_offset=0,
+            num_geometry_rows=self._transfer_geometry.num_field_rows,
+            max_payload_bytes=max(
+                layer_slice[2] for layer_slice in self._transfer_geometry.layer_slices
+            ),
             backend=self.transfer_backend,
-            workspace=self._write_workspace,
-            num_ranges=num_ranges,
-            max_bytes=max_bytes,
         )
         finish = device_module.Event()
         finish.record(stream)
@@ -463,57 +437,40 @@ class L2CacheExecutor:
             if load_index is None:
                 raise RuntimeError("cache transfer layout has no layer consumers")
 
-            workspace = None
-            num_blocks = 0
-            layer_ranges = None
-            if self._load_geometry is not None:
-                device = self.layout.buffers[0].device
-                workspace = self._load_workspaces[load_index]
-                num_blocks, _ = workspace.load_block_transfers(
-                    transfers, geometry=self._load_geometry
-                )
-                # All layer kernels below read slices of this one table. The
-                # indexed workspace is not refilled until this event set wraps.
+            device = self.layout.buffers[0].device
+            workspace = self._load_workspaces[load_index]
+            num_blocks, _ = workspace.load_block_transfers(
+                transfers, geometry=self._transfer_geometry
+            )
+            # All layer kernels below read slices of this one table. The
+            # indexed workspace is not refilled until this event set wraps.
+            if self._transfer_geometry.device_rows is not None:
                 with device_module.stream(self.load_stream):
                     workspace.commit_block_transfers(
                         num_blocks,
                         device,
                         non_blocking=True,
                     )
-            else:
-                layer_ranges = []
-                for layer_index in range(sum(count for _, count in active_trackers)):
-                    consumer = self.layout.consumers[layer_index]
-                    layer_ranges.append(self._transfer_ranges(transfers, set(consumer)))
 
             flat_layer_index = 0
             for load_events, consumer_count in active_trackers:
                 for layer_index in range(consumer_count):
-                    if self._load_geometry is None:
-                        transfer_cache_ranges(
-                            "h2d",
-                            self.layout.buffers,
-                            self.host_storage.host_buffer,
-                            layer_ranges[flat_layer_index],
-                            self.load_stream,
-                            backend=self.transfer_backend,
-                        )
-                    else:
-                        geometry_offset, num_geometry_rows, max_payload_bytes = (
-                            self._load_geometry.layer_slices[flat_layer_index]
-                        )
-                        transfer_cache_blocks_h2d(
-                            self.layout.buffers,
-                            self.host_storage.host_buffer,
-                            self._load_geometry,
-                            workspace,
-                            self.load_stream,
-                            num_blocks=num_blocks,
-                            geometry_offset=geometry_offset,
-                            num_geometry_rows=num_geometry_rows,
-                            max_payload_bytes=max_payload_bytes,
-                            backend=self.transfer_backend,
-                        )
+                    geometry_offset, num_geometry_rows, max_payload_bytes = (
+                        self._transfer_geometry.layer_slices[flat_layer_index]
+                    )
+                    transfer_cache_blocks(
+                        "h2d",
+                        self.layout.buffers,
+                        self.host_storage.host_buffer,
+                        self._transfer_geometry,
+                        workspace,
+                        self.load_stream,
+                        num_blocks=num_blocks,
+                        geometry_offset=geometry_offset,
+                        num_geometry_rows=num_geometry_rows,
+                        max_payload_bytes=max_payload_bytes,
+                        backend=self.transfer_backend,
+                    )
                     finish = device_module.Event()
                     finish.record(self.load_stream)
                     load_events.layer_done_events[layer_index] = finish

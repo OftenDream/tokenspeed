@@ -31,7 +31,7 @@ from typing import Literal
 import torch
 from tokenspeed_kernel.ops.kvcache.triton import (
     HOST_CACHE_TRANSFER_CHUNK_BYTES,
-    transfer_cache_blocks_h2d as _transfer_cache_blocks_h2d_triton,
+    transfer_cache_blocks as _transfer_cache_blocks_triton,
     transfer_cache_ranges as _transfer_cache_ranges_triton,
 )
 from tokenspeed_kernel.platform import current_platform
@@ -602,13 +602,13 @@ def _triton_is_unavailable(error: Exception) -> bool:
             "triton is not available",
             "hostgetdevicepointer",
             "mapped host access is not available",
-            "has no attribute 'transfer_cache_blocks_h2d'",
+            "has no attribute 'transfer_cache_blocks'",
             "has no attribute 'transfer_cache_ranges'",
         )
     )
 
 
-def _make_h2d_ranges(
+def _make_block_ranges(
     geometry: HostTransferGeometry,
     workspace: HostTransferWorkspace,
     *,
@@ -656,14 +656,14 @@ def _make_h2d_ranges(
     return tuple(ranges)
 
 
-def _layer_block_work_items(
+def _block_work_items(
     geometry: HostTransferGeometry,
     workspace: HostTransferWorkspace,
     *,
     geometry_offset: int,
     num_geometry_rows: int,
 ) -> int:
-    """Return the largest real block/chunk count among one layer's fields."""
+    """Return the largest real block/chunk count in a geometry slice."""
 
     geometry_rows = geometry.host_rows[
         geometry_offset : geometry_offset + num_geometry_rows
@@ -673,9 +673,7 @@ def _layer_block_work_items(
     for row in geometry_rows:
         group_index = int(row[0])
         payload_bytes = int(row[7])
-        group_blocks = int(
-            group_offsets[group_index + 1] - group_offsets[group_index]
-        )
+        group_blocks = int(group_offsets[group_index + 1] - group_offsets[group_index])
         num_chunks = (
             payload_bytes + HOST_CACHE_TRANSFER_CHUNK_BYTES - 1
         ) // HOST_CACHE_TRANSFER_CHUNK_BYTES
@@ -683,7 +681,8 @@ def _layer_block_work_items(
     return work_items
 
 
-def transfer_cache_blocks_h2d(
+def transfer_cache_blocks(
+    direction: Literal["d2h", "h2d"],
     device_buffers: Sequence[torch.Tensor],
     host_buffer: torch.Tensor,
     geometry: HostTransferGeometry,
@@ -697,25 +696,28 @@ def transfer_cache_blocks_h2d(
     backend: Literal["auto", "triton", "dma"] = "auto",
     grid_cap: int | None = None,
 ) -> None:
-    """Restore one layer from compact Host blocks.
+    """Copy compact Host blocks using static geometry and dynamic block IDs.
 
     Args:
+        direction: ``"d2h"`` for writeback or ``"h2d"`` for restore.
         device_buffers: Device tensors referenced by static geometry rows.
         host_buffer: Contiguous pinned uint8 compact Host allocation.
-        geometry: Immutable transfer geometry, already Device-bound for Triton.
+        geometry: Immutable transfer geometry, Device-bound when using Triton.
         workspace: Current dynamic block mapping; Triton requires it committed.
         stream: Device stream ordering the asynchronous copies.
         num_blocks: Number of valid dynamic block-pair rows.
         geometry_offset: First static field row for this layer.
         num_geometry_rows: Number of static field rows for this layer.
-        max_payload_bytes: Largest field payload in this layer, precomputed on CPU.
-        backend: Prefer mapped-Host Triton or expand this layer for DMA fallback.
+        max_payload_bytes: Largest field payload in this geometry slice.
+        backend: Prefer mapped-Host Triton or lazily expand ranges for DMA.
         grid_cap: Max Triton CTAs.
 
     Returns:
         None. Completion is observed by recording an event on ``stream``.
     """
 
+    if direction not in ("d2h", "h2d"):
+        raise ValueError(f"unknown cache transfer direction {direction!r}")
     if backend not in ("auto", "triton", "dma"):
         raise ValueError(f"unknown cache transfer backend {backend!r}")
     if geometry_offset < 0 or num_geometry_rows < 0 or max_payload_bytes < 0:
@@ -730,7 +732,7 @@ def transfer_cache_blocks_h2d(
         return
 
     def transfer_dma() -> None:
-        ranges = _make_h2d_ranges(
+        ranges = _make_block_ranges(
             geometry,
             workspace,
             num_blocks=num_blocks,
@@ -738,7 +740,7 @@ def transfer_cache_blocks_h2d(
             num_geometry_rows=num_geometry_rows,
         )
         transfer_cache_ranges(
-            "h2d",
+            direction,
             device_buffers,
             host_buffer,
             ranges,
@@ -763,7 +765,7 @@ def transfer_cache_blocks_h2d(
         try:
             with stream_context:
                 block_rows, group_offsets = workspace.committed_block_tables(num_blocks)
-                work_items = _layer_block_work_items(
+                work_items = _block_work_items(
                     geometry,
                     workspace,
                     geometry_offset=geometry_offset,
@@ -772,11 +774,12 @@ def transfer_cache_blocks_h2d(
                 if work_items == 0:
                     return
                 address_table = workspace.bind_addresses(device_buffers, host_buffer)
-                _transfer_cache_blocks_h2d_triton(
+                _transfer_cache_blocks_triton(
                     address_table,
                     geometry.device_rows,
                     block_rows,
                     group_offsets,
+                    0 if direction == "d2h" else 1,
                     geometry_offset=geometry_offset,
                     num_geometry_rows=num_geometry_rows,
                     host_lcm_block_bytes=geometry.host_lcm_block_bytes,
