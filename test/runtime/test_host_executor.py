@@ -45,7 +45,7 @@ def _load_executor_module_without_triton(*, force_isolated=False):
     host_transfer = ModuleType("tokenspeed_kernel.ops.kvcache.host_transfer")
     host_transfer.HostTransferWorkspace = Mock
     host_transfer.build_host_transfer_geometry = Mock()
-    host_transfer.transfer_cache_blocks_h2d = Mock()
+    host_transfer.transfer_cache_blocks = Mock()
     host_transfer.transfer_cache_ranges = Mock()
     scheduler = ModuleType("tokenspeed_scheduler")
 
@@ -274,51 +274,7 @@ class GroupAwareWireTest(unittest.TestCase):
         self.assertEqual(op_ids, [7])
         self.assertEqual(transfers, [(0, 5, 9), (1, 5, 9)])
 
-    def test_fill_workspace_ranges_uses_one_batched_load(self):
-        try:
-            L2CacheExecutor = _load_executor_module_without_triton().L2CacheExecutor
-        except (ImportError, ModuleNotFoundError) as exc:
-            self.skipTest(f"needs runtime dependencies: {exc}")
-
-        field = SimpleNamespace(
-            field_id="k",
-            device_buffer_index=0,
-            device_block_zero_offset_bytes=8,
-            block_stride_bytes=8,
-            payload_bytes=4,
-        )
-        executor = L2CacheExecutor.__new__(L2CacheExecutor)
-        executor.layout = SimpleNamespace(groups=(SimpleNamespace(fields=(field,)),))
-        executor.host_storage = SimpleNamespace(
-            host_field_offset=lambda group, block, index: 100 + block * 10 + index
-        )
-        workspace = Mock()
-        workspace.load_ranges.return_value = (1, 4)
-        transfers = [(0, 1, 2)]
-
-        count, max_bytes = executor._fill_workspace_ranges(workspace, transfers)
-
-        workspace.load_ranges.assert_called_once_with(
-            executor._transfer_ranges(transfers)
-        )
-        self.assertEqual((count, max_bytes), (1, 4))
-
-    def test_fill_workspace_ranges_skips_empty_batch(self):
-        try:
-            L2CacheExecutor = _load_executor_module_without_triton().L2CacheExecutor
-        except (ImportError, ModuleNotFoundError) as exc:
-            self.skipTest(f"needs runtime dependencies: {exc}")
-
-        executor = L2CacheExecutor.__new__(L2CacheExecutor)
-        executor.layout = SimpleNamespace(groups=(SimpleNamespace(fields=()),))
-        workspace = Mock()
-
-        count, max_bytes = executor._fill_workspace_ranges(workspace, [])
-
-        workspace.load_ranges.assert_not_called()
-        self.assertEqual((count, max_bytes), (0, 0))
-
-    def test_writeback_calls_transfer_with_compact_layout(self):
+    def test_writeback_reuses_static_geometry_on_the_caller_stream(self):
         try:
             executor_module = _load_executor_module_without_triton()
             L2CacheExecutor = executor_module.L2CacheExecutor
@@ -329,12 +285,18 @@ class GroupAwareWireTest(unittest.TestCase):
         executor._ack_lock = threading.Lock()
         executor.attn_tp_rank = 0
         executor._ready_write_op_ids = []
-        executor.layout = SimpleNamespace(buffers=("device",))
+        device = SimpleNamespace(type="cuda")
+        executor.layout = SimpleNamespace(buffers=(SimpleNamespace(device=device),))
         executor.host_storage = SimpleNamespace(host_buffer="host")
-        executor.transfer_backend = "dma"
+        executor.transfer_backend = "auto"
         executor._write_acks = []
-        executor._write_workspace = object()
-        executor._fill_workspace_ranges = Mock(return_value=(3, 32))
+        executor._write_workspace = Mock()
+        executor._write_workspace.load_block_transfers.return_value = (1, (0, 1))
+        executor._transfer_geometry = SimpleNamespace(
+            device_rows=object(),
+            layer_slices=((0, 2, 32), (2, 1, 16)),
+            num_field_rows=3,
+        )
         stream = object()
         finish = Mock()
 
@@ -343,23 +305,31 @@ class GroupAwareWireTest(unittest.TestCase):
                 executor_module.device_module, "current_stream", return_value=stream
             ),
             patch.object(executor_module.device_module, "Event", return_value=finish),
-            patch.object(executor_module, "transfer_cache_ranges") as transfer,
+            patch.object(executor_module, "transfer_cache_blocks") as transfer,
         ):
             executor._start_writing([7], [(0, 5, 9)])
 
         # On the CALLER's current stream: the copy must read the source pages
         # before anything later in the plan (zeroing, the granted request's
         # writes) can touch them, and the single-stream FIFO is that fence.
+        executor._write_workspace.load_block_transfers.assert_called_once_with(
+            [(0, 5, 9)], geometry=executor._transfer_geometry
+        )
+        executor._write_workspace.commit_block_transfers.assert_called_once_with(
+            1, device
+        )
         transfer.assert_called_once_with(
             "d2h",
             executor.layout.buffers,
             executor.host_storage.host_buffer,
-            (),
+            executor._transfer_geometry,
+            executor._write_workspace,
             stream,
-            backend="dma",
-            workspace=executor._write_workspace,
-            num_ranges=3,
-            max_bytes=32,
+            num_blocks=1,
+            geometry_offset=0,
+            num_geometry_rows=3,
+            max_payload_bytes=32,
+            backend="auto",
         )
         finish.record.assert_called_once_with(stream)
 
@@ -377,12 +347,20 @@ class GroupAwareWireTest(unittest.TestCase):
         executor._load_acks = []
         executor.load_stream = object()
         executor.transfer_backend = "dma"
-        executor._load_geometry = None
-        executor.layout = SimpleNamespace(buffers=("device",), consumers=(("field",),))
+        device = SimpleNamespace(type="cuda")
+        executor.layout = SimpleNamespace(
+            buffers=(SimpleNamespace(device=device),),
+            consumers=(("field",),),
+        )
         executor.host_storage = SimpleNamespace(host_buffer="host")
-        executor._transfer_ranges = Mock(return_value=[(0, 64, 128, 32)])
-        executor._load_workspace = object()
-        executor._fill_workspace_ranges = Mock(return_value=(2, 32))
+        geometry = SimpleNamespace(
+            device_rows=None,
+            layer_slices=((0, 1, 32),),
+        )
+        executor._transfer_geometry = geometry
+        workspace = Mock()
+        workspace.load_block_transfers.return_value = (2, (0, 2))
+        executor._load_workspaces = (workspace,)
         load_events = SimpleNamespace(start_event=Mock(), layer_done_events=[None])
         tracker = Mock()
         tracker.begin_load.return_value = 0
@@ -393,20 +371,26 @@ class GroupAwareWireTest(unittest.TestCase):
         with (
             patch.object(executor_module, "get_is_capture_mode", return_value=False),
             patch.object(executor_module.device_module, "Event", return_value=finish),
-            patch.object(executor_module, "transfer_cache_ranges") as transfer,
+            patch.object(executor_module, "transfer_cache_blocks") as transfer,
             patch.object(executor_module.logger, "info") as log_info,
         ):
             executor._start_loading([9], [(0, 2, 1), (0, 5, 4)])
 
-        executor._transfer_ranges.assert_called_once_with(
-            [(0, 2, 1), (0, 5, 4)], {"field"}
+        workspace.load_block_transfers.assert_called_once_with(
+            [(0, 2, 1), (0, 5, 4)], geometry=geometry
         )
+        workspace.commit_block_transfers.assert_not_called()
         transfer.assert_called_once_with(
             "h2d",
             executor.layout.buffers,
             executor.host_storage.host_buffer,
-            [(0, 64, 128, 32)],
+            geometry,
+            workspace,
             executor.load_stream,
+            num_blocks=2,
+            geometry_offset=0,
+            num_geometry_rows=1,
+            max_payload_bytes=32,
             backend="dma",
         )
         log_info.assert_called_once_with(
@@ -520,11 +504,6 @@ class GroupAwareWireTest(unittest.TestCase):
                 "build_host_transfer_geometry",
                 return_value=unbound_geometry,
             ) as build_geometry,
-            patch.object(
-                executor_module.device_module,
-                "stream",
-                return_value=nullcontext(),
-            ),
         ):
             executor = L2CacheExecutor(
                 target_pool,
@@ -547,11 +526,11 @@ class GroupAwareWireTest(unittest.TestCase):
             num_device_lcm_blocks=11,
             num_device_buffers=2,
         )
-        unbound_geometry.bind.assert_called_once_with(device, non_blocking=True)
-        self.assertIs(executor._load_geometry, bound_geometry)
+        unbound_geometry.bind.assert_called_once_with(device)
+        self.assertIs(executor._transfer_geometry, bound_geometry)
         self.assertEqual([count for count, _ in trackers], [3, 1])
 
-    def test_direct_and_npu_init_do_not_create_device_geometry(self):
+    def test_direct_and_npu_init_keep_geometry_on_the_host(self):
         try:
             executor_module = _load_executor_module_without_triton()
             L2CacheExecutor = executor_module.L2CacheExecutor
@@ -561,6 +540,8 @@ class GroupAwareWireTest(unittest.TestCase):
         pool = Mock()
         pool.arena.cache_group_specs = (SimpleNamespace(group_id="group"),)
         storage = SimpleNamespace(
+            host_cache_block_bytes=(16,),
+            host_field_offsets=((0,),),
             host_lcm_block_bytes=64,
             num_host_lcm_blocks=2,
             host_buffer="host",
@@ -584,11 +565,23 @@ class GroupAwareWireTest(unittest.TestCase):
             patch.object(executor_module, "_new_cache_stream", return_value="load"),
             patch.object(executor_module, "HostTransferWorkspace", side_effect=Mock),
             patch.object(
-                executor_module, "build_host_transfer_geometry"
+                executor_module,
+                "build_host_transfer_geometry",
+                side_effect=lambda **_kwargs: SimpleNamespace(
+                    device_rows=None,
+                    bind=Mock(),
+                ),
             ) as build_geometry,
         ):
             for io_backend, device_type in (("direct", "cuda"), ("kernel", "npu")):
                 with self.subTest(io_backend=io_backend, device_type=device_type):
+                    field = SimpleNamespace(
+                        field_id="field",
+                        device_buffer_index=0,
+                        device_block_zero_offset_bytes=0,
+                        block_stride_bytes=16,
+                        payload_bytes=16,
+                    )
                     layout = SimpleNamespace(
                         num_lcm_blocks=2,
                         buffers=(
@@ -597,7 +590,7 @@ class GroupAwareWireTest(unittest.TestCase):
                         groups=(
                             SimpleNamespace(
                                 cache_blocks_per_lcm_block=1,
-                                fields=(object(),),
+                                fields=(field,),
                             ),
                         ),
                         consumers=(("field",),),
@@ -609,9 +602,10 @@ class GroupAwareWireTest(unittest.TestCase):
                         host_size_gb=0,
                         io_backend=io_backend,
                     )
-                    self.assertIsNone(executor._load_geometry)
+                    self.assertIsNone(executor._transfer_geometry.device_rows)
+                    executor._transfer_geometry.bind.assert_not_called()
 
-        build_geometry.assert_not_called()
+        self.assertEqual(build_geometry.call_count, 2)
 
     def test_optional_dependency_shim_restores_existing_modules(self):
         protected_names = (
@@ -665,11 +659,9 @@ class GroupAwareWireTest(unittest.TestCase):
             consumers=(("layer.0",), (), ("layer.2",)),
         )
         executor.host_storage = SimpleNamespace(host_buffer="host")
-        executor._transfer_ranges = Mock(
-            side_effect=AssertionError("normal kernel H2D must not expand ranges")
-        )
         geometry = SimpleNamespace(layer_slices=((0, 2, 64), (2, 0, 0), (2, 1, 32)))
-        executor._load_geometry = geometry
+        geometry.device_rows = object()
+        executor._transfer_geometry = geometry
         workspace = Mock()
         workspace.load_block_transfers.return_value = (1, (0, 1))
         executor._load_workspaces = (workspace,)
@@ -690,7 +682,7 @@ class GroupAwareWireTest(unittest.TestCase):
                 return_value=nullcontext(),
             ),
             patch.object(executor_module.device_module, "Event", side_effect=finishes),
-            patch.object(executor_module, "transfer_cache_blocks_h2d") as transfer,
+            patch.object(executor_module, "transfer_cache_blocks") as transfer,
         ):
             executor._start_loading([9], [(0, 2, 1)])
 
@@ -700,11 +692,11 @@ class GroupAwareWireTest(unittest.TestCase):
         workspace.commit_block_transfers.assert_called_once_with(
             1, device, non_blocking=True
         )
-        executor._transfer_ranges.assert_not_called()
         self.assertEqual(
             transfer.call_args_list,
             [
                 call(
+                    "h2d",
                     executor.layout.buffers,
                     executor.host_storage.host_buffer,
                     geometry,
@@ -717,6 +709,7 @@ class GroupAwareWireTest(unittest.TestCase):
                     backend="auto",
                 ),
                 call(
+                    "h2d",
                     executor.layout.buffers,
                     executor.host_storage.host_buffer,
                     geometry,
@@ -729,6 +722,7 @@ class GroupAwareWireTest(unittest.TestCase):
                     backend="auto",
                 ),
                 call(
+                    "h2d",
                     executor.layout.buffers,
                     executor.host_storage.host_buffer,
                     geometry,
@@ -771,7 +765,8 @@ class GroupAwareWireTest(unittest.TestCase):
         )
         executor.host_storage = SimpleNamespace(host_buffer="host")
         geometry = SimpleNamespace(layer_slices=((0, 1, 8), (1, 1, 16), (2, 1, 32)))
-        executor._load_geometry = geometry
+        geometry.device_rows = object()
+        executor._transfer_geometry = geometry
         workspace = Mock()
         workspace.load_block_transfers.return_value = (1, (0, 1))
         executor._load_workspaces = (workspace,)
@@ -803,7 +798,7 @@ class GroupAwareWireTest(unittest.TestCase):
             ),
             patch.object(
                 executor_module,
-                "transfer_cache_blocks_h2d",
+                "transfer_cache_blocks",
                 side_effect=(None, RuntimeError("layer launch failed")),
             ) as transfer,
         ):
@@ -843,7 +838,8 @@ class GroupAwareWireTest(unittest.TestCase):
         )
         executor.host_storage = SimpleNamespace(host_buffer="host")
         geometry = SimpleNamespace(layer_slices=((0, 1, 8),))
-        executor._load_geometry = geometry
+        geometry.device_rows = object()
+        executor._transfer_geometry = geometry
         workspace = Mock()
         workspace.load_block_transfers.return_value = (1, (0, 1))
         executor._load_workspaces = (workspace,)
@@ -873,7 +869,7 @@ class GroupAwareWireTest(unittest.TestCase):
             ),
             patch.object(
                 executor_module,
-                "transfer_cache_blocks_h2d",
+                "transfer_cache_blocks",
                 side_effect=original_error,
             ),
         ):
@@ -988,7 +984,6 @@ class CompactLayoutRoundTripTest(unittest.TestCase):
         first[94:99].copy_(state_three)
         torch.cuda.synchronize()
 
-        executor._transfer_ranges = Mock(wraps=executor._transfer_ranges)
         executor._start_writing(  # pylint: disable=protected-access
             [7],
             [(0, 1, 1), (0, 4, 4), (1, 3, 3)],
@@ -996,8 +991,6 @@ class CompactLayoutRoundTripTest(unittest.TestCase):
         torch.cuda.current_stream().synchronize()
         write_results = executor.poll_results()
         self.assertEqual([int(event.op_id) for event in write_results], [7])
-        executor._transfer_ranges.assert_called()
-        executor._transfer_ranges.reset_mock()
 
         # Destroy every Device byte so stale cache contents cannot make the
         # H2D half of the round trip pass accidentally.
@@ -1016,8 +1009,6 @@ class CompactLayoutRoundTripTest(unittest.TestCase):
         torch.cuda.synchronize()
         load_results = executor.poll_results()
         self.assertEqual([int(event.op_id) for event in load_results], [9])
-        executor._transfer_ranges.assert_not_called()
-
         # Hand-derived destination ranges for blocks (full: 2, 5; state: 4).
         expected_first = torch.full((128,), 0xEE, dtype=torch.uint8)
         expected_second = torch.full((128,), 0xEE, dtype=torch.uint8)
