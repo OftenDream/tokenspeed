@@ -48,6 +48,7 @@ def layer_ready_ptx_supported() -> bool:
 
     return bool(current_platform().is_nvidia)
 
+
 _GEOMETRY_ROW_WIDTH = 8
 GeometryRow = tuple[int, int, int, int, int, int, int, int]
 LayerSlice = tuple[int, int]
