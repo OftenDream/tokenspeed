@@ -78,11 +78,16 @@ def _load_executor_module_without_triton(*, force_isolated=False):
     runtime_utils = ModuleType("tokenspeed.runtime.utils")
     runtime_utils.get_colorful_logger = Mock(return_value=Mock())
     runtime_utils.get_device_module = Mock(return_value=Mock())
+    verify = ModuleType("tokenspeed.runtime.cache.l2.verify")
+    verify.L2TransferVerifier = Mock
+    verify.l2_verify_enabled = Mock(return_value=False)
+    verify.l2_verify_log_path = Mock(return_value="")
     fake_modules = {
         "tokenspeed_kernel.ops.kvcache.host_transfer": host_transfer,
         "tokenspeed_scheduler": scheduler,
         "tokenspeed.runtime.cache.l2.layerwise_load": layerwise_load,
         "tokenspeed.runtime.cache.l2.storage": storage,
+        "tokenspeed.runtime.cache.l2.verify": verify,
         "tokenspeed.runtime.cache.transfer.layout": layout,
         "tokenspeed.runtime.execution.cuda_graph_wrapper": graph_wrapper,
         "tokenspeed.runtime.utils": runtime_utils,

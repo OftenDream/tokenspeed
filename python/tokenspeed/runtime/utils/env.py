@@ -245,6 +245,9 @@ class Envs:
     TOKENSPEED_CI_SMALL_KV_SIZE = EnvInt(-1)
     TOKENSPEED_NVTX = EnvBool(False)
     TOKENSPEED_DP_SAMPLING_BACKEND = EnvStr(None)
+    # Debug: hash L2 store/load. Baseline is Host after D2H, not Device at submit.
+    TOKENSPEED_L2_VERIFY = EnvBool(False)
+    TOKENSPEED_L2_VERIFY_LOG = EnvStr("")
 
     # Scheduler
     TOKENSPEED_BLOCK_NONZERO_RANK_CHILDREN = EnvBool(True)

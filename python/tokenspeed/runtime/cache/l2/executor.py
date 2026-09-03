@@ -42,6 +42,11 @@ from tokenspeed.runtime.cache.l2.storage import (
     HostCacheStorage,
     compute_host_lcm_block_bytes,
 )
+from tokenspeed.runtime.cache.l2.verify import (
+    L2TransferVerifier,
+    l2_verify_enabled,
+    l2_verify_log_path,
+)
 from tokenspeed.runtime.cache.transfer.layout import combine_cache_transfer_layouts
 from tokenspeed.runtime.execution.cuda_graph_wrapper import get_is_capture_mode
 from tokenspeed.runtime.utils import get_colorful_logger, get_device_module
@@ -79,6 +84,8 @@ def _ordered_unique(values: Iterable[int]) -> list[int]:
 class _Ack(NamedTuple):
     finish_event: object
     op_ids: list[int]
+    kind: str
+    transfers: list[tuple[int, int, int]]
 
 
 def _num_host_lcm_blocks(
@@ -272,6 +279,15 @@ class L2CacheExecutor:
         self._ready_write_op_ids: list[int] = []
         self._ready_load_op_ids: list[int] = []
         self._load_poisoned = False
+        self._verifier = None
+        if l2_verify_enabled():
+            self._verifier = L2TransferVerifier(
+                self.layout, self.host_storage, self.attn_tp_rank
+            )
+            logger.warning(
+                "[L2 verify] enabled: baseline is Host after D2H; jsonl=%s",
+                l2_verify_log_path() or "off",
+            )
 
     def submit_write_backs(self, plan) -> None:
         """Enqueue the plan's D2H snapshot copies on the current stream.
@@ -364,6 +380,11 @@ class L2CacheExecutor:
         # emits this op, and the single-stream FIFO is what keeps the copy
         # ahead of the pages' next writer.
         stream = device_module.current_stream()
+        verifier = getattr(self, "_verifier", None)
+        if verifier is not None:
+            # Wait for prior Device KV writers on this stream before hashing.
+            stream.synchronize()
+            verifier.snapshot_store_device(transfers)
         num_blocks, _ = self._write_workspace.load_block_transfers(
             transfers, geometry=self._transfer_geometry
         )
@@ -389,7 +410,9 @@ class L2CacheExecutor:
         finish = device_module.Event()
         finish.record(stream)
         with self._ack_lock:
-            self._write_acks.append(_Ack(finish, op_ids))
+            self._write_acks.append(
+                _Ack(finish, op_ids, "write", list(transfers))
+            )
 
     def _start_loading(
         self,
@@ -440,6 +463,12 @@ class L2CacheExecutor:
                 load_events.start_event.wait(self.load_stream)
             if load_index is None:
                 raise RuntimeError("cache transfer layout has no layer consumers")
+
+            verifier = getattr(self, "_verifier", None)
+            if verifier is not None:
+                # Host baseline check before any H2D payload kernel runs.
+                active_trackers[0][0].start_event.synchronize()
+                verifier.snapshot_load_host(transfers)
 
             device = self.layout.buffers[0].device
             workspace = self._load_workspaces[load_index]
@@ -520,8 +549,19 @@ class L2CacheExecutor:
                         flat_layer_index += 1
             if finish is None:
                 raise RuntimeError("cache transfer layout has no layer consumers")
+            # Authoritative H2D check: sync the load stream before the model
+            # forward can wait on layer events and mutate KDA checkpoint pages
+            # in-place. The later at-poll check is retained to quantify that race.
+            verifier = getattr(self, "_verifier", None)
+            if verifier is not None:
+                finish.synchronize()
+                verifier.check_load_device(
+                    transfers, stage="LOAD device post-h2d"
+                )
             with self._ack_lock:
-                self._load_acks.append(_Ack(finish, op_ids))
+                self._load_acks.append(
+                    _Ack(finish, op_ids, "load", list(transfers))
+                )
             return load_index
         except BaseException as original_error:
             if active_trackers:
@@ -560,10 +600,12 @@ class L2CacheExecutor:
             self._ready_write_op_ids.clear()
             results.extend(self._load_done(op_id) for op_id in self._ready_load_op_ids)
             self._ready_load_op_ids.clear()
-            self._write_acks[:] = self._drain(
+            self._write_acks[:] = self._drain_verified(
                 self._write_acks, self._write_done, results
             )
-            self._load_acks[:] = self._drain(self._load_acks, self._load_done, results)
+            self._load_acks[:] = self._drain_verified(
+                self._load_acks, self._load_done, results
+            )
         return results
 
     @staticmethod
@@ -571,6 +613,23 @@ class L2CacheExecutor:
         pending = []
         for ack in queue:
             if ack.finish_event.query():
+                results.extend(done(op_id) for op_id in ack.op_ids)
+            else:
+                pending.append(ack)
+        return pending
+
+    def _drain_verified(self, queue, done, results):
+        pending = []
+        verifier = getattr(self, "_verifier", None)
+        for ack in queue:
+            if ack.finish_event.query():
+                if verifier is not None:
+                    if ack.kind == "write":
+                        verifier.commit_store_host(ack.transfers)
+                    elif ack.kind == "load":
+                        verifier.check_load_device(
+                            ack.transfers, stage="LOAD device at-poll"
+                        )
                 results.extend(done(op_id) for op_id in ack.op_ids)
             else:
                 pending.append(ack)
@@ -602,3 +661,6 @@ class L2CacheExecutor:
         self._ready_load_op_ids.clear()
         for tracker, _ in self._load_trackers:
             tracker.reset()
+        verifier = getattr(self, "_verifier", None)
+        if verifier is not None:
+            verifier.reset()
