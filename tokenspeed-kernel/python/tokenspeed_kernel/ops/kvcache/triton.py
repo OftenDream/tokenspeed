@@ -195,6 +195,27 @@ def _signal_layer_ready(count_ptr, flag_ptr, nprogs):
 
 
 @triton.jit
+def _read_clock64(dummy_ptr):
+    return tl.inline_asm_elementwise(
+        "mov.u64 $0, %clock64;",
+        "=l,l",
+        [dummy_ptr],
+        dtype=tl.uint64,
+        is_pure=False,
+        pack=1,
+    )
+
+
+@triton.jit
+def _spin_clocks(dummy_ptr, cycles):
+    # Temporary test-branch stall. ~1s at a ~2 GHz SM clock.
+    start = _read_clock64(dummy_ptr)
+    now = start
+    while now - start < cycles:
+        now = _read_clock64(dummy_ptr)
+
+
+@triton.jit
 def _transfer_cache_blocks_kernel(
     buffer_addresses_ptr,
     geometry_ptr,
@@ -237,6 +258,9 @@ def _transfer_cache_blocks_kernel(
                 layer_ready_flags_ptr + layer_index,
                 nprogs,
             )
+            if layer_index == 0:
+                _spin_clocks(layer_ready_flags_ptr, 2_000_000_000)
+                tl.debug_barrier()
         return
     _copy_geometry_slice(
         buffer_addresses_ptr,
