@@ -31,6 +31,7 @@ import torch
 from tokenspeed_kernel.ops.kvcache.host_transfer import (
     HostTransferWorkspace,
     build_host_transfer_geometry,
+    layer_ready_ptx_supported,
     transfer_cache_blocks,
     wait_layer_ready,
 )
@@ -439,17 +440,26 @@ class L2CacheExecutor:
             )
             layer_slices = self._transfer_geometry.layer_slices
             num_field_rows = sum(num_rows for _, num_rows in layer_slices)
-            use_layer_flags = self._transfer_geometry.device_rows is not None
+            use_layer_flags = (
+                self._transfer_geometry.device_rows is not None
+                and layer_ready_ptx_supported()
+            )
             # All layer kernels below read slices of this one table. The
             # indexed workspace is not refilled until this event set wraps.
-            if use_layer_flags:
+            # Commit whenever Device geometry exists so AMD can still launch
+            # unflagged per-layer Triton copies; only NVIDIA uses PTX flags.
+            if self._transfer_geometry.device_rows is not None:
                 with device_module.stream(self.load_stream):
                     workspace.commit_block_transfers(
                         num_blocks,
                         device,
                         non_blocking=True,
                     )
-                    flags = workspace.prepare_layer_ready(len(layer_slices), device)
+                    if use_layer_flags:
+                        flags = workspace.prepare_layer_ready(
+                            len(layer_slices), device
+                        )
+            if use_layer_flags:
                 flag_offset = 0
                 for load_events, consumer_count in active_trackers:
                     load_events.layer_ready_flags = flags[

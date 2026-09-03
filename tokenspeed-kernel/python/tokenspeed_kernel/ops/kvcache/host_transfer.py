@@ -42,6 +42,12 @@ from tokenspeed_kernel.platform import current_platform
 
 _mapped_host_triton_available: bool | None = None
 
+
+def layer_ready_ptx_supported() -> bool:
+    """Layer-ready flags use NVIDIA PTX acquire/release; AMD must not compile them."""
+
+    return bool(current_platform().is_nvidia)
+
 _GEOMETRY_ROW_WIDTH = 8
 GeometryRow = tuple[int, int, int, int, int, int, int, int]
 LayerSlice = tuple[int, int]
@@ -655,9 +661,10 @@ def transfer_cache_blocks(
         num_geometry_rows: Number of static field rows for this layer.
         backend: Prefer mapped-Host Triton or lazily expand ranges for DMA.
         grid_cap: Max Triton CTAs.
-        layer_ready_flags: Optional per-layer Device flags. Triton copies every
-            layer slice in one grid and release-stores each flag; DMA fills
-            them after the full range copy.
+        layer_ready_flags: Optional per-layer Device flags. On NVIDIA, Triton
+            copies every layer slice in one grid and release-stores each flag.
+            Other vendors keep the event path; ``auto`` falls back to DMA and
+            fills the flags after the full range copy.
 
     Returns:
         None. Completion is observed by recording an event on ``stream``.
@@ -708,6 +715,11 @@ def transfer_cache_blocks(
         _publish_dma_flags()
 
     if backend == "dma":
+        transfer_dma()
+        return
+    if layer_ready_flags is not None and not layer_ready_ptx_supported():
+        if backend == "triton":
+            raise ValueError("flagged Triton transfers require NVIDIA PTX")
         transfer_dma()
         return
 
@@ -864,9 +876,14 @@ def _transfer_cache_ranges(
 def wait_layer_ready(flags: torch.Tensor, layer_index: int) -> None:
     """Wait on the current stream until layer ``layer_index`` is released.
 
+    NVIDIA-only: the waiter uses ``ld.acquire.gpu``. Other vendors wait on
+    recorded CUDA/HIP events instead.
+
     Args:
         flags: Device int32 per-layer completion flags.
         layer_index: Consumer-local layer to wait for.
     """
 
+    if not layer_ready_ptx_supported():
+        raise RuntimeError("wait_layer_ready requires NVIDIA PTX")
     _wait_layer_ready_triton(flags, layer_index)
