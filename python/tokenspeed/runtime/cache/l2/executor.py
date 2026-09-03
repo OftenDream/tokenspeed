@@ -457,6 +457,8 @@ class L2CacheExecutor:
                     )
                     if use_layer_flags:
                         flags = workspace.prepare_layer_ready(len(layer_slices), device)
+                        for load_events, _ in active_trackers:
+                            load_events.layer_ready_init_event.record(self.load_stream)
             if use_layer_flags:
                 flag_offset = 0
                 for load_events, consumer_count in active_trackers:
