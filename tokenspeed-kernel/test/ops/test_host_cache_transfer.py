@@ -218,6 +218,25 @@ def test_workspace_prepare_layer_ready_zeros_and_reuses(host_transfer_contract):
     assert workspace.layer_cta_counts().tolist() == [0, 0, 0]
 
 
+def test_workspace_allocate_layer_ready_fixes_length_at_init(host_transfer_contract):
+    workspace = host_transfer_contract.HostTransferWorkspace()
+    device = torch.device("cpu")
+
+    workspace.allocate_layer_ready(3, device)
+    flags = workspace.prepare_layer_ready(3, device)
+    flags[:] = 7
+    workspace.layer_cta_counts()[:] = 4
+    reused = workspace.prepare_layer_ready(3, device)
+
+    assert reused.data_ptr() == flags.data_ptr()
+    assert reused.tolist() == [0, 0, 0]
+    assert workspace.layer_cta_counts().tolist() == [0, 0, 0]
+    with pytest.raises(ValueError, match="already allocated"):
+        workspace.allocate_layer_ready(3, device)
+    with pytest.raises(ValueError, match="does not match"):
+        workspace.prepare_layer_ready(4, device)
+
+
 def test_workspace_reuses_block_mapping_storage(host_transfer_contract):
     geometry = _sample_geometry(host_transfer_contract)
     workspace = host_transfer_contract.HostTransferWorkspace()

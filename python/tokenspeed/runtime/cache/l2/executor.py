@@ -254,6 +254,14 @@ class L2CacheExecutor:
         self._load_workspaces = tuple(
             HostTransferWorkspace() for _ in range(load_workspace_count)
         )
+        if (
+            io_backend == "kernel"
+            and device.type != "npu"
+            and layer_ready_ptx_supported()
+        ):
+            num_ready_layers = len(layer_slices)
+            for workspace in self._load_workspaces:
+                workspace.allocate_layer_ready(num_ready_layers, device)
 
         # Submission runs on the forward thread and polling on the control
         # plane (event queries only), so the completion queues below are the

@@ -498,6 +498,9 @@ class GroupAwareWireTest(unittest.TestCase):
             patch.object(executor_module, "_new_cache_stream", return_value="load"),
             patch.object(executor_module, "HostTransferWorkspace", side_effect=Mock),
             patch.object(
+                executor_module, "layer_ready_ptx_supported", return_value=True
+            ),
+            patch.object(
                 executor_module,
                 "build_host_transfer_geometry",
                 return_value=unbound_geometry,
@@ -527,6 +530,10 @@ class GroupAwareWireTest(unittest.TestCase):
         unbound_geometry.bind.assert_called_once_with(device)
         self.assertIs(executor._transfer_geometry, bound_geometry)
         self.assertEqual([count for count, _ in trackers], [3, 1])
+        self.assertEqual(len(executor._load_workspaces), 2)
+        for workspace in executor._load_workspaces:
+            workspace.allocate_layer_ready.assert_called_once_with(4, device)
+        executor._write_workspace.allocate_layer_ready.assert_not_called()
 
     def test_direct_and_npu_init_keep_geometry_on_the_host(self):
         executor_module = self._executor_module()

@@ -510,37 +510,47 @@ class HostTransferWorkspace:
             raise ValueError("block group offsets are empty")
         return self._block_group_offsets_host[: self._block_group_offsets_count]
 
+    def allocate_layer_ready(self, num_layers: int, device: torch.device) -> None:
+        """Allocate fixed-length per-layer ready flags and CTA counters."""
+
+        if num_layers <= 0:
+            raise ValueError("num_layers must be positive")
+        if self._layer_ready_flags is not None or self._layer_cta_counts is not None:
+            raise ValueError("layer-ready state is already allocated")
+        self._layer_ready_flags = torch.zeros(
+            num_layers, dtype=torch.int32, device=device
+        )
+        self._layer_cta_counts = torch.zeros(
+            num_layers, dtype=torch.int32, device=device
+        )
+        self._num_layer_ready = num_layers
+
     def prepare_layer_ready(
         self,
         num_layers: int,
         device: torch.device,
     ) -> torch.Tensor:
-        """Allocate or reuse zeroed per-layer ready flags and CTA counters."""
+        """Return zeroed per-layer ready flags for this load.
+
+        Length and device are fixed at ``allocate_layer_ready``. Tests may skip
+        that call; the first prepare allocates.
+        """
 
         if num_layers <= 0:
             raise ValueError("num_layers must be positive")
-        reusable = (
-            self._layer_ready_flags is not None
-            and self._layer_cta_counts is not None
-            and self._layer_ready_flags.device == device
-            and self._layer_ready_flags.shape[0] >= num_layers
-            and self._layer_cta_counts.shape[0] >= num_layers
-        )
-        if not reusable:
-            capacity = num_layers
-            if self._layer_ready_flags is not None:
-                capacity = max(capacity, self._layer_ready_flags.shape[0] * 2)
-            self._layer_ready_flags = torch.zeros(
-                capacity, dtype=torch.int32, device=device
-            )
-            self._layer_cta_counts = torch.zeros(
-                capacity, dtype=torch.int32, device=device
-            )
-        else:
-            self._layer_ready_flags[:num_layers].zero_()
-            self._layer_cta_counts[:num_layers].zero_()
-        self._num_layer_ready = num_layers
-        return self._layer_ready_flags[:num_layers]
+        if self._layer_ready_flags is None or self._layer_cta_counts is None:
+            self.allocate_layer_ready(num_layers, device)
+            return self._layer_ready_flags
+        if (
+            self._layer_ready_flags.device != device
+            or self._layer_cta_counts.device != device
+            or self._layer_ready_flags.shape[0] != num_layers
+            or self._layer_cta_counts.shape[0] != num_layers
+        ):
+            raise ValueError("layer-ready state does not match this prepare")
+        self._layer_ready_flags.zero_()
+        self._layer_cta_counts.zero_()
+        return self._layer_ready_flags
 
     def layer_cta_counts(self) -> torch.Tensor:
         if self._layer_cta_counts is None or self._num_layer_ready <= 0:
