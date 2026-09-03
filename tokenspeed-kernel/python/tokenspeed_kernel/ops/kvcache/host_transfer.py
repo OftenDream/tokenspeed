@@ -31,7 +31,11 @@ from typing import Literal
 import torch
 from tokenspeed_kernel.ops.kvcache.triton import (
     HOST_CACHE_TRANSFER_CHUNK_BYTES,
+)
+from tokenspeed_kernel.ops.kvcache.triton import (
     transfer_cache_blocks as _transfer_cache_blocks_triton,
+)
+from tokenspeed_kernel.ops.kvcache.triton import (
     wait_layer_ready as _wait_layer_ready_triton,
 )
 from tokenspeed_kernel.platform import current_platform

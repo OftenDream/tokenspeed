@@ -670,9 +670,9 @@ def store_sf_interleaved(
         enable_pdl: Whether to use Programmatic Dependent Launch. Defaults to
             the platform policy; pass ``False`` to disable it explicitly.
     """
-    assert page_size % 128 == 0, (
-        f"interleaved SF layout requires page_size % 128 == 0, got {page_size}"
-    )
+    assert (
+        page_size % 128 == 0
+    ), f"interleaved SF layout requires page_size % 128 == 0, got {page_size}"
     num_tokens, nheads, sf_dim = sf_in.shape
     assert sf_dim == 4, f"expected sf_dim=4 (head_dim 128 / 32), got {sf_dim}"
     if num_tokens == 0:
@@ -1171,9 +1171,9 @@ def store_kv_cache(
         return
     n_kv_k = k_src.numel() // n_tokens
     n_kv_v = v_src.numel() // n_tokens
-    assert n_kv_k == n_kv_v, (
-        f"k/v must share per-token element count, got {n_kv_k} vs {n_kv_v}"
-    )
+    assert (
+        n_kv_k == n_kv_v
+    ), f"k/v must share per-token element count, got {n_kv_k} vs {n_kv_v}"
     assert k_src.stride(-1) == 1 and v_src.stride(-1) == 1
     assert k_dst.stride(-1) == 1 and v_dst.stride(-1) == 1
 
@@ -1401,34 +1401,34 @@ def fused_fp8_set_kv_buffer(
 
     if k_cache.ndim == 3:
         total_slots, num_kv_heads, head_dim = k_cache.shape
-        assert total_slots % page_size == 0, (
-            f"total_slots ({total_slots}) must be divisible by page_size ({page_size})"
-        )
+        assert (
+            total_slots % page_size == 0
+        ), f"total_slots ({total_slots}) must be divisible by page_size ({page_size})"
     elif k_cache.ndim == 4:
         _, ps, num_kv_heads, head_dim = k_cache.shape
-        assert ps == page_size, (
-            f"page_size mismatch: cache has {ps}, expected {page_size}"
-        )
+        assert (
+            ps == page_size
+        ), f"page_size mismatch: cache has {ps}, expected {page_size}"
     else:
         raise ValueError(f"Unsupported k_cache.ndim={k_cache.ndim}, expected 3 or 4")
 
     if k.ndim == 3:
-        assert k.shape[1] == num_kv_heads, (
-            f"num_kv_heads mismatch: k.shape[1]={k.shape[1]} vs cache={num_kv_heads}"
-        )
-        assert k.shape[2] == head_dim, (
-            f"head_dim mismatch: k.shape[2]={k.shape[2]} vs cache={head_dim}"
-        )
+        assert (
+            k.shape[1] == num_kv_heads
+        ), f"num_kv_heads mismatch: k.shape[1]={k.shape[1]} vs cache={num_kv_heads}"
+        assert (
+            k.shape[2] == head_dim
+        ), f"head_dim mismatch: k.shape[2]={k.shape[2]} vs cache={head_dim}"
         assert v.shape[1] == num_kv_heads and v.shape[2] == head_dim, "v shape mismatch"
         k_3d = k
         v_3d = v
     elif k.ndim == 2:
-        assert k.shape[1] == num_kv_heads * head_dim, (
-            f"k.shape[1]={k.shape[1]} != {num_kv_heads * head_dim}"
-        )
-        assert v.shape[1] == num_kv_heads * head_dim, (
-            f"v.shape[1]={v.shape[1]} != {num_kv_heads * head_dim}"
-        )
+        assert (
+            k.shape[1] == num_kv_heads * head_dim
+        ), f"k.shape[1]={k.shape[1]} != {num_kv_heads * head_dim}"
+        assert (
+            v.shape[1] == num_kv_heads * head_dim
+        ), f"v.shape[1]={v.shape[1]} != {num_kv_heads * head_dim}"
         k_3d = k.view(num_tokens, num_kv_heads, head_dim)
         v_3d = v.view(num_tokens, num_kv_heads, head_dim)
     else:
