@@ -45,6 +45,7 @@ def _load_executor_module_without_triton(*, force_isolated=False):
     host_transfer = ModuleType("tokenspeed_kernel.ops.kvcache.host_transfer")
     host_transfer.HostTransferWorkspace = Mock
     host_transfer.build_host_transfer_geometry = Mock()
+    host_transfer.layer_ready_ptx_supported = Mock(return_value=True)
     host_transfer.transfer_cache_blocks = Mock()
     host_transfer.wait_layer_ready = Mock()
     scheduler = ModuleType("tokenspeed_scheduler")
@@ -663,6 +664,9 @@ class GroupAwareWireTest(unittest.TestCase):
                 return_value=nullcontext(),
             ),
             patch.object(executor_module.device_module, "Event", return_value=finish),
+            patch.object(
+                executor_module, "layer_ready_ptx_supported", return_value=True
+            ),
             patch.object(executor_module, "transfer_cache_blocks") as transfer,
         ):
             executor._start_loading([9], [(0, 2, 1)])
@@ -726,6 +730,9 @@ class GroupAwareWireTest(unittest.TestCase):
                 return_value=retirement,
             ),
             patch.object(
+                executor_module, "layer_ready_ptx_supported", return_value=True
+            ),
+            patch.object(
                 executor_module,
                 "transfer_cache_blocks",
                 side_effect=RuntimeError("layer launch failed"),
@@ -776,6 +783,9 @@ class GroupAwareWireTest(unittest.TestCase):
                 executor_module.device_module,
                 "Event",
                 return_value=retirement,
+            ),
+            patch.object(
+                executor_module, "layer_ready_ptx_supported", return_value=True
             ),
             patch.object(
                 executor_module,

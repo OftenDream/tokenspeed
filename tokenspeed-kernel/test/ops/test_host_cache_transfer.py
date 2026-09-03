@@ -456,6 +456,7 @@ def test_block_h2d_triton_uses_committed_tables_without_expanding_ranges(monkeyp
 
 def test_block_h2d_triton_layered_flags_launch_full_geometry_once(monkeypatch):
     host_transfer = _load_host_transfer_contract_module()
+    monkeypatch.setattr(host_transfer, "layer_ready_ptx_supported", lambda: True)
     geometry = _sample_geometry(host_transfer).bind(torch.device("cpu"))
     workspace, num_blocks = _committed_block_workspace(
         host_transfer,
@@ -1050,6 +1051,8 @@ def test_geometry_block_transfer_is_byte_exact_for_packed_multigroup_fields():
 @requires_cuda
 def test_layered_h2d_sets_flags_and_copies_each_layer():
     module = _load_host_transfer_contract_module()
+    if not module.layer_ready_ptx_supported():
+        pytest.skip("flagged Triton transfers require NVIDIA PTX")
     geometry = module.build_host_transfer_geometry(
         rows=(
             (0, 0, 0, 16, 16, 0, 1, 8),
