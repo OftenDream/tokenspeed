@@ -33,6 +33,7 @@ class _LayerwiseLoadEvents:
     def __init__(self, num_layers: int):
         self.layer_done_events = [device_module.Event() for _ in range(num_layers)]
         self.start_event = device_module.Event()
+        self.layer_ready_init_event = device_module.Event()
         self.layer_ready_flags = None
         self.wait_layer_ready = None
 
@@ -41,6 +42,10 @@ class _LayerwiseLoadEvents:
             waiter = self.wait_layer_ready
             if waiter is None:
                 raise RuntimeError("layer-ready flags bound without a waiter")
+            # Flag reuse leaves stale 1s until load_stream's zero_() lands.
+            # Wait for that reset before spinning, or a reused workspace can
+            # look finished and attention reads unrestored Device KV.
+            device_module.current_stream().wait_event(self.layer_ready_init_event)
             waiter(self.layer_ready_flags, layer_index)
             return
         device_module.current_stream().wait_event(self.layer_done_events[layer_index])

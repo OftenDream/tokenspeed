@@ -96,4 +96,4 @@ def test_layerwise_load_waits_for_bound_flags(monkeypatch):
     tracker.wait_for_layer(1)
 
     assert waiter == [(flags, 1)]
-    assert stream.waited_events == []
+    assert stream.waited_events == [events.layer_ready_init_event]

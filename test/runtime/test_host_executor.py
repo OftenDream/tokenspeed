@@ -649,6 +649,7 @@ class GroupAwareWireTest(unittest.TestCase):
             layer_done_events=[None, None, None],
             layer_ready_flags=None,
             wait_layer_ready=None,
+            layer_ready_init_event=Mock(),
         )
         tracker = Mock()
         tracker.begin_load.return_value = 0
@@ -678,6 +679,9 @@ class GroupAwareWireTest(unittest.TestCase):
             1, device, non_blocking=True
         )
         workspace.prepare_layer_ready.assert_called_once_with(3, device)
+        load_events.layer_ready_init_event.record.assert_called_once_with(
+            executor.load_stream
+        )
         transfer.assert_called_once_with(
             "h2d",
             executor.layout.buffers,
@@ -705,9 +709,15 @@ class GroupAwareWireTest(unittest.TestCase):
             load_stream=Mock(),
         )
         target_events = SimpleNamespace(
-            start_event=Mock(), layer_done_events=[Mock(), Mock()]
+            start_event=Mock(),
+            layer_done_events=[Mock(), Mock()],
+            layer_ready_init_event=Mock(),
         )
-        draft_events = SimpleNamespace(start_event=Mock(), layer_done_events=[Mock()])
+        draft_events = SimpleNamespace(
+            start_event=Mock(),
+            layer_done_events=[Mock()],
+            layer_ready_init_event=Mock(),
+        )
         target_tracker = Mock()
         target_tracker.begin_load.return_value = 0
         target_tracker.event_sets = [target_events]
@@ -760,7 +770,11 @@ class GroupAwareWireTest(unittest.TestCase):
         )
         executor._write_acks = []
         executor._ready_write_op_ids = []
-        load_events = SimpleNamespace(start_event=Mock(), layer_done_events=[Mock()])
+        load_events = SimpleNamespace(
+            start_event=Mock(),
+            layer_done_events=[Mock()],
+            layer_ready_init_event=Mock(),
+        )
         tracker = Mock()
         tracker.begin_load.return_value = 0
         tracker.event_sets = [load_events]
