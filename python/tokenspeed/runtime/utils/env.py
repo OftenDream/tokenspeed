@@ -245,6 +245,13 @@ class Envs:
     TOKENSPEED_CI_SMALL_KV_SIZE = EnvInt(-1)
     TOKENSPEED_NVTX = EnvBool(False)
     TOKENSPEED_DP_SAMPLING_BACKEND = EnvStr(None)
+    # Debug: hash L2 store/load. Baseline is Host after D2H, not Device at submit.
+    TOKENSPEED_L2_VERIFY = EnvBool(False)
+    TOKENSPEED_L2_VERIFY_MODE = EnvStr("sync")
+    TOKENSPEED_L2_VERIFY_LOG = EnvStr("")
+    # Optional raw page dump (content-addressed blobs + pages.jsonl). Heavy.
+    TOKENSPEED_L2_VERIFY_DUMP = EnvStr("")
+    TOKENSPEED_L2_VERIFY_DUMP_MAX_STORE_BLOCKS = EnvInt(4096)
 
     # Scheduler
     TOKENSPEED_BLOCK_NONZERO_RANK_CHILDREN = EnvBool(True)

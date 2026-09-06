@@ -754,6 +754,7 @@ def build_device_side(
             host_ratio=server_args.kvstore_ratio,
             host_size_gb=server_args.kvstore_size,
             io_backend=server_args.kvstore_io_backend,
+            attn_tp_rank=attn_tp_rank,
         )
 
     kv_transfer = _build_kv_transfer(

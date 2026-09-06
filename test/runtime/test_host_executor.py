@@ -177,6 +177,7 @@ class GroupAwareWireTest(unittest.TestCase):
         executor._ready_load_op_ids = []
         executor._load_acks = []
         executor._load_poisoned = False
+        executor._verifier = None
         executor.load_stream = object() if load_stream is None else load_stream
         executor.transfer_backend = backend
         device = SimpleNamespace(type="cuda")
@@ -318,6 +319,8 @@ class GroupAwareWireTest(unittest.TestCase):
         executor = L2CacheExecutor.__new__(L2CacheExecutor)
         executor._ack_lock = threading.Lock()
         executor.attn_tp_rank = 0
+        verifier = Mock(requires_device_sync=False)
+        executor._verifier = verifier
         executor._ready_write_op_ids = []
         device = SimpleNamespace(type="cuda")
         executor.layout = SimpleNamespace(buffers=(SimpleNamespace(device=device),))
@@ -331,7 +334,7 @@ class GroupAwareWireTest(unittest.TestCase):
             layer_slices=((0, 2), (2, 1)),
             num_field_rows=3,
         )
-        stream = object()
+        stream = Mock()
         finish = Mock()
 
         with (
@@ -342,6 +345,9 @@ class GroupAwareWireTest(unittest.TestCase):
             patch.object(executor_module, "transfer_cache_blocks") as transfer,
         ):
             executor._start_writing([7], [(0, 5, 9)])
+
+        stream.synchronize.assert_not_called()
+        verifier.snapshot_store_device.assert_not_called()
 
         # On the CALLER's current stream: the copy must read the source pages
         # before anything later in the plan (zeroing, the granted request's
@@ -365,6 +371,33 @@ class GroupAwareWireTest(unittest.TestCase):
             backend="auto",
         )
         finish.record.assert_called_once_with(stream)
+
+    def test_poll_results_commits_host_baseline_without_device_hash(self):
+        """Control-plane poll may hash Host pages, never Device CUDA tensors."""
+        L2CacheExecutor = self._executor_module().L2CacheExecutor
+        Ack = self._executor_module()._Ack
+
+        executor = L2CacheExecutor.__new__(L2CacheExecutor)
+        executor._ack_lock = threading.Lock()
+        executor._ready_write_op_ids = []
+        executor._ready_load_op_ids = []
+        verifier = Mock()
+        executor._verifier = verifier
+        finish = Mock()
+        finish.query.return_value = True
+        write_transfers = [(0, 5, 9)]
+        load_transfers = [(1, 3, 4)]
+        executor._write_acks = [Ack(finish, [7], "write", write_transfers)]
+        executor._load_acks = [Ack(finish, [8], "load", load_transfers)]
+
+        results = executor.poll_results()
+
+        self.assertEqual([int(event.op_id) for event in results], [7, 8])
+        verifier.commit_store_host.assert_called_once_with(write_transfers)
+        verifier.check_load_device.assert_not_called()
+        verifier.snapshot_store_device.assert_not_called()
+        self.assertEqual(executor._write_acks, [])
+        self.assertEqual(executor._load_acks, [])
 
     def test_loadback_logs_non_empty_batch(self):
         executor_module, executor, _, geometry, workspace = self._make_load_executor(
@@ -643,7 +676,8 @@ class GroupAwareWireTest(unittest.TestCase):
         flags = Mock()
         flags.__getitem__ = Mock(return_value=flags)
         workspace.prepare_layer_ready.return_value = flags
-        executor._verifier = None
+        verifier = Mock(requires_device_sync=False)
+        executor._verifier = verifier
         load_events = SimpleNamespace(
             start_event=Mock(),
             layer_done_events=[None, None, None],
@@ -700,6 +734,10 @@ class GroupAwareWireTest(unittest.TestCase):
         self.assertIs(load_events.layer_ready_flags, flags)
         self.assertIs(load_events.wait_layer_ready, executor_module.wait_layer_ready)
         self.assertIs(executor._load_acks[0].finish_event, finish)
+        load_events.start_event.synchronize.assert_not_called()
+        finish.synchronize.assert_not_called()
+        verifier.snapshot_load_host.assert_called_once_with([(0, 2, 1)])
+        verifier.check_load_device.assert_not_called()
 
     def test_loadback_launch_failure_retires_all_target_and_draft_events(self):
         executor_module, executor, _, _, _ = self._make_load_executor(
