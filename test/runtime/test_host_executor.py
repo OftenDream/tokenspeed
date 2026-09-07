@@ -335,6 +335,7 @@ class GroupAwareWireTest(unittest.TestCase):
         executor.transfer_backend = "auto"
         executor._write_acks = []
         executor._write_workspace = Mock()
+        executor._write_metadata_done = None
         executor._write_workspace.load_block_transfers.return_value = (1, (0, 1))
         executor._write_workspace.prepare_backend.return_value = SimpleNamespace(
             uses_device_tables=True,
@@ -346,12 +347,17 @@ class GroupAwareWireTest(unittest.TestCase):
         )
         stream = object()
         finish = Mock()
+        metadata_done = Mock()
 
         with (
             patch.object(
                 executor_module.device_module, "current_stream", return_value=stream
             ),
-            patch.object(executor_module.device_module, "Event", return_value=finish),
+            patch.object(
+                executor_module.device_module,
+                "Event",
+                side_effect=[metadata_done, finish],
+            ),
             patch.object(executor_module, "transfer_cache_blocks") as transfer,
         ):
             executor._start_writing([7], [(0, 5, 9)])
@@ -363,7 +369,7 @@ class GroupAwareWireTest(unittest.TestCase):
             [(0, 5, 9)], geometry=executor._transfer_geometry
         )
         executor._write_workspace.commit_block_transfers.assert_called_once_with(
-            1, device, non_blocking=False
+            1, device, non_blocking=True
         )
         transfer.assert_called_once_with(
             "d2h",
@@ -380,6 +386,43 @@ class GroupAwareWireTest(unittest.TestCase):
             layer_ready_flags=None,
         )
         finish.record.assert_called_once_with(stream)
+        metadata_done.record.assert_called_once_with(stream)
+        metadata_done.synchronize.assert_not_called()
+
+        # Refill must wait for metadata, but must never wait for payload ACK.
+        for ready in (False, True):
+            with self.subTest(metadata_ready=ready):
+                metadata_done.reset_mock()
+                metadata_done.query.return_value = ready
+                order = Mock()
+                order.attach_mock(metadata_done.synchronize, "retire")
+                order.attach_mock(
+                    executor._write_workspace.load_block_transfers, "refill"
+                )
+                order.attach_mock(
+                    executor._write_workspace.commit_block_transfers, "upload"
+                )
+                order.attach_mock(metadata_done.record, "record")
+                with (
+                    patch.object(
+                        executor_module.device_module,
+                        "current_stream",
+                        return_value=stream,
+                    ),
+                    patch.object(
+                        executor_module.device_module, "Event", return_value=finish
+                    ),
+                    patch.object(executor_module, "transfer_cache_blocks") as transfer,
+                ):
+                    order.attach_mock(transfer, "payload")
+                    executor._start_writing([8], [(0, 6, 10)])
+                names = [call[0] for call in order.mock_calls]
+                self.assertEqual(
+                    names,
+                    ([] if ready else ["retire"])
+                    + ["refill", "upload", "record", "payload"],
+                )
+                finish.synchronize.assert_not_called()
 
     def test_loadback_logs_non_empty_batch(self):
         executor_module, executor, _, geometry, workspace = self._make_load_executor(
@@ -999,6 +1042,37 @@ class CompactLayoutRoundTripTest(unittest.TestCase):
         expected_first[104:109].copy_(state_three)
         self.assertTrue(torch.equal(first.cpu(), expected_first))
         self.assertTrue(torch.equal(second.cpu(), expected_second))
+
+    def test_async_write_metadata_reuse_keeps_batches_distinct(self):
+        torch = self.torch
+        device = torch.zeros((128,), dtype=torch.uint8, device="cuda")
+        layout = self._single_group_layout(
+            device, self.CacheField("layer.0.k", 0, 8, 8, 4)
+        )
+        executor, pool, _ = self._make_executor(layout, io_backend="kernel")
+        for generation in range(3):
+            # Reuse one Device source, but preserve each batch in its own Host
+            # block. No caller synchronization between write submissions.
+            for block in range(1, 4):
+                device[16:20].fill_(generation * 16 + block)
+                executor._start_writing([block], [(0, 1, block)])
+            device.fill_(0xEE)
+            load_index = executor._start_loading(
+                [9], [(0, block, block) for block in range(1, 4)]
+            )
+            pool.load_tracker.set_consumers(load_index)
+            pool.load_tracker.wait_for_layer(0)
+            torch.cuda.current_stream().synchronize()
+            for block in range(1, 4):
+                offset = 8 + block * 8
+                self.assertEqual(
+                    device[offset : offset + 4].tolist(),
+                    [generation * 16 + block] * 4,
+                )
+            self.assertEqual(
+                sorted(int(event.op_id) for event in executor.poll_results()),
+                [1, 2, 3, 9],
+            )
 
     def test_real_transfer_restores_merged_owner_draft_subset_once(self):
         torch = self.torch

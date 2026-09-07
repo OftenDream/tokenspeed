@@ -240,6 +240,7 @@ class L2CacheExecutor:
             geometry = geometry.bind(device, non_blocking=False)
         self._transfer_geometry = geometry
         self._write_workspace = HostTransferWorkspace()
+        self._write_metadata_done = None
         # A tracker waits for an event set's previous final-layer event before
         # reusing its index. Aligning workspaces to those indices keeps each
         # load's pinned and Device block-ID tables immutable until all
@@ -355,6 +356,11 @@ class L2CacheExecutor:
         # emits this op, and the single-stream FIFO is what keeps the copy
         # ahead of the pages' next writer.
         stream = device_module.current_stream()
+        # CPU writes are not ordered by stream FIFO. Retire the previous
+        # metadata upload before refilling its pinned source, not at submit.
+        if self._write_metadata_done is not None:
+            if not self._write_metadata_done.query():
+                self._write_metadata_done.synchronize()
         num_blocks, _ = self._write_workspace.load_block_transfers(
             transfers, geometry=self._transfer_geometry
         )
@@ -364,12 +370,17 @@ class L2CacheExecutor:
             backend=self.transfer_backend,
         )
         if mode.uses_device_tables:
-            # The single write workspace can be refilled by the next plan as
-            # soon as this method returns, so finish staging before releasing
-            # the caller thread. Device-table reuse remains ordered by stream.
-            self._write_workspace.commit_block_transfers(
-                num_blocks, self.layout.buffers[0].device, non_blocking=False
-            )
+            if self._write_metadata_done is None:
+                self._write_metadata_done = device_module.Event()
+            try:
+                self._write_workspace.commit_block_transfers(
+                    num_blocks, self.layout.buffers[0].device, non_blocking=True
+                )
+            finally:
+                # Also protect a partially submitted upload if staging fails.
+                # This event excludes the payload transfer; Device table reuse
+                # and source-page reuse remain ordered by the caller stream.
+                self._write_metadata_done.record(stream)
         transfer_cache_blocks(
             "d2h",
             self.layout.buffers,

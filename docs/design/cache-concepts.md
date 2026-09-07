@@ -217,6 +217,15 @@ blocks, the transfer boundary validates the loaded block count and returns
 before mapping Host pointers or touching the accelerator runtime. Flagged
 loads still publish readiness for empty consumers.
 
+Writeback uploads block metadata asynchronously on the caller stream. An
+event recorded after both metadata copies protects the pinned CPU staging
+tables: before refilling them, the next submission waits only if that event
+is incomplete. This does not wait for the payload transfer or publish a
+writeback ACK. Device metadata reuse stays ordered after the previous payload
+by caller-stream FIFO; the forward-to-cache and cache-to-page-reuse fences
+remain unchanged. Even a partially submitted metadata upload records its
+retirement event before propagating a staging failure.
+
 Ready flags are valid only for a full-geometry H2D transfer. Consumers first
 wait for the current generation's flag initialization event, then its layer
 flag. Workspace reuse also waits for the previous transfer's completion;
