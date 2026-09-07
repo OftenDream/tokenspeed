@@ -237,7 +237,7 @@ class L2CacheExecutor:
         if io_backend == "kernel" and device.type != "npu":
             # Both the caller stream (D2H) and load stream (H2D) consume this
             # immutable table, so publish it synchronously once at init.
-            geometry = geometry.bind(device)
+            geometry = geometry.bind(device, non_blocking=False)
         self._transfer_geometry = geometry
         self._write_workspace = HostTransferWorkspace()
         # A tracker waits for an event set's previous final-layer event before
@@ -368,7 +368,7 @@ class L2CacheExecutor:
             # soon as this method returns, so finish staging before releasing
             # the caller thread. Device-table reuse remains ordered by stream.
             self._write_workspace.commit_block_transfers(
-                num_blocks, self.layout.buffers[0].device
+                num_blocks, self.layout.buffers[0].device, non_blocking=False
             )
         transfer_cache_blocks(
             "d2h",
@@ -381,6 +381,8 @@ class L2CacheExecutor:
             geometry_offset=0,
             num_geometry_rows=self._transfer_geometry.num_field_rows,
             backend=self.transfer_backend,
+            grid_cap=None,
+            layer_ready_flags=None,
         )
         finish = device_module.Event()
         finish.record(stream)
@@ -480,6 +482,7 @@ class L2CacheExecutor:
                     num_geometry_rows=self._transfer_geometry.num_field_rows,
                     backend=self.transfer_backend,
                     layer_ready_flags=flags,
+                    grid_cap=None,
                 )
                 finish = device_module.Event()
                 finish.record(self.load_stream)
@@ -506,6 +509,8 @@ class L2CacheExecutor:
                             geometry_offset=geometry_offset,
                             num_geometry_rows=num_geometry_rows,
                             backend=self.transfer_backend,
+                            grid_cap=None,
+                            layer_ready_flags=None,
                         )
                         finish = device_module.Event()
                         finish.record(self.load_stream)

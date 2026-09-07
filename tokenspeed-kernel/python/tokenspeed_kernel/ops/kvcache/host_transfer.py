@@ -106,7 +106,7 @@ class HostTransferGeometry:
         self,
         device: torch.device,
         *,
-        non_blocking: bool = False,
+        non_blocking: bool,
     ) -> HostTransferGeometry:
         if self.device_rows is not None:
             if self.device_rows.device != device:
@@ -211,6 +211,30 @@ def build_host_transfer_geometry(
     num_device_lcm_blocks: int,
     num_device_buffers: int,
 ) -> HostTransferGeometry:
+    """Validate and build Host-side geometry shared by transfer operations.
+
+    Args:
+        rows: Consumer-ordered field tuples: ``(group_index,
+            device_buffer_index, device_block_zero_offset_bytes,
+            device_block_stride_bytes, host_cache_block_bytes,
+            host_field_offset_bytes, cache_blocks_per_lcm_block,
+            payload_bytes)``. Group and buffer indices are zero-based;
+            dynamic cache block IDs are one-based. Device block zero is
+            reserved, whereas Host blocks are packed without a reserved slot.
+        layer_slices: Contiguous ``(row_offset, row_count)`` slices covering
+            all field rows in consumer order. Empty consumers have zero rows.
+        group_packing: Positive cache-block counts per LCM block, by group.
+        host_lcm_block_bytes: Byte stride of a packed Host LCM block.
+        num_host_lcm_blocks: Host LCM capacity used to bound dynamic block IDs.
+        num_device_lcm_blocks: Device LCM capacity, excluding reserved block
+            zero, used with group packing to bound dynamic block IDs.
+        num_device_buffers: Number of Device buffers referenced by field rows.
+
+    Returns:
+        Validated HostTransferGeometry with Host field rows, layer slices,
+        bounds, and precomputed per-field work sizing. Device tables remain
+        unbound until ``bind`` is called; DMA uses the Host geometry directly.
+    """
     if not rows:
         raise ValueError("geometry must contain at least one field row")
     if not group_packing:
@@ -295,7 +319,7 @@ class HostTransferWorkspace:
         device_buffers: Sequence[torch.Tensor],
         host_buffer: torch.Tensor,
         *,
-        backend: Literal["auto", "triton", "dma"] = "auto",
+        backend: Literal["auto", "triton", "dma"],
     ) -> HostTransferMode:
         """Resolve capability before submitting payload or publishing waits.
 
@@ -499,7 +523,7 @@ class HostTransferWorkspace:
         num_blocks: int,
         device: torch.device,
         *,
-        non_blocking: bool = False,
+        non_blocking: bool,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         self._require_loaded_block_state(num_blocks)
         if num_blocks <= 0:
@@ -719,9 +743,9 @@ def transfer_cache_blocks(
     num_blocks: int,
     geometry_offset: int,
     num_geometry_rows: int,
-    backend: Literal["auto", "triton", "dma"] = "auto",
-    grid_cap: int | None = None,
-    layer_ready_flags: torch.Tensor | None = None,
+    backend: Literal["auto", "triton", "dma"],
+    grid_cap: int | None,
+    layer_ready_flags: torch.Tensor | None,
 ) -> None:
     """Copy compact Host blocks using static geometry and dynamic block IDs.
 
@@ -736,7 +760,7 @@ def transfer_cache_blocks(
         geometry_offset: First static field row for this layer.
         num_geometry_rows: Number of static field rows for this layer.
         backend: Prefer mapped-Host Triton or lazily expand ranges for DMA.
-        grid_cap: Max Triton CTAs.
+        grid_cap: Max Triton CTAs, or None to use the configured grid cap.
         layer_ready_flags: Optional per-layer Device flags. On NVIDIA, Triton
             copies every layer slice in one grid and release-stores each flag.
             Other vendors keep the event path; ``auto`` falls back to DMA and
@@ -805,6 +829,17 @@ def transfer_cache_blocks(
         transfer_dma()
         return
 
+    # An empty layer must not map buffers or touch the accelerator runtime.
+    work_items = _block_work_items(
+        geometry,
+        workspace,
+        geometry_offset=geometry_offset,
+        num_geometry_rows=num_geometry_rows,
+    )
+    if work_items == 0 and layer_ready_flags is None:
+        workspace.host_block_rows(num_blocks)
+        return
+
     device_module = torch.get_device_module(device_buffers[0].device)
     with device_module.stream(stream) if stream is not None else nullcontext():
         mode = workspace.prepare_backend(device_buffers, host_buffer, backend=backend)
@@ -814,14 +849,6 @@ def transfer_cache_blocks(
         if geometry.device_rows is None:
             raise ValueError("geometry must be bound before a Triton block transfer")
         block_rows, group_offsets = workspace.committed_block_tables(num_blocks)
-        work_items = _block_work_items(
-            geometry,
-            workspace,
-            geometry_offset=geometry_offset,
-            num_geometry_rows=num_geometry_rows,
-        )
-        if work_items == 0 and layer_ready_flags is None:
-            return
         triton_kwargs = {
             "geometry_offset": geometry_offset,
             "num_geometry_rows": num_geometry_rows,
@@ -829,6 +856,9 @@ def transfer_cache_blocks(
             "work_items": work_items,
             "num_device_buffers": len(device_buffers),
             "grid_cap": grid_cap,
+            "layer_ready_flags": None,
+            "layer_slices": None,
+            "layer_cta_counts": None,
         }
         if layer_ready_flags is not None:
             if geometry.device_layer_slices is None:

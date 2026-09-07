@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import inspect
 import sys
 import types
 from functools import lru_cache
@@ -95,7 +96,9 @@ def _sample_geometry(
 def _committed_block_workspace(host_transfer, geometry, transfers):
     workspace = host_transfer.HostTransferWorkspace()
     num_blocks, _ = workspace.load_block_transfers(transfers, geometry=geometry)
-    workspace.commit_block_transfers(num_blocks, torch.device("cpu"))
+    workspace.commit_block_transfers(
+        num_blocks, torch.device("cpu"), non_blocking=False
+    )
     return workspace, num_blocks
 
 
@@ -119,8 +122,8 @@ def test_geometry_bind_uploads_device_rows_once(host_transfer_contract):
     geometry = _sample_geometry(host_transfer_contract)
     device = torch.device("cpu")
 
-    first = geometry.bind(device)
-    second = first.bind(device)
+    first = geometry.bind(device, non_blocking=False)
+    second = first.bind(device, non_blocking=False)
 
     assert first.device_rows is not None
     assert first.device_layer_slices is not None
@@ -250,7 +253,7 @@ def test_group_offsets_use_valid_length_after_capacity_growth(host_transfer_cont
     device = torch.device("cpu")
 
     num_blocks, _ = workspace.load_block_transfers(((0, 2, 1),), geometry=geometry)
-    workspace.commit_block_transfers(num_blocks, device)
+    workspace.commit_block_transfers(num_blocks, device, non_blocking=False)
     valid_count = geometry.num_groups + 1
     expanded = torch.zeros(valid_count + 4, dtype=torch.int64, device=device)
     expanded[:valid_count] = workspace._block_group_offsets_device[:valid_count]
@@ -306,7 +309,7 @@ def test_empty_load_invalidates_committed_block_state(host_transfer_contract):
     device = torch.device("cpu")
 
     num_blocks, _ = workspace.load_block_transfers(((0, 2, 1),), geometry=geometry)
-    workspace.commit_block_transfers(num_blocks, device)
+    workspace.commit_block_transfers(num_blocks, device, non_blocking=False)
 
     workspace.load_block_transfers((), geometry=geometry)
 
@@ -334,7 +337,7 @@ def test_new_load_invalidates_previous_commit(host_transfer_contract):
     device = torch.device("cpu")
 
     first_count, _ = workspace.load_block_transfers(((0, 2, 1),), geometry=geometry)
-    workspace.commit_block_transfers(first_count, device)
+    workspace.commit_block_transfers(first_count, device, non_blocking=False)
 
     workspace.load_block_transfers(((0, 4, 3),), geometry=geometry)
 
@@ -353,7 +356,7 @@ def test_commit_rejects_wrong_num_blocks(host_transfer_contract):
     )
 
     with pytest.raises(ValueError, match="must equal"):
-        workspace.commit_block_transfers(num_blocks - 1, device)
+        workspace.commit_block_transfers(num_blocks - 1, device, non_blocking=False)
 
 
 def test_commit_rejects_duplicate_upload(host_transfer_contract):
@@ -362,10 +365,10 @@ def test_commit_rejects_duplicate_upload(host_transfer_contract):
     device = torch.device("cpu")
 
     num_blocks, _ = workspace.load_block_transfers(((0, 2, 1),), geometry=geometry)
-    workspace.commit_block_transfers(num_blocks, device)
+    workspace.commit_block_transfers(num_blocks, device, non_blocking=False)
 
     with pytest.raises(ValueError, match="already committed"):
-        workspace.commit_block_transfers(num_blocks, device)
+        workspace.commit_block_transfers(num_blocks, device, non_blocking=False)
 
 
 def test_committed_tables_are_shared_without_reupload(host_transfer_contract):
@@ -376,7 +379,9 @@ def test_committed_tables_are_shared_without_reupload(host_transfer_contract):
         geometry=geometry,
     )
     device = torch.device("cpu")
-    block_table, returned_offsets = workspace.commit_block_transfers(num_blocks, device)
+    block_table, returned_offsets = workspace.commit_block_transfers(
+        num_blocks, device, non_blocking=False
+    )
     block_ptr = workspace._block_device.data_ptr()
     offset_ptr = workspace._block_group_offsets_device.data_ptr()
 
@@ -420,6 +425,7 @@ def test_flags_require_full_h2d_geometry(
             num_geometry_rows=count,
             backend=backend,
             layer_ready_flags=torch.zeros(3, dtype=torch.int32),
+            grid_cap=None,
         )
 
 
@@ -433,7 +439,7 @@ def test_flags_require_full_h2d_geometry(
 )
 def test_kernel_errors_never_trigger_dma(monkeypatch, error):
     module = _load_host_transfer_contract_module()
-    geometry = _sample_geometry(module).bind(torch.device("cpu"))
+    geometry = _sample_geometry(module).bind(torch.device("cpu"), non_blocking=False)
     workspace, count = _committed_block_workspace(module, geometry, ((0, 2, 1),))
     kernel, ranges = _mock_triton_block_path(monkeypatch, module, workspace)
     kernel.side_effect = error
@@ -448,6 +454,9 @@ def test_kernel_errors_never_trigger_dma(monkeypatch, error):
             num_blocks=count,
             geometry_offset=0,
             num_geometry_rows=3,
+            backend="auto",
+            grid_cap=None,
+            layer_ready_flags=None,
         )
     assert raised.value is error
     ranges.assert_not_called()
@@ -464,8 +473,8 @@ def test_mapping_fallback_is_scoped_to_buffer_binding(monkeypatch):
     monkeypatch.setattr(module, "current_platform", lambda: platform)
     failed = module.HostTransferWorkspace()
     with pytest.warns(RuntimeWarning, match="falling back"):
-        assert failed.prepare_backend(buffers, host).backend == "dma"
-    assert failed.prepare_backend(buffers, host).backend == "dma"
+        assert failed.prepare_backend(buffers, host, backend="auto").backend == "dma"
+    assert failed.prepare_backend(buffers, host, backend="auto").backend == "dma"
     platform.device_visible_data_ptr.assert_called_once()
     with pytest.raises(RuntimeError, match="mapped Host"):
         failed.prepare_backend(buffers, host, backend="triton")
@@ -473,8 +482,11 @@ def test_mapping_fallback_is_scoped_to_buffer_binding(monkeypatch):
     platform.device_visible_data_ptr.side_effect = None
     platform.device_visible_data_ptr.return_value = host.data_ptr()
     other = module.HostTransferWorkspace()
-    assert other.prepare_backend(buffers, host).backend == "triton"
-    assert failed.prepare_backend(buffers, torch.empty(16)).backend == "triton"
+    assert other.prepare_backend(buffers, host, backend="auto").backend == "triton"
+    assert (
+        failed.prepare_backend(buffers, torch.empty(16), backend="auto").backend
+        == "triton"
+    )
 
 
 def test_mapping_attribute_bug_is_not_silently_downgraded(monkeypatch):
@@ -482,7 +494,7 @@ def test_mapping_attribute_bug_is_not_silently_downgraded(monkeypatch):
     monkeypatch.setattr(module, "current_platform", lambda: SimpleNamespace())
     with pytest.raises(AttributeError, match="device_visible_data_ptr"):
         module.HostTransferWorkspace().prepare_backend(
-            (torch.empty(1),), torch.empty(1)
+            (torch.empty(1),), torch.empty(1), backend="auto"
         )
 
 
@@ -519,12 +531,17 @@ def test_block_transfer_rejects_unknown_direction():
             num_blocks=0,
             geometry_offset=0,
             num_geometry_rows=0,
+            backend="auto",
+            grid_cap=None,
+            layer_ready_flags=None,
         )
 
 
 def test_block_h2d_triton_uses_committed_tables_without_expanding_ranges(monkeypatch):
     host_transfer = _load_host_transfer_contract_module()
-    geometry = _sample_geometry(host_transfer).bind(torch.device("cpu"))
+    geometry = _sample_geometry(host_transfer).bind(
+        torch.device("cpu"), non_blocking=False
+    )
     workspace, num_blocks = _committed_block_workspace(
         host_transfer,
         geometry,
@@ -554,6 +571,7 @@ def test_block_h2d_triton_uses_committed_tables_without_expanding_ranges(monkeyp
         num_geometry_rows=1,
         backend="triton",
         grid_cap=7,
+        layer_ready_flags=None,
     )
 
     workspace.bind_addresses.assert_called_once()
@@ -572,13 +590,18 @@ def test_block_h2d_triton_uses_committed_tables_without_expanding_ranges(monkeyp
         "work_items": 2,
         "num_device_buffers": 1,
         "grid_cap": 7,
+        "layer_ready_flags": None,
+        "layer_slices": None,
+        "layer_cta_counts": None,
     }
 
 
 def test_block_h2d_triton_layered_flags_launch_full_geometry_once(monkeypatch):
     host_transfer = _load_host_transfer_contract_module()
     monkeypatch.setattr(host_transfer, "layer_ready_ptx_supported", lambda: True)
-    geometry = _sample_geometry(host_transfer).bind(torch.device("cpu"))
+    geometry = _sample_geometry(host_transfer).bind(
+        torch.device("cpu"), non_blocking=False
+    )
     workspace, num_blocks = _committed_block_workspace(
         host_transfer,
         geometry,
@@ -603,6 +626,7 @@ def test_block_h2d_triton_layered_flags_launch_full_geometry_once(monkeypatch):
         num_geometry_rows=geometry.num_field_rows,
         backend="triton",
         layer_ready_flags=flags,
+        grid_cap=None,
     )
 
     range_factory.assert_not_called()
@@ -620,7 +644,9 @@ def test_block_h2d_triton_layered_flags_launch_full_geometry_once(monkeypatch):
 
 def test_block_d2h_triton_reuses_geometry_without_expanding_ranges(monkeypatch):
     host_transfer = _load_host_transfer_contract_module()
-    geometry = _sample_geometry(host_transfer).bind(torch.device("cpu"))
+    geometry = _sample_geometry(host_transfer).bind(
+        torch.device("cpu"), non_blocking=False
+    )
     workspace, num_blocks = _committed_block_workspace(
         host_transfer,
         geometry,
@@ -645,6 +671,8 @@ def test_block_d2h_triton_reuses_geometry_without_expanding_ranges(monkeypatch):
         geometry_offset=0,
         num_geometry_rows=geometry.num_field_rows,
         backend="triton",
+        grid_cap=None,
+        layer_ready_flags=None,
     )
 
     range_factory.assert_not_called()
@@ -667,13 +695,15 @@ def test_block_h2d_triton_uses_max_real_work_across_layer_groups(monkeypatch):
         num_host_lcm_blocks=8,
         num_device_lcm_blocks=8,
         num_device_buffers=1,
-    ).bind(torch.device("cpu"))
+    ).bind(torch.device("cpu"), non_blocking=False)
     workspace = host_transfer.HostTransferWorkspace()
     num_blocks, _ = workspace.load_block_transfers(
         ((0, 1, 1), (0, 2, 2), (1, 1, 1), (1, 2, 2), (1, 3, 3)),
         geometry=geometry,
     )
-    workspace.commit_block_transfers(num_blocks, torch.device("cpu"))
+    workspace.commit_block_transfers(
+        num_blocks, torch.device("cpu"), non_blocking=False
+    )
     workspace.bind_addresses = MagicMock(return_value=object())
     triton_transfer = MagicMock()
     monkeypatch.setattr(host_transfer, "_transfer_cache_blocks_triton", triton_transfer)
@@ -689,26 +719,41 @@ def test_block_h2d_triton_uses_max_real_work_across_layer_groups(monkeypatch):
         geometry_offset=0,
         num_geometry_rows=2,
         backend="triton",
+        grid_cap=None,
+        layer_ready_flags=None,
     )
 
     # Group 0: 2 blocks * 2 chunks = 4. Group 1: 3 blocks * 1 chunk = 3.
     assert triton_transfer.call_args.kwargs["work_items"] == 4
 
 
-def test_block_h2d_triton_skips_layer_with_no_group_blocks(monkeypatch):
+@pytest.mark.parametrize("backend", ["auto", "triton"])
+@pytest.mark.parametrize("direction", ["h2d", "d2h"])
+def test_block_transfer_skips_empty_layer_before_mapping(
+    monkeypatch, backend, direction
+):
     host_transfer = _load_host_transfer_contract_module()
-    geometry = _sample_geometry(host_transfer).bind(torch.device("cpu"))
+    geometry = _sample_geometry(host_transfer).bind(
+        torch.device("cpu"), non_blocking=False
+    )
     workspace = host_transfer.HostTransferWorkspace()
     num_blocks, _ = workspace.load_block_transfers(
         ((0, 2, 1),),
         geometry=geometry,
     )
-    workspace.commit_block_transfers(num_blocks, torch.device("cpu"))
+    workspace.commit_block_transfers(
+        num_blocks, torch.device("cpu"), non_blocking=False
+    )
     triton_transfer = MagicMock()
     monkeypatch.setattr(host_transfer, "_transfer_cache_blocks_triton", triton_transfer)
 
+    mapper = MagicMock(
+        side_effect=AssertionError("empty layer must not map Host memory")
+    )
+    monkeypatch.setattr(workspace, "bind_addresses", mapper)
+
     host_transfer.transfer_cache_blocks(
-        "h2d",
+        direction,
         (torch.empty(1, dtype=torch.uint8),),
         torch.empty(1, dtype=torch.uint8),
         geometry,
@@ -717,10 +762,27 @@ def test_block_h2d_triton_skips_layer_with_no_group_blocks(monkeypatch):
         num_blocks=num_blocks,
         geometry_offset=2,
         num_geometry_rows=1,
-        backend="triton",
+        backend=backend,
+        grid_cap=None,
+        layer_ready_flags=None,
     )
 
     triton_transfer.assert_not_called()
+    mapper.assert_not_called()
+
+
+def test_public_transfer_arguments_are_explicit():
+    module = _load_host_transfer_contract_module()
+    for function in (
+        module.HostTransferGeometry.bind,
+        module.HostTransferWorkspace.prepare_backend,
+        module.HostTransferWorkspace.commit_block_transfers,
+        module.transfer_cache_blocks,
+    ):
+        assert all(
+            p.default is inspect.Parameter.empty
+            for p in inspect.signature(function).parameters.values()
+        ), function.__qualname__
 
 
 @pytest.mark.parametrize("requested_num_blocks", [1, 3])
@@ -729,13 +791,17 @@ def test_block_h2d_triton_requires_exact_committed_block_count(
     requested_num_blocks,
 ):
     host_transfer = _load_host_transfer_contract_module()
-    geometry = _sample_geometry(host_transfer).bind(torch.device("cpu"))
+    geometry = _sample_geometry(host_transfer).bind(
+        torch.device("cpu"), non_blocking=False
+    )
     workspace = host_transfer.HostTransferWorkspace()
     committed_count, _ = workspace.load_block_transfers(
         ((0, 2, 1), (1, 3, 2)),
         geometry=geometry,
     )
-    workspace.commit_block_transfers(committed_count, torch.device("cpu"))
+    workspace.commit_block_transfers(
+        committed_count, torch.device("cpu"), non_blocking=False
+    )
     workspace.bind_addresses = MagicMock(return_value=object())
     monkeypatch.setattr(
         host_transfer,
@@ -755,6 +821,8 @@ def test_block_h2d_triton_requires_exact_committed_block_count(
             geometry_offset=0,
             num_geometry_rows=2,
             backend="triton",
+            grid_cap=None,
+            layer_ready_flags=None,
         )
     host_transfer._transfer_cache_blocks_triton.assert_not_called()
 
@@ -793,6 +861,8 @@ def test_block_dma_expands_ranges_without_binding_device_metadata(
         geometry_offset=2,
         num_geometry_rows=1,
         backend="dma",
+        grid_cap=None,
+        layer_ready_flags=None,
     )
 
     range_factory.assert_called_once_with(
@@ -873,13 +943,17 @@ def test_block_h2d_range_factory_reads_only_referenced_group_rows():
 
 def test_block_h2d_auto_only_expands_after_capability_failure(monkeypatch):
     host_transfer = _load_host_transfer_contract_module()
-    geometry = _sample_geometry(host_transfer).bind(torch.device("cpu"))
+    geometry = _sample_geometry(host_transfer).bind(
+        torch.device("cpu"), non_blocking=False
+    )
     workspace = host_transfer.HostTransferWorkspace()
     num_blocks, _ = workspace.load_block_transfers(
         ((0, 2, 1),),
         geometry=geometry,
     )
-    workspace.commit_block_transfers(num_blocks, torch.device("cpu"))
+    workspace.commit_block_transfers(
+        num_blocks, torch.device("cpu"), non_blocking=False
+    )
     workspace.bind_addresses = MagicMock(
         side_effect=host_transfer._MappedHostUnavailable(
             "mapped host access is not available"
@@ -910,6 +984,8 @@ def test_block_h2d_auto_only_expands_after_capability_failure(monkeypatch):
             geometry_offset=0,
             num_geometry_rows=2,
             backend="auto",
+            grid_cap=None,
+            layer_ready_flags=None,
         )
 
     range_factory.assert_called_once()
@@ -917,7 +993,9 @@ def test_block_h2d_auto_only_expands_after_capability_failure(monkeypatch):
 
     workspace = host_transfer.HostTransferWorkspace()
     num_blocks, _ = workspace.load_block_transfers(((0, 2, 1),), geometry=geometry)
-    workspace.commit_block_transfers(num_blocks, torch.device("cpu"))
+    workspace.commit_block_transfers(
+        num_blocks, torch.device("cpu"), non_blocking=False
+    )
     workspace.bind_addresses = MagicMock(return_value=object())
     monkeypatch.setattr(
         host_transfer,
@@ -938,6 +1016,8 @@ def test_block_h2d_auto_only_expands_after_capability_failure(monkeypatch):
             geometry_offset=0,
             num_geometry_rows=2,
             backend="auto",
+            grid_cap=None,
+            layer_ready_flags=None,
         )
     range_factory.assert_not_called()
     range_transfer.assert_not_called()
@@ -945,13 +1025,17 @@ def test_block_h2d_auto_only_expands_after_capability_failure(monkeypatch):
 
 def test_block_h2d_auto_capability_fallback_persists_across_layers(monkeypatch):
     host_transfer = _load_host_transfer_contract_module()
-    geometry = _sample_geometry(host_transfer).bind(torch.device("cpu"))
+    geometry = _sample_geometry(host_transfer).bind(
+        torch.device("cpu"), non_blocking=False
+    )
     workspace = host_transfer.HostTransferWorkspace()
     num_blocks, _ = workspace.load_block_transfers(
         ((0, 2, 1), (1, 3, 2)),
         geometry=geometry,
     )
-    workspace.commit_block_transfers(num_blocks, torch.device("cpu"))
+    workspace.commit_block_transfers(
+        num_blocks, torch.device("cpu"), non_blocking=False
+    )
     workspace.bind_addresses = MagicMock(
         side_effect=host_transfer._MappedHostUnavailable(
             "mapped host access is not available"
@@ -983,6 +1067,8 @@ def test_block_h2d_auto_capability_fallback_persists_across_layers(monkeypatch):
             geometry_offset=0,
             num_geometry_rows=2,
             backend="auto",
+            grid_cap=None,
+            layer_ready_flags=None,
         )
     host_transfer.transfer_cache_blocks(
         "h2d",
@@ -995,9 +1081,11 @@ def test_block_h2d_auto_capability_fallback_persists_across_layers(monkeypatch):
         geometry_offset=2,
         num_geometry_rows=1,
         backend="auto",
+        grid_cap=None,
+        layer_ready_flags=None,
     )
 
-    assert workspace.prepare_backend(buffers, host).backend == "dma"
+    assert workspace.prepare_backend(buffers, host, backend="auto").backend == "dma"
     workspace.bind_addresses.assert_called_once()
     triton_transfer.assert_not_called()
     assert range_factory.call_args_list == [
@@ -1095,6 +1183,7 @@ def test_geometry_block_transfer_is_byte_exact_for_packed_multigroup_fields():
             num_geometry_rows=4,
             backend="triton",
             grid_cap=2,
+            layer_ready_flags=None,
         )
     except RuntimeError as error:
         if (
@@ -1149,6 +1238,7 @@ def test_geometry_block_transfer_is_byte_exact_for_packed_multigroup_fields():
         num_geometry_rows=4,
         backend="triton",
         grid_cap=2,
+        layer_ready_flags=None,
     )
     stream.synchronize()
 

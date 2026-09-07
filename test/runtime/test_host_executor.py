@@ -363,7 +363,7 @@ class GroupAwareWireTest(unittest.TestCase):
             [(0, 5, 9)], geometry=executor._transfer_geometry
         )
         executor._write_workspace.commit_block_transfers.assert_called_once_with(
-            1, device
+            1, device, non_blocking=False
         )
         transfer.assert_called_once_with(
             "d2h",
@@ -376,6 +376,8 @@ class GroupAwareWireTest(unittest.TestCase):
             geometry_offset=0,
             num_geometry_rows=3,
             backend="auto",
+            grid_cap=None,
+            layer_ready_flags=None,
         )
         finish.record.assert_called_once_with(stream)
 
@@ -577,7 +579,7 @@ class GroupAwareWireTest(unittest.TestCase):
             num_device_lcm_blocks=11,
             num_device_buffers=2,
         )
-        unbound_geometry.bind.assert_called_once_with(device)
+        unbound_geometry.bind.assert_called_once_with(device, non_blocking=False)
         self.assertIs(executor._transfer_geometry, bound_geometry)
         self.assertEqual([count for count, _ in trackers], [3, 1])
 
@@ -743,6 +745,7 @@ class GroupAwareWireTest(unittest.TestCase):
             num_geometry_rows=3,
             backend="auto",
             layer_ready_flags=flags,
+            grid_cap=None,
         )
         finish.record.assert_called_once_with(executor.load_stream)
         self.assertEqual(load_events.layer_done_events, [finish, finish, finish])

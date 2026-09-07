@@ -298,10 +298,10 @@ def transfer_cache_blocks(
     host_lcm_block_bytes: int,
     work_items: int,
     num_device_buffers: int,
-    grid_cap: int | None = None,
-    layer_ready_flags: torch.Tensor | None = None,
-    layer_slices: torch.Tensor | None = None,
-    layer_cta_counts: torch.Tensor | None = None,
+    grid_cap: int | None,
+    layer_ready_flags: torch.Tensor | None,
+    layer_slices: torch.Tensor | None,
+    layer_cta_counts: torch.Tensor | None,
 ) -> None:
     """Copy compact Host blocks using prepared static and dynamic metadata.
 

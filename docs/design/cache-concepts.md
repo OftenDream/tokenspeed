@@ -211,6 +211,11 @@ publish per-layer events. Device-resident geometry is metadata, not evidence
 that a particular completion protocol is supported. Automatic DMA fallback
 is limited to unavailable Host-pointer mapping, scoped to that workspace and
 buffer binding; validation, allocation, and kernel-launch failures propagate.
+Transfer callers explicitly select the backend, staging synchronization,
+grid cap, and optional layer flags. For an unflagged layer with no matching
+blocks, the transfer boundary validates the loaded block count and returns
+before mapping Host pointers or touching the accelerator runtime. Flagged
+loads still publish readiness for empty consumers.
 
 Ready flags are valid only for a full-geometry H2D transfer. Consumers first
 wait for the current generation's flag initialization event, then its layer
