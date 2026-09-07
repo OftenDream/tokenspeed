@@ -17,6 +17,11 @@ from ci_system.ci_register import register_cuda_ci
 register_cuda_ci(est_time=30, suite="runtime-1gpu")
 
 
+class _LoadEvents(SimpleNamespace):
+    def set_completion(self, event):
+        self.layer_done_events[:] = [event] * len(self.layer_done_events)
+
+
 class _SyntheticPool:
     def __init__(self, layout, arena=None):
         self._layout = layout
@@ -45,7 +50,6 @@ def _load_executor_module_without_triton(*, force_isolated=False):
     host_transfer = ModuleType("tokenspeed_kernel.ops.kvcache.host_transfer")
     host_transfer.HostTransferWorkspace = Mock
     host_transfer.build_host_transfer_geometry = Mock()
-    host_transfer.layer_ready_ptx_supported = Mock(return_value=True)
     host_transfer.transfer_cache_blocks = Mock()
     host_transfer.wait_layer_ready = Mock()
     scheduler = ModuleType("tokenspeed_scheduler")
@@ -73,8 +77,8 @@ def _load_executor_module_without_triton(*, force_isolated=False):
     layout.combine_cache_transfer_layouts = lambda target, draft, group_ids=None: (
         target if draft is None else draft
     )
-    graph_wrapper = ModuleType("tokenspeed.runtime.execution.cuda_graph_wrapper")
-    graph_wrapper.get_is_capture_mode = Mock(return_value=False)
+    forward_step = ModuleType("tokenspeed.runtime.execution.forward_step")
+    forward_step.get_is_capture_mode = Mock(return_value=False)
     runtime_utils = ModuleType("tokenspeed.runtime.utils")
     runtime_utils.get_colorful_logger = Mock(return_value=Mock())
     runtime_utils.get_device_module = Mock(return_value=Mock())
@@ -84,7 +88,7 @@ def _load_executor_module_without_triton(*, force_isolated=False):
         "tokenspeed.runtime.cache.l2.layerwise_load": layerwise_load,
         "tokenspeed.runtime.cache.l2.storage": storage,
         "tokenspeed.runtime.cache.transfer.layout": layout,
-        "tokenspeed.runtime.execution.cuda_graph_wrapper": graph_wrapper,
+        "tokenspeed.runtime.execution.forward_step": forward_step,
         "tokenspeed.runtime.utils": runtime_utils,
     }
     executor_path = os.path.abspath(
@@ -188,10 +192,15 @@ class GroupAwareWireTest(unittest.TestCase):
         geometry = SimpleNamespace(
             layer_slices=layer_slices,
             device_rows=device_rows,
+            num_field_rows=sum(count for _, count in layer_slices),
         )
         executor._transfer_geometry = geometry
         workspace = MagicMock()
         workspace.load_block_transfers.return_value = (1, (0, 1))
+        workspace.prepare_backend.return_value = SimpleNamespace(
+            uses_device_tables=device_rows is not None,
+            layer_ready=device_rows is not None,
+        )
         executor._load_workspaces = (workspace,)
         return executor_module, executor, device, geometry, workspace
 
@@ -289,6 +298,7 @@ class GroupAwareWireTest(unittest.TestCase):
         executor = L2CacheExecutor.__new__(L2CacheExecutor)
         executor._ack_lock = threading.Lock()
         executor._load_trackers = [(tracker, 1)]
+        executor._load_poisoned = False
 
         executor.submit_load_backs(SimpleNamespace(cache=[]))
 
@@ -326,6 +336,9 @@ class GroupAwareWireTest(unittest.TestCase):
         executor._write_acks = []
         executor._write_workspace = Mock()
         executor._write_workspace.load_block_transfers.return_value = (1, (0, 1))
+        executor._write_workspace.prepare_backend.return_value = SimpleNamespace(
+            uses_device_tables=True,
+        )
         executor._transfer_geometry = SimpleNamespace(
             device_rows=object(),
             layer_slices=((0, 2), (2, 1)),
@@ -383,6 +396,9 @@ class GroupAwareWireTest(unittest.TestCase):
 
         with (
             patch.object(executor_module, "get_is_capture_mode", return_value=False),
+            patch.object(
+                executor_module.device_module, "stream", return_value=nullcontext()
+            ),
             patch.object(executor_module.device_module, "Event", return_value=finish),
             patch.object(executor_module, "transfer_cache_blocks") as transfer,
             patch.object(executor_module.logger, "info") as log_info,
@@ -397,6 +413,43 @@ class GroupAwareWireTest(unittest.TestCase):
         log_info.assert_called_once_with(
             "[L2] load started: operations=%d blocks=%d", 1, 2
         )
+
+    def test_resolved_transport_selects_events_even_with_device_geometry(self):
+        for uses_device_tables in (False, True):
+            with self.subTest(uses_device_tables=uses_device_tables):
+                module, executor, _, _, workspace = self._make_load_executor(
+                    consumers=(("first",), ("second",)),
+                    layer_slices=((0, 1), (1, 1)),
+                    device_rows="bound geometry",
+                )
+                workspace.prepare_backend.return_value = SimpleNamespace(
+                    uses_device_tables=uses_device_tables, layer_ready=False
+                )
+                events = _LoadEvents(start_event=Mock(), layer_done_events=[None, None])
+                tracker = Mock()
+                tracker.begin_load.return_value = 0
+                tracker.event_sets = [events]
+                executor._load_trackers = [(tracker, 2)]
+                with (
+                    patch.object(module, "get_is_capture_mode", return_value=False),
+                    patch.object(
+                        module.device_module, "stream", return_value=nullcontext()
+                    ),
+                    patch.object(
+                        module.device_module, "Event", side_effect=[Mock(), Mock()]
+                    ),
+                    patch.object(module, "transfer_cache_blocks") as transfer,
+                ):
+                    executor._start_loading([9], [(0, 1, 1)])
+                self.assertEqual(
+                    workspace.commit_block_transfers.call_count, int(uses_device_tables)
+                )
+                workspace.prepare_layer_ready.assert_not_called()
+                self.assertIsNone(events.layer_ready_flags)
+                self.assertEqual(transfer.call_count, 2)
+                self.assertTrue(
+                    all(event is not None for event in events.layer_done_events)
+                )
 
     def test_kernel_init_builds_consumer_ordered_static_geometry_once(self):
         executor_module = self._executor_module()
@@ -609,7 +662,7 @@ class GroupAwareWireTest(unittest.TestCase):
             "tokenspeed.runtime.cache.l2.layerwise_load",
             "tokenspeed.runtime.cache.l2.storage",
             "tokenspeed.runtime.cache.transfer.layout",
-            "tokenspeed.runtime.execution.cuda_graph_wrapper",
+            "tokenspeed.runtime.execution.forward_step",
             "tokenspeed.runtime.utils",
             "tokenspeed.runtime.cache.l2.executor",
         )
@@ -643,8 +696,7 @@ class GroupAwareWireTest(unittest.TestCase):
         flags = Mock()
         flags.__getitem__ = Mock(return_value=flags)
         workspace.prepare_layer_ready.return_value = flags
-        executor._verifier = None
-        load_events = SimpleNamespace(
+        load_events = _LoadEvents(
             start_event=Mock(),
             layer_done_events=[None, None, None],
             layer_ready_flags=None,
@@ -665,9 +717,6 @@ class GroupAwareWireTest(unittest.TestCase):
                 return_value=nullcontext(),
             ),
             patch.object(executor_module.device_module, "Event", return_value=finish),
-            patch.object(
-                executor_module, "layer_ready_ptx_supported", return_value=True
-            ),
             patch.object(executor_module, "transfer_cache_blocks") as transfer,
         ):
             executor._start_loading([9], [(0, 2, 1)])
@@ -708,12 +757,12 @@ class GroupAwareWireTest(unittest.TestCase):
             device_rows=object(),
             load_stream=Mock(),
         )
-        target_events = SimpleNamespace(
+        target_events = _LoadEvents(
             start_event=Mock(),
             layer_done_events=[Mock(), Mock()],
             layer_ready_init_event=Mock(),
         )
-        draft_events = SimpleNamespace(
+        draft_events = _LoadEvents(
             start_event=Mock(),
             layer_done_events=[Mock()],
             layer_ready_init_event=Mock(),
@@ -738,9 +787,6 @@ class GroupAwareWireTest(unittest.TestCase):
                 executor_module.device_module,
                 "Event",
                 return_value=retirement,
-            ),
-            patch.object(
-                executor_module, "layer_ready_ptx_supported", return_value=True
             ),
             patch.object(
                 executor_module,
@@ -770,7 +816,7 @@ class GroupAwareWireTest(unittest.TestCase):
         )
         executor._write_acks = []
         executor._ready_write_op_ids = []
-        load_events = SimpleNamespace(
+        load_events = _LoadEvents(
             start_event=Mock(),
             layer_done_events=[Mock()],
             layer_ready_init_event=Mock(),
@@ -797,9 +843,6 @@ class GroupAwareWireTest(unittest.TestCase):
                 executor_module.device_module,
                 "Event",
                 return_value=retirement,
-            ),
-            patch.object(
-                executor_module, "layer_ready_ptx_supported", return_value=True
             ),
             patch.object(
                 executor_module,

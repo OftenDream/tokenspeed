@@ -204,6 +204,22 @@ already be racing the asynchronous H2D restore. Place the fence immediately
 before the first cache-field access so independent projections can still
 overlap the load.
 
+The Host-transfer workspace resolves transport capability for its buffer
+binding before publishing consumer waits. NVIDIA mapped-Host transfers can
+use a single full-geometry H2D launch with per-layer ready flags; other paths
+publish per-layer events. Device-resident geometry is metadata, not evidence
+that a particular completion protocol is supported. Automatic DMA fallback
+is limited to unavailable Host-pointer mapping, scoped to that workspace and
+buffer binding; validation, allocation, and kernel-launch failures propagate.
+
+Ready flags are valid only for a full-geometry H2D transfer. Consumers first
+wait for the current generation's flag initialization event, then its layer
+flag. Workspace reuse also waits for the previous transfer's completion;
+layer readiness alone does not retire metadata still read by the transfer.
+On submission failure, retirement fences protect reuse without publishing a
+successful load ACK. If neither event publication nor stream synchronization
+can establish retirement, the executor must reject further loads.
+
 ## block vs. page
 
 **`block` is the general concept; `page` is its specialization under

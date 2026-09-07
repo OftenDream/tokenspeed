@@ -31,7 +31,6 @@ import torch
 from tokenspeed_kernel.ops.kvcache.host_transfer import (
     HostTransferWorkspace,
     build_host_transfer_geometry,
-    layer_ready_ptx_supported,
     transfer_cache_blocks,
     wait_layer_ready,
 )
@@ -359,7 +358,12 @@ class L2CacheExecutor:
         num_blocks, _ = self._write_workspace.load_block_transfers(
             transfers, geometry=self._transfer_geometry
         )
-        if self._transfer_geometry.device_rows is not None:
+        mode = self._write_workspace.prepare_backend(
+            self.layout.buffers,
+            self.host_storage.host_buffer,
+            backend=self.transfer_backend,
+        )
+        if mode.uses_device_tables:
             # The single write workspace can be refilled by the next plan as
             # soon as this method returns, so finish staging before releasing
             # the caller thread. Device-table reuse remains ordered by stream.
@@ -388,7 +392,7 @@ class L2CacheExecutor:
         op_ids: Sequence[int],
         transfers: Sequence[tuple[int, int, int]],
     ) -> int | None:
-        if getattr(self, "_load_poisoned", False):
+        if self._load_poisoned:
             raise RuntimeError(
                 "L2 cache executor is poisoned after failed Host-load retirement"
             )
@@ -439,27 +443,24 @@ class L2CacheExecutor:
                 transfers, geometry=self._transfer_geometry
             )
             layer_slices = self._transfer_geometry.layer_slices
-            num_field_rows = sum(num_rows for _, num_rows in layer_slices)
-            use_layer_flags = (
-                self._transfer_geometry.device_rows is not None
-                and layer_ready_ptx_supported()
-            )
-            # All layer kernels below read slices of this one table. The
-            # indexed workspace is not refilled until this event set wraps.
-            # Commit whenever Device geometry exists so AMD can still launch
-            # unflagged per-layer Triton copies; only NVIDIA uses PTX flags.
-            if self._transfer_geometry.device_rows is not None:
-                with device_module.stream(self.load_stream):
+            # Resolve the transport before choosing the consumer wait protocol.
+            with device_module.stream(self.load_stream):
+                mode = workspace.prepare_backend(
+                    self.layout.buffers,
+                    self.host_storage.host_buffer,
+                    backend=self.transfer_backend,
+                )
+                if mode.uses_device_tables:
                     workspace.commit_block_transfers(
                         num_blocks,
                         device,
                         non_blocking=True,
                     )
-                    if use_layer_flags:
-                        flags = workspace.prepare_layer_ready(len(layer_slices), device)
-                        for load_events, _ in active_trackers:
-                            load_events.layer_ready_init_event.record(self.load_stream)
-            if use_layer_flags:
+                if mode.layer_ready:
+                    flags = workspace.prepare_layer_ready(len(layer_slices), device)
+                    for load_events, _ in active_trackers:
+                        load_events.layer_ready_init_event.record(self.load_stream)
+            if mode.layer_ready:
                 flag_offset = 0
                 for load_events, consumer_count in active_trackers:
                     load_events.layer_ready_flags = flags[
@@ -476,14 +477,14 @@ class L2CacheExecutor:
                     self.load_stream,
                     num_blocks=num_blocks,
                     geometry_offset=0,
-                    num_geometry_rows=num_field_rows,
+                    num_geometry_rows=self._transfer_geometry.num_field_rows,
                     backend=self.transfer_backend,
                     layer_ready_flags=flags,
                 )
                 finish = device_module.Event()
                 finish.record(self.load_stream)
                 for load_events, consumer_count in active_trackers:
-                    load_events.layer_done_events[:] = [finish] * consumer_count
+                    load_events.set_completion(finish)
             else:
                 for load_events, _ in active_trackers:
                     load_events.layer_ready_flags = None
@@ -516,35 +517,38 @@ class L2CacheExecutor:
                 self._load_acks.append(_Ack(finish, op_ids))
             return load_index
         except BaseException as original_error:
-            if active_trackers:
-                try:
-                    if flags is not None:
-                        with device_module.stream(self.load_stream):
-                            flags.fill_(1)
-                    retirement = device_module.Event()
-                    retirement.record(self.load_stream)
-                    for load_events, _ in active_trackers:
-                        load_events.layer_done_events[:] = [retirement] * len(
-                            load_events.layer_done_events
-                        )
-                except BaseException as retirement_error:
-                    # If an Event cannot be reliably published, stream
-                    # completion is the fallback workspace-retirement fence.
-                    try:
-                        self.load_stream.synchronize()
-                    except BaseException as sync_error:
-                        self._load_poisoned = True
-                        add_note = getattr(original_error, "add_note", None)
-                        if add_note is not None:
-                            try:
-                                add_note(
-                                    "Host-load retirement failed; executor poisoned: "
-                                    f"retirement error={retirement_error!r}; "
-                                    f"synchronize error={sync_error!r}"
-                                )
-                            except BaseException:
-                                pass
+            self._retire_failed_load(active_trackers, flags, original_error)
             raise
+
+    def _retire_failed_load(self, active_trackers, flags, original_error) -> None:
+        """Retire submitted GPU readers without publishing a success ACK."""
+        if not active_trackers:
+            return
+        try:
+            if flags is not None:
+                with device_module.stream(self.load_stream):
+                    flags.fill_(1)
+            retirement = device_module.Event()
+            retirement.record(self.load_stream)
+            for load_events, _ in active_trackers:
+                load_events.set_completion(retirement)
+            return
+        except BaseException as retirement_error:
+            # If event publication fails, only stream completion permits reuse.
+            try:
+                self.load_stream.synchronize()
+            except BaseException as sync_error:
+                self._load_poisoned = True
+                add_note = getattr(original_error, "add_note", None)
+                if add_note is not None:
+                    try:
+                        add_note(
+                            "Host-load retirement failed; executor poisoned: "
+                            f"retirement error={retirement_error!r}; "
+                            f"synchronize error={sync_error!r}"
+                        )
+                    except BaseException:
+                        pass
 
     def poll_results(self) -> list:
         with self._ack_lock:

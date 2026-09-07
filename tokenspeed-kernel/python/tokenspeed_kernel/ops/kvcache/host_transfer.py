@@ -40,7 +40,21 @@ from tokenspeed_kernel.ops.kvcache.triton import (
 )
 from tokenspeed_kernel.platform import current_platform
 
-_mapped_host_triton_available: bool | None = None
+
+@dataclass(frozen=True, slots=True)
+class HostTransferMode:
+    """Resolved transport and completion protocol for one buffer binding."""
+
+    backend: Literal["triton", "dma"]
+    layer_ready: bool = False
+
+    @property
+    def uses_device_tables(self) -> bool:
+        return self.backend == "triton"
+
+
+class _MappedHostUnavailable(RuntimeError):
+    pass
 
 
 def layer_ready_ptx_supported() -> bool:
@@ -71,6 +85,7 @@ class HostTransferGeometry:
     host_lcm_block_bytes: int
     num_host_lcm_blocks: int
     num_device_lcm_blocks: int
+    row_work: tuple[tuple[int, int], ...]
     device_layer_slices: torch.Tensor | None = None
 
     @property
@@ -243,6 +258,14 @@ def build_host_transfer_geometry(
         host_lcm_block_bytes=int(host_lcm_block_bytes),
         num_host_lcm_blocks=int(num_host_lcm_blocks),
         num_device_lcm_blocks=int(num_device_lcm_blocks),
+        row_work=tuple(
+            (
+                int(row[0]),
+                (int(row[7]) + HOST_CACHE_TRANSFER_CHUNK_BYTES - 1)
+                // HOST_CACHE_TRANSFER_CHUNK_BYTES,
+            )
+            for row in rows
+        ),
     )
 
 
@@ -264,6 +287,61 @@ class HostTransferWorkspace:
         self._layer_ready_flags: torch.Tensor | None = None
         self._layer_cta_counts: torch.Tensor | None = None
         self._num_layer_ready = 0
+        self._backend_key = None
+        self._mode: HostTransferMode | None = None
+
+    def prepare_backend(
+        self,
+        device_buffers: Sequence[torch.Tensor],
+        host_buffer: torch.Tensor,
+        *,
+        backend: Literal["auto", "triton", "dma"] = "auto",
+    ) -> HostTransferMode:
+        """Resolve capability before submitting payload or publishing waits.
+
+        Args:
+            device_buffers: Cache buffers on one device.
+            host_buffer: Pinned Host allocation to map.
+            backend: Requested transport; only auto may fall back to DMA.
+
+        Returns:
+            Buffer-scoped transport and layer completion capability. Call on
+            the transfer stream so newly allocated address tables are ordered.
+        """
+        if backend not in ("auto", "triton", "dma"):
+            raise ValueError(f"unknown cache transfer backend {backend!r}")
+        device = device_buffers[0].device
+        if backend == "dma" or device.type == "npu":
+            if backend == "triton":
+                raise RuntimeError("mapped Host Triton transfer is unavailable on NPU")
+            return HostTransferMode("dma")
+        key = (
+            device,
+            tuple(buffer.data_ptr() for buffer in device_buffers),
+            host_buffer.data_ptr(),
+        )
+        if key != self._backend_key:
+            self._backend_key = key
+            self._mode = None
+        if self._mode is None:
+            try:
+                self._address_table = self.bind_addresses(device_buffers, host_buffer)
+            except _MappedHostUnavailable:
+                if backend == "triton":
+                    raise
+                self._mode = HostTransferMode("dma")
+                warnings.warn(
+                    "Mapped Host access is unavailable; falling back to DMA",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+            else:
+                self._mode = HostTransferMode(
+                    "triton", device.type == "cuda" and layer_ready_ptx_supported()
+                )
+        if backend == "triton" and not self._mode.uses_device_tables:
+            raise _MappedHostUnavailable("mapped Host access is not available")
+        return self._mode
 
     def _invalidate_block_commit(self) -> None:
         self._block_load_generation += 1
@@ -289,15 +367,19 @@ class HostTransferWorkspace:
         host_buffer: torch.Tensor,
     ) -> torch.Tensor:
         device = device_buffers[0].device
+        try:
+            host_ptr = int(current_platform().device_visible_data_ptr(host_buffer))
+        except (AttributeError, RuntimeError) as error:
+            if not _triton_is_unavailable(error):
+                raise
+            raise _MappedHostUnavailable(str(error)) from error
         key = tuple(int(buffer.data_ptr()) for buffer in device_buffers) + (
-            int(current_platform().device_visible_data_ptr(host_buffer)),
+            host_ptr,
             int(device.index if device.index is not None else 0),
         )
         if self._address_table is None or self._address_key != key:
             addresses = [int(buffer.data_ptr()) for buffer in device_buffers]
-            addresses.append(
-                int(current_platform().device_visible_data_ptr(host_buffer))
-            )
+            addresses.append(host_ptr)
             self._address_table = torch.tensor(
                 addresses, dtype=torch.uint64, device=device
             )
@@ -550,10 +632,9 @@ class HostTransferWorkspace:
 
 def _triton_is_unavailable(error: Exception) -> bool:
     message = str(error).lower()
-    return isinstance(error, AttributeError) or any(
+    return any(
         marker in message
         for marker in (
-            "triton is not available",
             "hostgetdevicepointer",
             "mapped host access is not available",
         )
@@ -617,18 +698,12 @@ def _block_work_items(
 ) -> int:
     """Return the largest real block/chunk count in a geometry slice."""
 
-    geometry_rows = geometry.host_rows[
-        geometry_offset : geometry_offset + num_geometry_rows
-    ].tolist()
     group_offsets = workspace.block_group_offsets_host().tolist()
     work_items = 0
-    for row in geometry_rows:
-        group_index = int(row[0])
-        payload_bytes = int(row[7])
+    for group_index, num_chunks in geometry.row_work[
+        geometry_offset : geometry_offset + num_geometry_rows
+    ]:
         group_blocks = int(group_offsets[group_index + 1] - group_offsets[group_index])
-        num_chunks = (
-            payload_bytes + HOST_CACHE_TRANSFER_CHUNK_BYTES - 1
-        ) // HOST_CACHE_TRANSFER_CHUNK_BYTES
         work_items = max(work_items, group_blocks * num_chunks)
     return work_items
 
@@ -682,6 +757,12 @@ def transfer_cache_blocks(
     if num_blocks < 0:
         raise ValueError("num_blocks must be non-negative")
     if layer_ready_flags is not None:
+        if (
+            direction != "h2d"
+            or geometry_offset != 0
+            or num_geometry_rows != geometry.num_field_rows
+        ):
+            raise ValueError("layer-ready flags require a full-geometry H2D transfer")
         if layer_ready_flags.dtype != torch.int32 or layer_ready_flags.ndim != 1:
             raise ValueError("layer_ready_flags must be a 1-D int32 tensor")
         if layer_ready_flags.numel() != len(geometry.layer_slices):
@@ -724,66 +805,47 @@ def transfer_cache_blocks(
         transfer_dma()
         return
 
-    global _mapped_host_triton_available
-    mapped_host_candidate = device_buffers[0].device.type != "npu"
-    if mapped_host_candidate and _mapped_host_triton_available is not False:
+    device_module = torch.get_device_module(device_buffers[0].device)
+    with device_module.stream(stream) if stream is not None else nullcontext():
+        mode = workspace.prepare_backend(device_buffers, host_buffer, backend=backend)
+        if not mode.uses_device_tables:
+            transfer_dma()
+            return
         if geometry.device_rows is None:
             raise ValueError("geometry must be bound before a Triton block transfer")
-        device_module = torch.get_device_module(device_buffers[0].device)
-        stream_context = (
-            device_module.stream(stream) if stream is not None else nullcontext()
+        block_rows, group_offsets = workspace.committed_block_tables(num_blocks)
+        work_items = _block_work_items(
+            geometry,
+            workspace,
+            geometry_offset=geometry_offset,
+            num_geometry_rows=num_geometry_rows,
         )
-        try:
-            with stream_context:
-                block_rows, group_offsets = workspace.committed_block_tables(num_blocks)
-                work_items = _block_work_items(
-                    geometry,
-                    workspace,
-                    geometry_offset=geometry_offset,
-                    num_geometry_rows=num_geometry_rows,
-                )
-                if work_items == 0 and layer_ready_flags is None:
-                    return
-                address_table = workspace.bind_addresses(device_buffers, host_buffer)
-                triton_kwargs = {
-                    "geometry_offset": geometry_offset,
-                    "num_geometry_rows": num_geometry_rows,
-                    "host_lcm_block_bytes": geometry.host_lcm_block_bytes,
-                    "work_items": work_items,
-                    "num_device_buffers": len(device_buffers),
-                    "grid_cap": grid_cap,
-                }
-                if layer_ready_flags is not None:
-                    if geometry.device_layer_slices is None:
-                        raise ValueError(
-                            "geometry layer slices must be bound before a "
-                            "flagged Triton transfer"
-                        )
-                    triton_kwargs["layer_ready_flags"] = layer_ready_flags
-                    triton_kwargs["layer_slices"] = geometry.device_layer_slices
-                    triton_kwargs["layer_cta_counts"] = workspace.layer_cta_counts()
-                _transfer_cache_blocks_triton(
-                    address_table,
-                    geometry.device_rows,
-                    block_rows,
-                    group_offsets,
-                    0 if direction == "d2h" else 1,
-                    **triton_kwargs,
-                )
-            _mapped_host_triton_available = True
+        if work_items == 0 and layer_ready_flags is None:
             return
-        except (AttributeError, RuntimeError) as error:
-            if backend == "triton" or not _triton_is_unavailable(error):
-                raise
-            _mapped_host_triton_available = False
-            warnings.warn(
-                "Mapped Host Triton block transfer is unavailable; falling back to DMA",
-                RuntimeWarning,
-                stacklevel=2,
-            )
-    if backend == "triton":
-        raise RuntimeError("mapped Host Triton transfer is unavailable")
-    transfer_dma()
+        triton_kwargs = {
+            "geometry_offset": geometry_offset,
+            "num_geometry_rows": num_geometry_rows,
+            "host_lcm_block_bytes": geometry.host_lcm_block_bytes,
+            "work_items": work_items,
+            "num_device_buffers": len(device_buffers),
+            "grid_cap": grid_cap,
+        }
+        if layer_ready_flags is not None:
+            if geometry.device_layer_slices is None:
+                raise ValueError(
+                    "geometry layer slices must be bound before a flagged Triton transfer"
+                )
+            triton_kwargs["layer_ready_flags"] = layer_ready_flags
+            triton_kwargs["layer_slices"] = geometry.device_layer_slices
+            triton_kwargs["layer_cta_counts"] = workspace.layer_cta_counts()
+        _transfer_cache_blocks_triton(
+            workspace._address_table,
+            geometry.device_rows,
+            block_rows,
+            group_offsets,
+            0 if direction == "d2h" else 1,
+            **triton_kwargs,
+        )
 
 
 def _validate_ranges(

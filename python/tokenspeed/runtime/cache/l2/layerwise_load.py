@@ -54,6 +54,10 @@ class _LayerwiseLoadEvents:
     def last_layer_done_event(self):
         return self.layer_done_events[-1]
 
+    def set_completion(self, event) -> None:
+        """Retire every layer behind one full-transfer completion event."""
+        self.layer_done_events[:] = [event] * len(self.layer_done_events)
+
 
 class LayerwiseLoadTracker:
     def __init__(self, num_layers: int):

@@ -3,14 +3,16 @@ from __future__ import annotations
 import importlib
 import sys
 import types
+from functools import lru_cache
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import ANY, MagicMock, call
+from unittest.mock import ANY, MagicMock, call, patch
 
 import pytest
 import torch
 
 
+@lru_cache(maxsize=1)
 def _load_host_transfer_contract_module():
     module_name = "tokenspeed_kernel.ops.kvcache.host_transfer"
     module = sys.modules.get(module_name)
@@ -19,24 +21,35 @@ def _load_host_transfer_contract_module():
 
     try:
         return importlib.import_module(module_name)
-    except ModuleNotFoundError:
+    except ModuleNotFoundError as error:
+        if error.name != "tokenspeed_kernel" and not (error.name or "").startswith(
+            "tokenspeed_triton"
+        ):
+            raise
         root = Path(__file__).resolve().parents[2] / "python" / "tokenspeed_kernel"
         packages = (
             ("tokenspeed_kernel", root),
             ("tokenspeed_kernel.ops", root / "ops"),
             ("tokenspeed_kernel.ops.kvcache", root / "ops" / "kvcache"),
         )
+        stubs = {}
         for name, path in packages:
             if name not in sys.modules:
                 pkg = types.ModuleType(name)
                 pkg.__path__ = [str(path)]
-                sys.modules[name] = pkg
-        triton_stub = sys.modules.setdefault(
-            "tokenspeed_kernel.ops.kvcache.triton",
-            MagicMock(name="kvcache_triton_stub"),
-        )
+                stubs[name] = pkg
+        triton_stub = MagicMock(name="kvcache_triton_stub")
         triton_stub.HOST_CACHE_TRANSFER_CHUNK_BYTES = 4096
-        return importlib.import_module(module_name)
+        stubs["tokenspeed_kernel.ops.kvcache.triton"] = triton_stub
+        spec = importlib.util.spec_from_file_location(
+            "_isolated_host_transfer_contract",
+            root / "ops" / "kvcache" / "host_transfer.py",
+        )
+        module = importlib.util.module_from_spec(spec)
+        stubs[spec.name] = module
+        with patch.dict(sys.modules, stubs):
+            spec.loader.exec_module(module)
+        return module
 
 
 @pytest.fixture
@@ -91,7 +104,6 @@ def _mock_triton_block_path(monkeypatch, host_transfer, workspace):
     range_factory = MagicMock(side_effect=AssertionError("ranges must stay lazy"))
     monkeypatch.setattr(host_transfer, "_transfer_cache_blocks_triton", triton_transfer)
     monkeypatch.setattr(host_transfer, "_make_block_ranges", range_factory)
-    monkeypatch.setattr(host_transfer, "_mapped_host_triton_available", None)
     workspace.bind_addresses = MagicMock(return_value="addresses")
     return triton_transfer, range_factory
 
@@ -376,12 +388,121 @@ def test_committed_tables_are_shared_without_reupload(host_transfer_contract):
     assert workspace._block_group_offsets_device.data_ptr() == offset_ptr
 
 
-def test_unrelated_triton_runtime_error_does_not_fall_back_to_dma(
-    host_transfer_contract,
+@pytest.mark.parametrize(
+    "error",
+    [
+        RuntimeError("requested kernel specialization is not available"),
+        AttributeError("workspace has no attribute misspelled"),
+    ],
+)
+def test_unrelated_errors_are_not_capability_failures(host_transfer_contract, error):
+    assert not host_transfer_contract._triton_is_unavailable(error)
+
+
+@pytest.mark.parametrize(
+    "direction,offset,count", [("d2h", 0, 3), ("h2d", 1, 2), ("h2d", 0, 2)]
+)
+@pytest.mark.parametrize("backend", ["dma", "auto", "triton"])
+def test_flags_require_full_h2d_geometry(
+    host_transfer_contract, direction, offset, count, backend
 ):
-    assert not host_transfer_contract._triton_is_unavailable(
-        RuntimeError("requested kernel specialization is not available")
+    geometry = _sample_geometry(host_transfer_contract)
+    with pytest.raises(ValueError, match="full-geometry H2D"):
+        host_transfer_contract.transfer_cache_blocks(
+            direction,
+            (),
+            torch.empty(0),
+            geometry,
+            host_transfer_contract.HostTransferWorkspace(),
+            None,
+            num_blocks=1,
+            geometry_offset=offset,
+            num_geometry_rows=count,
+            backend=backend,
+            layer_ready_flags=torch.zeros(3, dtype=torch.int32),
+        )
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        AttributeError("missing field"),
+        RuntimeError("kernel launch failed"),
+        RuntimeError("mapped host access is not available"),
+    ],
+)
+def test_kernel_errors_never_trigger_dma(monkeypatch, error):
+    module = _load_host_transfer_contract_module()
+    geometry = _sample_geometry(module).bind(torch.device("cpu"))
+    workspace, count = _committed_block_workspace(module, geometry, ((0, 2, 1),))
+    kernel, ranges = _mock_triton_block_path(monkeypatch, module, workspace)
+    kernel.side_effect = error
+    with pytest.raises(type(error)) as raised:
+        module.transfer_cache_blocks(
+            "h2d",
+            (torch.empty(1),),
+            torch.empty(1),
+            geometry,
+            workspace,
+            None,
+            num_blocks=count,
+            geometry_offset=0,
+            num_geometry_rows=3,
+        )
+    assert raised.value is error
+    ranges.assert_not_called()
+
+
+def test_mapping_fallback_is_scoped_to_buffer_binding(monkeypatch):
+    module = _load_host_transfer_contract_module()
+    buffers, host = (torch.empty(8),), torch.empty(8)
+    platform = SimpleNamespace(
+        device_visible_data_ptr=MagicMock(
+            side_effect=RuntimeError("hipHostGetDevicePointer failed")
+        )
     )
+    monkeypatch.setattr(module, "current_platform", lambda: platform)
+    failed = module.HostTransferWorkspace()
+    with pytest.warns(RuntimeWarning, match="falling back"):
+        assert failed.prepare_backend(buffers, host).backend == "dma"
+    assert failed.prepare_backend(buffers, host).backend == "dma"
+    platform.device_visible_data_ptr.assert_called_once()
+    with pytest.raises(RuntimeError, match="mapped Host"):
+        failed.prepare_backend(buffers, host, backend="triton")
+
+    platform.device_visible_data_ptr.side_effect = None
+    platform.device_visible_data_ptr.return_value = host.data_ptr()
+    other = module.HostTransferWorkspace()
+    assert other.prepare_backend(buffers, host).backend == "triton"
+    assert failed.prepare_backend(buffers, torch.empty(16)).backend == "triton"
+
+
+def test_mapping_attribute_bug_is_not_silently_downgraded(monkeypatch):
+    module = _load_host_transfer_contract_module()
+    monkeypatch.setattr(module, "current_platform", lambda: SimpleNamespace())
+    with pytest.raises(AttributeError, match="device_visible_data_ptr"):
+        module.HostTransferWorkspace().prepare_backend(
+            (torch.empty(1),), torch.empty(1)
+        )
+
+
+def test_work_sizing_does_not_read_static_tensor_again(monkeypatch):
+    module = _load_host_transfer_contract_module()
+    geometry = _sample_geometry(module)
+    workspace = module.HostTransferWorkspace()
+    workspace.load_block_transfers(((0, 2, 1), (0, 3, 2), (1, 3, 1)), geometry=geometry)
+    workspace.block_group_offsets_host = lambda: SimpleNamespace(
+        tolist=lambda: [0, 2, 3]
+    )
+    with patch.object(
+        torch.Tensor, "tolist", side_effect=AssertionError("static tensor read")
+    ):
+        assert (
+            module._block_work_items(
+                geometry, workspace, geometry_offset=0, num_geometry_rows=3
+            )
+            == 2
+        )
 
 
 def test_block_transfer_rejects_unknown_direction():
@@ -556,7 +677,6 @@ def test_block_h2d_triton_uses_max_real_work_across_layer_groups(monkeypatch):
     workspace.bind_addresses = MagicMock(return_value=object())
     triton_transfer = MagicMock()
     monkeypatch.setattr(host_transfer, "_transfer_cache_blocks_triton", triton_transfer)
-    monkeypatch.setattr(host_transfer, "_mapped_host_triton_available", None)
 
     host_transfer.transfer_cache_blocks(
         "h2d",
@@ -586,7 +706,6 @@ def test_block_h2d_triton_skips_layer_with_no_group_blocks(monkeypatch):
     workspace.commit_block_transfers(num_blocks, torch.device("cpu"))
     triton_transfer = MagicMock()
     monkeypatch.setattr(host_transfer, "_transfer_cache_blocks_triton", triton_transfer)
-    monkeypatch.setattr(host_transfer, "_mapped_host_triton_available", None)
 
     host_transfer.transfer_cache_blocks(
         "h2d",
@@ -618,7 +737,6 @@ def test_block_h2d_triton_requires_exact_committed_block_count(
     )
     workspace.commit_block_transfers(committed_count, torch.device("cpu"))
     workspace.bind_addresses = MagicMock(return_value=object())
-    monkeypatch.setattr(host_transfer, "_mapped_host_triton_available", None)
     monkeypatch.setattr(
         host_transfer,
         "_transfer_cache_blocks_triton",
@@ -638,7 +756,7 @@ def test_block_h2d_triton_requires_exact_committed_block_count(
             num_geometry_rows=2,
             backend="triton",
         )
-    workspace.bind_addresses.assert_not_called()
+    host_transfer._transfer_cache_blocks_triton.assert_not_called()
 
 
 @pytest.mark.parametrize("direction", ["d2h", "h2d"])
@@ -762,17 +880,22 @@ def test_block_h2d_auto_only_expands_after_capability_failure(monkeypatch):
         geometry=geometry,
     )
     workspace.commit_block_transfers(num_blocks, torch.device("cpu"))
-    workspace.bind_addresses = MagicMock(return_value=object())
+    workspace.bind_addresses = MagicMock(
+        side_effect=host_transfer._MappedHostUnavailable(
+            "mapped host access is not available"
+        )
+    )
     ranges = ((0, 292, 0, 40), (0, 332, 40, 40))
     range_factory = MagicMock(return_value=ranges)
     range_transfer = MagicMock()
     monkeypatch.setattr(host_transfer, "_make_block_ranges", range_factory)
     monkeypatch.setattr(host_transfer, "_transfer_cache_ranges", range_transfer)
-    monkeypatch.setattr(host_transfer, "_mapped_host_triton_available", None)
     monkeypatch.setattr(
         host_transfer,
         "_transfer_cache_blocks_triton",
-        MagicMock(side_effect=RuntimeError("mapped host access is not available")),
+        MagicMock(
+            side_effect=AssertionError("kernel must not launch on capability failure")
+        ),
     )
 
     with pytest.warns(RuntimeWarning, match="falling back"):
@@ -792,7 +915,10 @@ def test_block_h2d_auto_only_expands_after_capability_failure(monkeypatch):
     range_factory.assert_called_once()
     range_transfer.assert_called_once()
 
-    monkeypatch.setattr(host_transfer, "_mapped_host_triton_available", None)
+    workspace = host_transfer.HostTransferWorkspace()
+    num_blocks, _ = workspace.load_block_transfers(((0, 2, 1),), geometry=geometry)
+    workspace.commit_block_transfers(num_blocks, torch.device("cpu"))
+    workspace.bind_addresses = MagicMock(return_value=object())
     monkeypatch.setattr(
         host_transfer,
         "_transfer_cache_blocks_triton",
@@ -826,10 +952,14 @@ def test_block_h2d_auto_capability_fallback_persists_across_layers(monkeypatch):
         geometry=geometry,
     )
     workspace.commit_block_transfers(num_blocks, torch.device("cpu"))
-    workspace.bind_addresses = MagicMock(return_value=object())
-    triton_transfer = MagicMock(
-        side_effect=RuntimeError("mapped host access is not available")
+    workspace.bind_addresses = MagicMock(
+        side_effect=host_transfer._MappedHostUnavailable(
+            "mapped host access is not available"
+        )
     )
+    triton_transfer = MagicMock()
+    buffers = (torch.empty(1, dtype=torch.uint8),)
+    host = torch.empty(1, dtype=torch.uint8)
     range_factory = MagicMock(
         side_effect=(
             ((0, 292, 0, 40),),
@@ -840,13 +970,12 @@ def test_block_h2d_auto_capability_fallback_persists_across_layers(monkeypatch):
     monkeypatch.setattr(host_transfer, "_transfer_cache_blocks_triton", triton_transfer)
     monkeypatch.setattr(host_transfer, "_make_block_ranges", range_factory)
     monkeypatch.setattr(host_transfer, "_transfer_cache_ranges", range_transfer)
-    monkeypatch.setattr(host_transfer, "_mapped_host_triton_available", None)
 
     with pytest.warns(RuntimeWarning, match="falling back"):
         host_transfer.transfer_cache_blocks(
             "h2d",
-            (torch.empty(1, dtype=torch.uint8),),
-            torch.empty(1, dtype=torch.uint8),
+            buffers,
+            host,
             geometry,
             workspace,
             stream=None,
@@ -857,8 +986,8 @@ def test_block_h2d_auto_capability_fallback_persists_across_layers(monkeypatch):
         )
     host_transfer.transfer_cache_blocks(
         "h2d",
-        (torch.empty(1, dtype=torch.uint8),),
-        torch.empty(1, dtype=torch.uint8),
+        buffers,
+        host,
         geometry,
         workspace,
         stream=None,
@@ -868,8 +997,9 @@ def test_block_h2d_auto_capability_fallback_persists_across_layers(monkeypatch):
         backend="auto",
     )
 
-    assert host_transfer._mapped_host_triton_available is False
-    triton_transfer.assert_called_once()
+    assert workspace.prepare_backend(buffers, host).backend == "dma"
+    workspace.bind_addresses.assert_called_once()
+    triton_transfer.assert_not_called()
     assert range_factory.call_args_list == [
         call(
             geometry,
@@ -1049,7 +1179,7 @@ def test_geometry_block_transfer_is_byte_exact_for_packed_multigroup_fields():
 
 
 @requires_cuda
-def test_layered_h2d_sets_flags_and_copies_each_layer():
+def test_layered_h2d_reuses_workspaces_after_delayed_flag_reset():
     module = _load_host_transfer_contract_module()
     if not module.layer_ready_ptx_supported():
         pytest.skip("flagged Triton transfers require NVIDIA PTX")
@@ -1061,40 +1191,62 @@ def test_layered_h2d_sets_flags_and_copies_each_layer():
         layer_slices=((0, 1), (1, 0), (1, 1)),
         group_packing=(1,),
         host_lcm_block_bytes=16,
-        num_host_lcm_blocks=2,
+        num_host_lcm_blocks=8,
         num_device_lcm_blocks=4,
         num_device_buffers=1,
     )
-    host = torch.arange(32, dtype=torch.uint8).pin_memory()
+    host = torch.arange(128, dtype=torch.uint8).pin_memory()
     device = torch.full((64,), 0xA5, dtype=torch.uint8, device="cuda")
-    workspace = module.HostTransferWorkspace()
-    num_blocks, _ = workspace.load_block_transfers(((0, 1, 1),), geometry=geometry)
+    workspaces = [module.HostTransferWorkspace() for _ in range(3)]
+    initialized = [torch.cuda.Event() for _ in workspaces]
+    finished = [torch.cuda.Event() for _ in workspaces]
     stream = torch.cuda.Stream()
     compute = torch.cuda.Stream()
-
+    stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
         bound = geometry.bind(device.device, non_blocking=True)
-        workspace.commit_block_transfers(num_blocks, device.device, non_blocking=True)
-        flags = workspace.prepare_layer_ready(3, device.device)
+    snapshots = []
     try:
-        module.transfer_cache_blocks(
-            "h2d",
-            (device,),
-            host,
-            bound,
-            workspace,
-            stream,
-            num_blocks=num_blocks,
-            geometry_offset=0,
-            num_geometry_rows=2,
-            backend="triton",
-            layer_ready_flags=flags,
-            grid_cap=2,
-        )
-        with torch.cuda.stream(compute):
-            module.wait_layer_ready(flags, 0)
-            module.wait_layer_ready(flags, 1)
-            module.wait_layer_ready(flags, 2)
+        for generation in range(7):
+            slot = generation % len(workspaces)
+            workspace = workspaces[slot]
+            if generation >= len(workspaces):
+                finished[slot].synchronize()
+            num_blocks, _ = workspace.load_block_transfers(
+                ((0, 1, generation + 1),), geometry=geometry
+            )
+            # Reusing the destination also waits for the prior consumer reads.
+            stream.wait_stream(compute)
+            with torch.cuda.stream(stream):
+                torch.cuda._sleep(5_000_000)
+                workspace.commit_block_transfers(
+                    num_blocks, device.device, non_blocking=True
+                )
+                flags = workspace.prepare_layer_ready(3, device.device)
+                initialized[slot].record(stream)
+                module.transfer_cache_blocks(
+                    "h2d",
+                    (device,),
+                    host,
+                    bound,
+                    workspace,
+                    stream,
+                    num_blocks=num_blocks,
+                    geometry_offset=0,
+                    num_geometry_rows=2,
+                    backend="triton",
+                    layer_ready_flags=flags,
+                    grid_cap=2,
+                )
+                finished[slot].record(stream)
+            with torch.cuda.stream(compute):
+                compute.wait_event(initialized[slot])
+                module.wait_layer_ready(flags, 0)
+                first = device[16:24].clone()
+                module.wait_layer_ready(flags, 1)
+                module.wait_layer_ready(flags, 2)
+                second = device[24:32].clone()
+                snapshots.append((first, second))
     except RuntimeError as error:
         if (
             module._triton_is_unavailable(error)
@@ -1103,7 +1255,8 @@ def test_layered_h2d_sets_flags_and_copies_each_layer():
             pytest.skip(str(error))
         raise
     compute.synchronize()
-
-    assert flags.tolist() == [1, 1, 1]
-    assert device[16:24].cpu().tolist() == host[0:8].tolist()
-    assert device[24:32].cpu().tolist() == host[8:16].tolist()
+    stream.synchronize()
+    for generation, (first, second) in enumerate(snapshots):
+        offset = generation * 16
+        assert torch.equal(first.cpu(), host[offset : offset + 8])
+        assert torch.equal(second.cpu(), host[offset + 8 : offset + 16])
