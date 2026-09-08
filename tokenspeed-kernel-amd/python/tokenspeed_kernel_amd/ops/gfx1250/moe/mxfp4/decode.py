@@ -25,6 +25,8 @@ from tokenspeed_kernel_amd._triton import gl, gluon
 from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4._common import (
     MoEConfig,
     MoEPipelinedProgram,
+    _enforce_wave_uniform_i32,
+    _situ_gfx1250,
     _swiglu_gfx1250,
     compute_offsets,
     compute_pids,
@@ -90,6 +92,9 @@ def _matmul_decode(
     SWIGLU_ALPHA: gl.constexpr,
     SWIGLU_LIMIT: gl.constexpr,
     SWIGLU_BETA: gl.constexpr,
+    DO_SITU: gl.constexpr,
+    SITU_BETA: gl.constexpr,
+    SITU_LINEAR_BETA: gl.constexpr,
     ACTIVATION_REDUCTION_N: gl.constexpr,
     # MoE config
     N_EXPTS_TOT: gl.constexpr,
@@ -101,6 +106,7 @@ def _matmul_decode(
     XCD_SWIZZLE: gl.constexpr,
     SWIZZLE_MX_SCALE: gl.constexpr,
     EVEN_K: gl.constexpr,
+    INDEX_TYPE: gl.constexpr,
     UPCAST_INDICES: gl.constexpr = False,
     NUM_BUFFERS: gl.constexpr = 2,
     SCALE_BLOCK: gl.constexpr = 32,
@@ -130,16 +136,8 @@ def _matmul_decode(
     DTYPE_X: gl.constexpr = get_scaled_dot_format_string(X.dtype.element_ty)
     DTYPE_W: gl.constexpr = get_scaled_dot_format_string(W.dtype.element_ty)
 
-    if GatherIndx is not None:
-        # In triton_kernels, when indices exceed int32 range, they are upcasted to int64. TDM Gather doesn't
-        # support int64 indices. Only int16 or int32 are supported. In that case, we need to fall back to
-        # AsyncCopy. Fortunately in the GPT-OSS example, we don't need to upcast.
-        gl.static_assert(
-            not UPCAST_INDICES,
-            "TDM Gather doesn't support int64 indices. Only int16 or int32 are supported.",
-        )
-
-    index_type: gl.constexpr = gl.int64 if UPCAST_INDICES else gl.int32
+    # Width of pointer arithmetic only; TDM row indices use INDEX_TYPE.
+    address_index_type: gl.constexpr = gl.int64 if UPCAST_INDICES else gl.int32
     USE_GATHER: gl.constexpr = GatherIndx is not None
 
     SCALE_PRESHUFFLE: gl.constexpr = (
@@ -163,7 +161,7 @@ def _matmul_decode(
         WITH_X_MX_SCALE=WITH_X_MX_SCALE,
         WITH_W_MX_SCALE=WITH_W_MX_SCALE,
         SCALE_PRESHUFFLE=SCALE_PRESHUFFLE,
-        index_type=index_type,
+        index_type=INDEX_TYPE,
         NUM_SUBTILES=NUM_SUBTILES,
         EVEN_K=EVEN_K,
         USE_GATHER=USE_GATHER,
@@ -213,9 +211,9 @@ def _matmul_decode(
 
     eM = gl.multiple_of(gl.load(XSliceSizes + expt_id), X_SLICE_SIZES_DIVISIBILITY)
 
-    expt_id, off_m = expt_id.to(cfg.index_type), off_m.to(cfg.index_type)
-    start_m = start_m.to(cfg.index_type)
-    pid_n, pid_k = pid_n.to(cfg.index_type), pid_k.to(cfg.index_type)
+    expt_id, off_m = expt_id.to(address_index_type), off_m.to(address_index_type)
+    start_m = start_m.to(address_index_type)
+    pid_n, pid_k = pid_n.to(address_index_type), pid_k.to(address_index_type)
 
     X_ptr = X
     if not cfg.USE_GATHER:
@@ -240,7 +238,9 @@ def _matmul_decode(
 
     descriptor_m = M
     if not cfg.USE_GATHER:
-        descriptor_m = eM - off_m
+        # Rows left in this expert fit i32 even when the weight slab needs the
+        # wide index type.
+        descriptor_m = (eM - off_m).to(gl.int32)
     x_desc, w_desc, x_scale_desc, w_scale_desc, gathered_m = create_descriptor(
         cfg,
         X_ptr,
@@ -299,7 +299,17 @@ def _matmul_decode(
     bias = gl.convert_layout(bias, gl.SliceLayout(0, cfg.acc_layout))
     acc += bias[None, :]
 
-    if DO_SWIGLU:
+    gl.static_assert(
+        not (DO_SWIGLU and DO_SITU),
+        "SwiGLU and SiTU cannot both be enabled",
+    )
+    if DO_SITU:
+        out = _situ_gfx1250(acc, SITU_BETA, SITU_LINEAR_BETA)
+        gl.static_assert(
+            out.shape[1] == OUT_BLOCK_N,
+            f"Activation fn out.shape[1] ({out.shape[1]}) doesn't match computed OUT_BLOCK_N ({OUT_BLOCK_N})",
+        )
+    elif DO_SWIGLU:
         out = _swiglu_gfx1250(acc, SWIGLU_ALPHA, SWIGLU_LIMIT, SWIGLU_BETA)
         gl.static_assert(
             out.shape[1] == OUT_BLOCK_N,
@@ -318,17 +328,21 @@ def _matmul_decode(
     out = out.to(Y.dtype.element_ty)
     out = gl.convert_layout(out, BLOCKED_LAYOUT_Y)
 
+    OUTPUT_SHARED_LAYOUT: gl.constexpr = gl.SwizzledSharedLayout(
+        vec=1, per_phase=1, max_phase=1, order=[1, 0]
+    )
+    out_smem = gl.allocate_shared_memory(
+        Y.dtype.element_ty, (BLOCK_M, OUT_BLOCK_N), OUTPUT_SHARED_LAYOUT
+    )
+    out_smem.store(out)
+
     if WriteBackIndx is not None:
         WriteBackIndx += start_m
-
-        SCATTER_SHARED_LAYOUT: gl.constexpr = gl.SwizzledSharedLayout(
-            vec=1, per_phase=1, max_phase=1, order=[1, 0]
-        )
 
         IDX_BASE_LAYOUT: gl.constexpr = get_tdm_gather_scatter_idx_layout(
             BLOCK_M, cfg.NUM_WARPS
         )
-        IDX_LAYOUT: gl.constexpr = gl.SliceLayout(1, IDX_BASE_LAYOUT)
+        IDX_LAYOUT: gl.constexpr = gl.SliceLayout(0, IDX_BASE_LAYOUT)
 
         idx_offs = gl.arange(0, BLOCK_M, IDX_LAYOUT)
         idx_mask = (off_m + idx_offs < eM) & (
@@ -339,38 +353,33 @@ def _matmul_decode(
         )
         dst_row_indices = dst_row_indices.to(cfg.index_type)
 
-        out_smem = gl.allocate_shared_memory(
-            Y.dtype.element_ty, (BLOCK_M, OUT_BLOCK_N), SCATTER_SHARED_LAYOUT
-        )
-        out_smem.store(out)
-
-        y_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+        y_desc = gl.amd.cdna5.tdm.make_tensor_descriptor(
             base=Y_ptr,
             shape=(writeback_size, yN),
             strides=(stride_y_m, stride_y_n),
             block_shape=(BLOCK_M, OUT_BLOCK_N),
-            layout=SCATTER_SHARED_LAYOUT,
+            layout=OUTPUT_SHARED_LAYOUT,
         )
 
-        col_offset = (OUT_BLOCK_N * pid_n).to(cfg.index_type)
-        y_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
+        # TDM descriptor offsets do not support i64
+        col_offset = OUT_BLOCK_N * _enforce_wave_uniform_i32(pid_n.to(gl.int32))
+        y_desc_s = gl.amd.cdna5.tdm.update_tensor_descriptor(
             y_desc, add_offsets=[0, col_offset], clamp_bounds=True
         )
-        gl.amd.gfx1250.tdm.async_scatter(y_desc, dst_row_indices, out_smem)
-        gl.amd.gfx1250.tdm.async_wait(0)
+        gl.amd.cdna5.tdm.async_scatter(y_desc_s, dst_row_indices, out_smem)
+        gl.amd.cdna5.tdm.async_wait(0)
     else:
-        offs_y_m = off_m + gl.arange(0, BLOCK_M, gl.SliceLayout(1, BLOCKED_LAYOUT_Y))
-        offs_y_n = OUT_BLOCK_N * pid_n + gl.arange(
-            0, OUT_BLOCK_N, gl.SliceLayout(0, BLOCKED_LAYOUT_Y)
+        y_desc = gl.amd.cdna5.tdm.make_tensor_descriptor(
+            base=Y_ptr + start_m * stride_y_m,
+            shape=(eM, yN),
+            strides=(stride_y_m, stride_y_n),
+            block_shape=(BLOCK_M, OUT_BLOCK_N),
+            layout=OUTPUT_SHARED_LAYOUT,
         )
-        mask_m = offs_y_m < eM
-        mask_n = offs_y_n < yN
-
-        Y_ptr += start_m * stride_y_m
-
-        y_offs = (
-            offs_y_m.to(cfg.index_type)[:, None] * stride_y_m
-            + offs_y_n.to(cfg.index_type)[None, :] * stride_y_n
+        # TDM descriptor offsets do not support i64
+        gl.amd.cdna5.tdm.async_store(
+            y_desc,
+            [off_m.to(gl.int32), (OUT_BLOCK_N * pid_n).to(gl.int32)],
+            out_smem,
         )
-        y_mask = mask_m[:, None] & mask_n[None, :]
-        gl.amd.gfx1250.buffer_store(out, Y_ptr, y_offs, mask=y_mask)
+        gl.amd.cdna5.tdm.async_wait(0)

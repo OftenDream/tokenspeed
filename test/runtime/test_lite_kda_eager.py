@@ -471,7 +471,7 @@ def test_ascend_lite_output_epilogue_graph_replays_updated_values(batch):
 @pytest.mark.parametrize("featurewise", [False, True])
 @pytest.mark.skipif(not _npu_available(), reason="requires an Ascend NPU")
 def test_ascend_registry_runs_scalar_and_featurewise_kda_reference(featurewise):
-    from tokenspeed_kernel.ops.attention import kda_paged_prefill
+    from tokenspeed_kernel.ops.attention.kda import kda_paged_prefill
 
     inputs = _kda_inputs(dtype=torch.bfloat16, device="npu")
     if not featurewise:
@@ -506,7 +506,7 @@ def test_ascend_registry_runs_scalar_and_featurewise_kda_reference(featurewise):
 
 @pytest.mark.skipif(not _npu_available(), reason="requires an Ascend NPU")
 def test_lite_kda_production_shape_prefill_matches_continuous_decode():
-    from tokenspeed.runtime.layers.attention.backends.hybrid_kda import (
+    from tokenspeed.runtime.layers.attention.backends.state.kda import (
         KdaAttnBackend,
     )
 

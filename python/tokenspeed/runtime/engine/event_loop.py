@@ -19,7 +19,9 @@
 # SOFTWARE.
 
 import faulthandler
+import os
 import signal
+import sys
 import threading
 import time
 from collections import deque
@@ -45,7 +47,9 @@ from tokenspeed.runtime.engine.pause import PauseController, PauseHooks
 from tokenspeed.runtime.engine.request_handler import RequestHandler
 from tokenspeed.runtime.engine.scheduler_utils import (
     advance_scheduler,
+    engram_context_len,
     make_config,
+    ngram_inputs_for_forward,
     resolve_dspark_prefix_replay_tokens,
     scheduler_cache_group_pages,
     should_use_overlap_schedule,
@@ -94,23 +98,32 @@ logger = get_colorful_logger(__name__)
 
 
 def maybe_warm_cupti_for_graph_capture() -> None:
-    """Preload CUPTI before any CUDA graph is captured. NVIDIA only.
+    """Preload CUPTI before any CUDA graph is captured. Opt-in.
 
-    A profiler that first attaches AFTER capture invalidates the captured
-    graphs -- every later replay dies with cudaErrorLaunchFailure -- which
-    would forbid runtime ``/start_profile`` on graph-mode servers. One empty
-    profiler session loads CUPTI ahead of every capture, making runtime
-    attach/detach safe.
+    The warm-up guards a hazard reported on older stacks: a profiler that
+    first attaches AFTER capture invalidates the captured graphs -- every
+    later replay dies with cudaErrorLaunchFailure -- which would forbid
+    runtime ``/start_profile`` on graph-mode servers. One empty profiler
+    session loads CUPTI ahead of every capture.
 
-    Both the hazard and the remedy are CUDA-specific. CUPTI is CUDA's
-    profiling interface; ROCm routes torch profiling through roctracer, where
-    this empty warm-up session instead leaves activity collection permanently
-    dead for the life of the process: every subsequent ``/start_profile``
-    returns a trace with ``cpu_op`` entries but zero ``"cat": "kernel"``
-    events, on every rank, in eager and graph mode alike. So skip it on AMD.
+    It is off by default because it defeats its own purpose: the empty session
+    leaves activity collection dead for the life of the process, so every
+    later ``/start_profile`` returns a trace with ``cpu_op`` entries and zero
+    ``"cat": "kernel"`` events, on every rank, in eager and graph mode alike.
+    That was documented for ROCm's roctracer and is CUPTI's behaviour too --
+    on CUDA 13.0 / torch 2.13, 2xGB300 TP8, a profiled decode yields 0 kernel
+    events with the warm-up and 933k across 340 graph replays without it. The
+    hazard did not reproduce there either: all 340 replays ran after the
+    attach with no launch failure.
+
+    ``TOKENSPEED_CUPTI_GRAPH_WARMUP=1`` restores it on a stack that still
+    needs it, at the cost of GPU profiling. AMD ignores that request: on
+    roctracer the warm-up has the same cost and no upside.
     """
     from tokenspeed_kernel.platform import current_platform
 
+    if not envs.TOKENSPEED_CUPTI_GRAPH_WARMUP.get():
+        return
     if not torch.cuda.is_available() or current_platform().is_amd:
         return
 
@@ -174,6 +187,14 @@ class EventLoop:
             self.in_flight_depth = server_args.mapping.pp_size
         else:
             self.in_flight_depth = int(self.use_overlap_schedule)
+
+        self._ngram_context_len = engram_context_len(self.model_config.hf_text_config)
+        if self._ngram_context_len and (
+            server_args.mapping.has_pp or self.in_flight_depth > 1
+        ):
+            raise NotImplementedError(
+                "Engram input history requires PP=1 and in-flight depth <= 1"
+            )
 
         decode_input_tokens = (
             server_args.speculative_num_draft_tokens
@@ -297,7 +318,6 @@ class EventLoop:
             prefix_granularity=geometry.prefix_granularity,
             num_host_pages=num_host_pages,
             disable_l2_cache=not server_args.enable_kvstore,
-            enable_l3_storage=server_args.kvstore_storage_backend is not None,
             role=server_args.disaggregation_mode,
             enable_kv_cache_events=self._kv_events_enabled,
             decode_input_tokens=decode_input_tokens,
@@ -813,7 +833,7 @@ class EventLoop:
         self._dp_local_info[0, 0] = num_tokens
         self._dp_local_info[0, 1] = batch_size
         self._dp_local_info[0, 2] = int(forward_mode)
-        dist.all_gather_into_tensor(
+        dist.all_gather_single(
             self._dp_global_info,
             self._dp_local_info,
             group=self.world_cpu_group,
@@ -848,12 +868,12 @@ class EventLoop:
         return len(self.output_processor.rid_to_state)
 
     def _get_scheduler_stats(self):
-        available = self.scheduler.available_kv_pages()
-        active = self.scheduler.active_kv_pages()
+        empty = self.scheduler.empty_lcm_blocks()
+        active = self.scheduler.active_lcm_blocks()
         return {
             "num_active_pages": active,
             "num_cached_pages": (
-                self._scheduler_cache_geometry.num_usable_pages - available
+                self._scheduler_cache_geometry.num_usable_pages - empty - active
             ),
             "num_queue_reqs": self.scheduler.waiting_size(),
         }
@@ -1003,6 +1023,11 @@ class EventLoop:
                         request_history_seeds = self._gather_request_history_seeds(
                             forward_op
                         )
+                        ngram_inputs = ngram_inputs_for_forward(
+                            forward_op,
+                            self.output_processor.rid_to_state,
+                            self._ngram_context_len,
+                        )
 
                         if in_flight and self._dispatch_depends_on_pending_commit(
                             forward_op, grammar_inputs
@@ -1016,6 +1041,7 @@ class EventLoop:
                             sampling_params_list=sampling_params_list,
                             dp_metadata=dp_metadata,
                             grammar_inputs=grammar_inputs,
+                            ngram_inputs=ngram_inputs,
                             multimodal_context=(
                                 multimodal_context_for_forward(
                                     forward_op, self.output_processor.rid_to_state
@@ -1193,7 +1219,15 @@ def run_event_loop(
 
     event_loop = None
     shutdown_event = threading.Event()
+    received_signal = None
     previous_sigterm_handler = None
+
+    def request_shutdown(signum, _frame):
+        nonlocal received_signal
+        # Defer logging until outside the signal handler (logging takes locks).
+        received_signal = signum
+        shutdown_event.set()
+
     try:
         if server_args.disaggregation_mode == "encode":
             # The encode role is LM-free; run the lightweight vision-tower loop
@@ -1209,10 +1243,7 @@ def run_event_loop(
         # scheduler iteration and ordinary runtime cleanup can finish.
         if threading.current_thread() is threading.main_thread():
             previous_sigterm_handler = signal.getsignal(signal.SIGTERM)
-            signal.signal(
-                signal.SIGTERM,
-                lambda _signum, _frame: shutdown_event.set(),
-            )
+            signal.signal(signal.SIGTERM, request_shutdown)
 
         maybe_warm_cupti_for_graph_capture()
 
@@ -1251,6 +1282,17 @@ def run_event_loop(
         logger.error("Scheduler hit an exception: %s", traceback)
         parent_process.send_signal(signal.SIGUSR1)
     finally:
+        # SystemExit/KeyboardInterrupt bypass the Exception handler above;
+        # report their traceback without swallowing or changing the exit status.
+        exception_info = sys.exc_info()
+        logger.warning(
+            "Scheduler exiting: rank=%d pid=%d shutdown_requested=%s signal=%s",
+            global_rank,
+            os.getpid(),
+            shutdown_event.is_set(),
+            received_signal,
+            exc_info=exception_info if exception_info[0] is not None else None,
+        )
         if event_loop is not None:
             try:
                 event_loop.close()

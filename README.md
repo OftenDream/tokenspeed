@@ -6,15 +6,12 @@ TokenSpeed is a speed-of-light LLM inference engine designed for **agentic workl
 
 Core components:
 
-- **Modeling layer**: local-SPMD design with a static compiler that generates
-  collective communication from module-boundary placement annotations, so users
-  do not hand-write parallelism logic.
 - **Scheduler**: C++ control plane and Python execution plane. Request
   lifecycle, KV cache ownership, and overlap timing are encoded as a
   finite-state machine, with safe KV resource reuse enforced by the type system at compile time.
 - **Kernels**: pluggable, layered kernel system with a portable public API and
   a centralized registry including one of the fastest **MLA**
-  (Multi-head Latent Attention) implementations on Blackwell for agentic workload.
+  (Multi-head Latent Attention) implementations on Blackwell for agentic workloads.
 - **Entrypoint**: SMG-integrated AsyncLLM for low-overhead CPU-side request
   handling.
 
@@ -26,8 +23,11 @@ TokenSpeed takes a fundamentally different architectural approach from existing 
 >
 > TokenSpeed also treats kernels as a first-class, modular subsystem, separating them from the core engine through a portable public API, centralized registry and selection model, and an extensible plugin mechanism for heterogeneous accelerators.
 
+More importantly, TokenSpeed is the **Switzerland** of open-source LLM inference engines: neutral because it's backed by the non-profit [LightSeek Foundation](https://lightseek.org/) rather than a commercial company, with **serious hardware and engineering support** from vendors like NVIDIA and AMD.
+
 ## News
 
+- [2026/09] Kimi K3 Optimization on GB300 — Part I. [[blog](https://lightseek.org/blog/kimi-k3-optimization-gb300-part-i.html)]
 - [2026/08] [Qwen3.8 Flash Next](https://developer.nvidia.com/blog/experiment-with-qwen3-8-flash-next-176b-model-on-nvidia-gb300-nvl72-for-agentic-coding/) at Day 0 and [GLM 5.3 Flash](https://huggingface.co/zai-org/GLM-5.3-Flash#serve-glm-53-flash-locally) at Day 0.
 - [2026/08] [Qwen3.8](https://huggingface.co/Qwen/Qwen3.8-2.4T-A95B#serving-qwen38) at Day 0: 2.4T-Scale Inference with TokenSpeed. [[blog](https://lightseek.org/blog/tokenspeed-qwen3-8.html)]
 - [2026/08] TokenSpeed joins the [PyTorch Ecosystem](https://pytorch.org/blog/pytorch-ecosystem-landscape-q3-update/).
@@ -47,7 +47,17 @@ LightSeek's work is advanced by the support of [sponsors and partners](https://l
 
 ## Performance Comparison
 
-<img src="https://raw.githubusercontent.com/lightseekorg/tokenspeed/main/assets/perf/tokenspeed-kimi-k2.5-performance.png" alt="TokenSpeed vs. TensorRT-LLM Pareto curves on agentic workload (Kimi K2.5, B200)" width="800" margin="10px"></img>
+<p align="center">
+  <img
+    src="https://raw.githubusercontent.com/lightseekorg/tokenspeed/main/assets/perf/tokenspeed-kimi-k2.5-performance.png"
+    alt="TokenSpeed vs. TensorRT-LLM Pareto curves on agentic workloads (Kimi K2.5, B200)"
+    width="800"
+  />
+</p>
+
+<p align="center">
+  <em>TokenSpeed vs. TensorRT-LLM Pareto curves on agentic workloads (Kimi K2.5, B200)</em>
+</p>
 
 ## Documentation
 

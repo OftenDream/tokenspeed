@@ -26,71 +26,50 @@ import torch
 
 from tokenspeed.runtime.configs.model_config import ModelConfig
 from tokenspeed.runtime.layers.attention.configs.base import (
-    BaseAttnConfig,
+    AttnConfig,
+    SoftmaxAttnConfig,
+    is_block_drafter,
+    model_wide_kwargs,
+    resolve_cache_layer_types,
     resolve_dtype,
-    resolve_speculative_num_tokens,
 )
 from tokenspeed.runtime.utils.server_args import ServerArgs
 
 
-@dataclass
-class MHAConfig(BaseAttnConfig):
-    # Resolved by the Qwen GDN cache recipe after checking the engine option,
-    # verify width, device, and registered kernel support.
-    replay_ssm: bool = False
-    # Per-layer attention-type labels + window, forwarded to the KV pool for
-    # cache_group_specs publication (empty -> single full-history group).
-    layer_types: tuple[str, ...] = ()
-    sliding_window_tokens: int | tuple[int | None, ...] | None = None
-    max_scheduled_tokens: int = 0
-    # True iff server_args.disaggregation_mode != "null"; cache recipes use
-    # it to stamp transfer policies onto the cache group specs.
-    pd_disaggregation_enabled: bool = False
-    layer_kv_head_counts: tuple[int, ...] | None = None
+@dataclass(kw_only=True)
+class MHAConfig(SoftmaxAttnConfig):
+    # Mixed full+sliding models are ONE component carrying the inherited
+    # per-layer cache_layer_types/window vectors; the per-layer kv-head counts
+    # live on the cache-pool spec (``CachePoolSpec.layer_kv_head_counts``).
+
+    # BLASST skip-softmax sparsity, gluon MHA prefill only (gfx950); see
+    # ServerArgs.skip_softmax_threshold.
+    skip_softmax_threshold: float = 0.0
 
     @classmethod
     def generate(
         cls, server_args: ServerArgs, model_config: ModelConfig, is_draft: bool = False
-    ):
-        kwargs = {}
-        if server_args.speculative_algorithm is not None:
-            kwargs.update(
-                speculative_num_steps=server_args.speculative_num_steps,
-                speculative_num_draft_tokens=resolve_speculative_num_tokens(
-                    server_args, is_draft
-                ),
-            )
+    ) -> AttnConfig:
         kv_cache_dtype = server_args.kv_cache_dtype
-        draft_block_decode = bool(
-            is_draft and server_args.speculative_algorithm in ("DFLASH", "DSPARK")
+        draft_block_decode = is_block_drafter(
+            server_args.speculative_algorithm, is_draft
         )
         if draft_block_decode and server_args.drafter_attention_backend != "trtllm":
             kv_cache_dtype = "bfloat16"
 
-        hf_config = getattr(model_config, "hf_config", None)
-        # cache_layer_types wins: it can carry labels outside transformers' ALLOWED_LAYER_TYPES
-        layer_types = tuple(
-            getattr(hf_config, "cache_layer_types", None)
-            or getattr(hf_config, "layer_types", None)
-            or ()
+        hf_config = model_config.hf_config
+        cache_layer_types = resolve_cache_layer_types(
+            hf_config,
+            num_layers=model_config.num_attention_layers,
+            is_draft=is_draft,
+            draft_block_decode=draft_block_decode,
         )
-        if (
-            is_draft
-            and layer_types
-            and len(layer_types) != model_config.num_attention_layers
-        ):
-            # Target-stack labels don't fit the draft depth; drop so the pool falls back to full attn
-            layer_types = ()
-        sliding_window_tokens = getattr(hf_config, "sliding_window", None)
-        if draft_block_decode:
-            # A block drafter writes its KV at the target's cache locations, so
-            # it cannot carry a retention policy of its own; its window is an
-            # attention mask the draft applies in its own layers.
-            layer_types = ()
-            sliding_window_tokens = None
-        return cls(
-            device=server_args.device,
-            context_len=model_config.context_len + server_args.spec_context_pad,
+        # The retention window belongs to the storage labels: a block drafter
+        # has none of its own (its window is a compute mask on its layers).
+        sliding_window_tokens = (
+            None if draft_block_decode else getattr(hf_config, "sliding_window", None)
+        )
+        spec = cls(
             backend_name=(
                 server_args.attention_backend
                 if not is_draft
@@ -100,34 +79,30 @@ class MHAConfig(BaseAttnConfig):
             num_kv_heads=model_config.num_key_value_heads,
             head_dim=model_config.head_dim,
             attn_tp_size=server_args.attn_tp_size or server_args.mapping.attn.tp_size,
-            dtype=model_config.dtype,
-            kv_cache_dtype=resolve_dtype(kv_cache_dtype),
-            kv_cache_mxfp8=kv_cache_dtype == "mxfp8",
-            prefix_granularity=server_args.prefix_granularity,
-            max_bs=server_args.max_num_seqs
-            // (server_args.data_parallel_size or server_args.mapping.attn.dp_size),
-            max_graph_bs=server_args.max_cudagraph_capture_size,
-            kv_cache_quant_method=server_args.kv_cache_quant_method,
-            is_draft=is_draft,
-            draft_block_decode=draft_block_decode,
-            layer_types=layer_types,
+            cache_layer_types=cache_layer_types,
             sliding_window_tokens=sliding_window_tokens,
-            max_scheduled_tokens=getattr(server_args, "chunked_prefill_size", 8192),
-            pd_disaggregation_enabled=getattr(
-                server_args, "disaggregation_mode", "null"
-            )
-            != "null",
-            **kwargs,
+            skip_softmax_threshold=server_args.skip_softmax_threshold,
+        )
+        return AttnConfig(
+            components=(spec,),
+            **model_wide_kwargs(
+                server_args,
+                model_config,
+                is_draft,
+                kv_cache_dtype=resolve_dtype(kv_cache_dtype),
+                kv_cache_mxfp8=kv_cache_dtype == "mxfp8",
+                draft_block_decode=draft_block_decode,
+            ),
         )
 
-    def cache_cell_size(self) -> int:
+    def cache_cell_size(self, config: AttnConfig) -> int:
         cell = (
             max(self.num_kv_heads // self.attn_tp_size, 1)
             * self.head_dim
             * 2
-            * torch._utils._element_size(self.kv_cache_dtype)
+            * torch._utils._element_size(config.kv_cache_dtype)
         )
-        if self.kv_cache_mxfp8:
+        if config.kv_cache_mxfp8:
             # One UE8M0 byte per 32 fp8 data bytes.
             cell += cell // 32
         return cell

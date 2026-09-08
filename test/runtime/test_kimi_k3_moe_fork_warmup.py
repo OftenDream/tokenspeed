@@ -50,6 +50,7 @@ import sys
 from types import SimpleNamespace
 from unittest import mock
 
+import pytest
 import torch
 
 # CI Registration (parsed via AST, runtime no-op)
@@ -96,18 +97,20 @@ def _make_moe(fork: _SpyFork) -> SimpleNamespace:
 
     plan = SimpleNamespace(
         lane=None,
+        symm_outputs=None,
         split_shared_rs=False,
         routed_in_fork=False,
         defer_finalize=False,
     )
     comm = SimpleNamespace(
-        plan=lambda num_tokens, hs: plan,
+        # Absorb keyword axes so the stub does not pin plan's signature.
+        plan=lambda num_tokens, hs, **_: plan,
         run=lambda *a, **k: hidden,
         reduce_scatter_shared=lambda x: x,
         reduce_project_routed=lambda x: x,
     )
     return SimpleNamespace(
-        _gather_dp_tokens_for_moe=False,
+        mapping=SimpleNamespace(attn=SimpleNamespace(dp_size=1)),
         native_latent_moe=None,
         stream_fork=fork,
         _topk_ready=None,
@@ -121,6 +124,9 @@ def _make_moe(fork: _SpyFork) -> SimpleNamespace:
             torch.zeros(2, 1),
             torch.zeros(2, 1),
         ),
+        # None keeps this on the separate per-module projections, which is the
+        # composition whose fork structure these tests pin.
+        _latent_input_projections=lambda hs, shared_out=None: None,
         shared_experts=lambda hs, down_out=None: hs,
         routed_expert_down_proj=lambda hs: (hs, None),
         experts=SimpleNamespace(_situ_output_buffer=None),
@@ -176,3 +182,7 @@ def test_eager_serving_leaves_the_fork_disabled():
     """Outside the graph phase behaviour is unchanged: no fork, no aux stream."""
     call = _run(graph_phase=False, capture_mode=False)
     assert call["enable"] is False
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))

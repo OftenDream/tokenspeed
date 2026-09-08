@@ -26,6 +26,14 @@ on:
         required: false
         default: 60
         type: number
+      comparison_base_ref:
+        description: "Optional immutable baseline revision for paired tasks"
+        required: false
+        type: string
+      comparison_candidate_ref:
+        description: "Optional immutable candidate revision for paired tasks"
+        required: false
+        type: string
     secrets:
       HF_TOKEN:
         required: false
@@ -41,14 +49,15 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJson(inputs.matrix) }}
     name: ${{ matrix.name }} (${{ matrix.runner }})
-    # `runner` is the platform a task targets, and carries its vendor
-    # classification. `runs_on` is the machine that hosts it, and differs
-    # whenever the target platform is not the host's own hardware.
-    runs-on: ${{ matrix.runs_on || matrix.runner }}
-    timeout-minutes: ${{ inputs.timeout_minutes }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: ${{ matrix.runner == 'amd-mi45x-cpu-test' && 30 || inputs.timeout_minutes }}
     continue-on-error: ${{ matrix.optional }}
     env:
       INSTALL_TOKENSPEED_MLA_FROM_SOURCE: ${{ inputs.install_tokenspeed_mla_from_source }}
+      BASE_REF: ${{ inputs.comparison_base_ref }}
+      CANDIDATE_REF: ${{ inputs.comparison_candidate_ref }}
+      PR_NUMBER: ${{ github.event_name == 'pull_request' && github.event.pull_request.number || '' }}
+      MERGE_SHA: ${{ github.event_name == 'pull_request' && github.sha || '' }}
       # Authenticate model downloads so cold runners do not hit anonymous
       # Hugging Face rate limits while starting `ts serve`.
       HF_TOKEN: ${{ secrets.HF_TOKEN }}
@@ -59,6 +68,8 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.checkout_ref || github.sha }}
+          fetch-depth: ${{ matrix.workflow_stage == 'kernel-benchmark' && '0' || '1' }}
+          persist-credentials: ${{ matrix.workflow_stage != 'kernel-benchmark' }}
           path: run-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.name }}-${{ matrix.runner }}
 
       - name: Set work directory
@@ -66,7 +77,7 @@ jobs:
           echo "WORK_DIR=${{ github.workspace }}/run-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.name }}-${{ matrix.runner }}" >> "$GITHUB_ENV"
 
       - name: Restore MI450 simulator cache
-        if: matrix.runner == 'amd-mi450-sim'
+        if: matrix.runner == 'amd-mi45x-cpu-test'
         id: mi450-simulator-cache
         uses: actions/cache/restore@v4
         with:
@@ -74,7 +85,7 @@ jobs:
             ~/.cache/pip
             ~/.cache/uv
             ${{ runner.temp }}/tokenspeed-mi450-sim
-          key: mi450-sim-${{ runner.os }}-rocjitsu-79f87b82-rocm-20260812-v1
+          key: mi450-sim-${{ runner.os }}-rocjitsu-9083cc2a-rocm-20260822-v1
 
       - name: Install pipeline dependency
         # pypi.org occasionally returns "Content-Type: Unknown" for the simple
@@ -101,7 +112,7 @@ jobs:
             --result-json .ci-artifacts/result.json
 
       - name: Save MI450 simulator cache
-        if: matrix.runner == 'amd-mi450-sim' && steps.mi450-simulator-cache.outputs.cache-hit != 'true'
+        if: matrix.runner == 'amd-mi45x-cpu-test' && steps.mi450-simulator-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
           path: |
@@ -128,7 +139,10 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: pr-test-${{ matrix.name }}-${{ matrix.runner }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ env.WORK_DIR }}/.ci-artifacts/result.json
+          path: |
+            ${{ env.WORK_DIR }}/.ci-artifacts/result.json
+            ${{ env.WORK_DIR }}/.ci-artifacts/published/
+          include-hidden-files: true
 
       - name: Upload task logs on failure
         if: failure()

@@ -376,7 +376,7 @@ def test_ascend_lite_mla_absorbed_extend_crosses_page_boundary():
 @pytest.mark.skipif(not _NPU_AVAILABLE, reason="Ascend NPU is unavailable")
 @pytest.mark.parametrize("lengths", [(73,), (73, 91)])
 def test_ascend_lite_mla_decode_value_gate_and_merge(lengths):
-    from tokenspeed_kernel.ops.attention import mla_decode_with_kvcache
+    from tokenspeed_kernel.ops.attention.mla import mla_decode_with_kvcache
     from tokenspeed_kernel_npu.ops.mla import (
         attn_merge_state,
         mla_project_value,

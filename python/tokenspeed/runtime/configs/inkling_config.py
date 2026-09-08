@@ -22,10 +22,11 @@
 
 Adapted from the Inkling reference implementation. The runtime-facing surface is
 intentionally *scheduler-blind*: the C++ scheduler must see Inkling as a plain
-dense GQA model, so this config MUST NOT define ``mamba2_cache_params`` (or
-any other attribute the engine probes to enable mamba scheduling). The sconv
-rolling state is managed entirely engine-side, keyed on request pool indices
-(see ``tokenspeed.runtime.layers.attention.backends.inkling``).
+dense GQA model, so this config MUST NOT expose a non-empty
+``linear_layer_ids`` (the probe that registers a linear-attention component
+and with it mamba scheduling). The sconv rolling state is managed entirely
+engine-side, keyed on request pool indices
+(see ``tokenspeed.runtime.layers.attention.backends.specific.inkling``).
 
 KV-head note: the checkpoint uses 8 KV heads on full-attention layers and 16
 on sliding-window layers. The KV pools are uniform-head, so the runtime

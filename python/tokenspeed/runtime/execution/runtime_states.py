@@ -24,9 +24,6 @@ from __future__ import annotations
 import torch
 
 from tokenspeed.runtime.execution.request_token_history import RequestTokenHistoryView
-from tokenspeed.runtime.utils import get_colorful_logger
-
-logger = get_colorful_logger(__name__)
 
 
 class RuntimeStates:
@@ -46,6 +43,9 @@ class RuntimeStates:
         self.device = device
         self.vocab_size = vocab_size
         self._request_pool_size = req_pool_size
+        self.ngram_accepted_tokens: torch.Tensor | None = None
+        self.ngram_needs_seed: torch.Tensor | None = None
+        self.ngram_request_ids: list[str | None] = []
 
         self.valid_cache_lengths = torch.zeros(
             req_pool_size + 1, dtype=torch.int32, device=device
@@ -66,12 +66,25 @@ class RuntimeStates:
         self.remote_spec_candidate_ready = torch.zeros(
             req_pool_size + 1, dtype=torch.bool, device=device
         )
-        self.linear_penalties = torch.zeros(
-            (req_pool_size + 1, vocab_size), dtype=torch.float32, device=device
+
+    def init_ngram_state(self, context_len: int) -> None:
+        """Allocate a bounded, newest-first accepted input tail per pool slot.
+
+        ``context_len`` is zero without Engram, three for V4.1. This executor
+        state follows valid_cache_lengths, not sampled output or model KV. It
+        is reseeded from host snapshots on admission/recovery, never transferred
+        or prefix-matched as a backend cache. Returns None.
+        """
+        if context_len == 0:
+            return
+        pool_size = self.valid_cache_lengths.shape[0]
+        self.ngram_accepted_tokens = torch.full(
+            (pool_size, context_len), -1, dtype=torch.int64, device=self.device
         )
-        self.scaling_penalties = torch.ones(
-            (req_pool_size + 1, vocab_size), dtype=torch.float32, device=device
+        self.ngram_needs_seed = torch.ones(
+            pool_size, dtype=torch.bool, device=self.device
         )
+        self.ngram_request_ids = [None] * pool_size
 
     @property
     def has_request_token_history(self) -> bool:
@@ -107,9 +120,15 @@ class RuntimeStates:
         extend_prefix_lens: torch.Tensor,
     ) -> None:
         self.valid_cache_lengths[extend_request_pool_indices] = extend_prefix_lens
-        self.linear_penalties.index_fill_(0, extend_request_pool_indices, 0.0)
-        self.scaling_penalties.index_fill_(0, extend_request_pool_indices, 1.0)
-        self.remote_spec_candidate_ready[extend_request_pool_indices] = False
+        # Scalar indexed assignment stages a CPU tensor and synchronizes CUDA.
+        # Keep the reset ordered on the execution stream without a host wait.
+        self.remote_spec_candidate_ready.index_fill_(
+            0, extend_request_pool_indices, False
+        )
+        if self.ngram_accepted_tokens is not None:
+            assert self.ngram_needs_seed is not None
+            self.ngram_accepted_tokens.index_fill_(0, extend_request_pool_indices, -1)
+            self.ngram_needs_seed.index_fill_(0, extend_request_pool_indices, True)
 
     def seed_request_token_history(
         self,

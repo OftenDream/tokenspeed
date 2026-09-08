@@ -26,7 +26,7 @@ import math
 from typing import Any, Literal
 
 import torch
-from tokenspeed_kernel.ops.attention import mla_normalize_project_query
+from tokenspeed_kernel.ops.attention.mla import mla_normalize_project_query
 from tokenspeed_kernel.platform import current_platform
 from torch import nn
 from torch.nn import functional as F
@@ -265,7 +265,6 @@ class PackedFLASHLocalKDA(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         ctx: Any,
-        out_cache_loc: torch.Tensor,
         comm_manager: Any = None,
         **_kwargs: Any,
     ) -> torch.Tensor:
@@ -286,7 +285,6 @@ class PackedFLASHLocalKDA(nn.Module):
             k=None,
             v=None,
             layer=None,
-            out_cache_loc=out_cache_loc,
             token_to_kv_pool=ctx.token_to_kv_pool,
             forward_mode=ctx.forward_mode,
             bs=ctx.bs,
@@ -483,7 +481,6 @@ class SeparateProjectionKimiLinearMLAAttention(KimiLinearMLAAttention):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         ctx: Any,
-        out_cache_loc: torch.Tensor,
         comm_manager: Any = None,
         block_scale: torch.Tensor | None = None,
         attnres_partial_args: tuple | None = None,
@@ -492,7 +489,6 @@ class SeparateProjectionKimiLinearMLAAttention(KimiLinearMLAAttention):
             positions,
             hidden_states,
             ctx,
-            out_cache_loc,
             comm_manager,
             block_scale,
             attnres_partial_args,

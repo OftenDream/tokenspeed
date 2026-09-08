@@ -37,33 +37,69 @@ from tokenspeed.runtime.models.longcat_dsa import (
 )
 
 
+def test_sparse_decode_uses_backend_owned_write_locations() -> None:
+    query = torch.ones(1, 1, 2)
+    locations = torch.tensor([7], dtype=torch.int32)
+    topk = torch.tensor([[0]], dtype=torch.int32)
+    lengths = torch.tensor([1], dtype=torch.int32)
+    ctx = SimpleNamespace()
+    calls = []
+
+    def attention(q, k, v, context, save_kv_cache=True, **kwargs):
+        calls.append((context, save_kv_cache, kwargs))
+        return q
+
+    def project(q, latent, positions, context, write_locations):
+        assert write_locations is locations
+        return q, latent
+
+    layer = SimpleNamespace(
+        forward_absorb_qkv_proj=project,
+        attention_backend="mla",
+        _MLA_KERNEL_BACKENDS=("mla",),
+        attn_mqa=attention,
+        kv_lora_rank=2,
+        num_local_heads=1,
+        v_head_dim=2,
+        w_vc=torch.eye(2).unsqueeze(0),
+    )
+    output = torch.empty(1, 2)
+    LongCatDSAAttention._forward_sparse_decode(
+        layer, torch.tensor([0]), query, query, ctx, locations, output, topk, lengths
+    )
+    torch.testing.assert_close(output, torch.ones_like(output))
+    assert calls == [(ctx, False, {"topk_indices": topk, "topk_lens": lengths})]
+
+
 def test_dsa_outer_backend_wraps_explicit_dense_backend(monkeypatch) -> None:
-    config = SimpleNamespace(
+    spec = SimpleNamespace(
         backend_name="trtllm_mla",
         indexer_layer_ids=frozenset({0}),
     )
+    config = SimpleNamespace(component=lambda _cls: spec)
     selections = []
 
     class FakeDSABackend:
         def __init__(self, received_config) -> None:
             self.config = received_config
 
-    def get_backend_cls(name, arch):
+    def create_backend(name, arch, received_config):
         selections.append((name, arch))
-        return FakeDSABackend
+        return FakeDSABackend(received_config)
 
-    monkeypatch.setattr(registry, "_get_backend_cls", get_backend_cls)
+    monkeypatch.setattr(registry, "_create_attn_backend_with_name", create_backend)
 
     backend = registry._create_attn_backend(AttentionArch.DSA, config)
 
     assert selections == [("dsa", AttentionArch.DSA)]
     assert backend.config is config
-    assert config.backend_name == "trtllm_mla"
+    assert spec.backend_name == "trtllm_mla"
 
-    unrelated_config = SimpleNamespace(
+    unrelated_spec = SimpleNamespace(
         backend_name="trtllm_mla",
         indexer_layer_ids=None,
     )
+    unrelated_config = SimpleNamespace(component=lambda _cls: unrelated_spec)
     registry._create_attn_backend(AttentionArch.DSA, unrelated_config)
     assert selections[-1] == ("trtllm_mla", AttentionArch.DSA)
 

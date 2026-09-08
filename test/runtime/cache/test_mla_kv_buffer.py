@@ -33,6 +33,7 @@ from tokenspeed_kernel.ops.embedding import (
 )
 from tokenspeed_kernel.ops.kvcache.triton import (
     get_mla_kv_buffer_triton,
+    mla_latent_norm_rope_scatter,
     set_mla_kv_buffer_triton,
 )
 
@@ -65,6 +66,13 @@ N_LOC_ALL = N_LOC_SMALL + N_LOC_LARGE
 
 def _bitwise_equal(a: torch.Tensor, b: torch.Tensor) -> bool:
     return torch.equal(a.view(torch.uint8), b.view(torch.uint8))
+
+
+def _assert_fp8_rounding(actual: torch.Tensor, expected: torch.Tensor) -> None:
+    # E4M3FN rounds by at most half its mantissa step (2**-3), or half
+    # its smallest subnormal (2**-9). Compare against FP32, since the
+    # portable split RoPE path rounds through BF16 before converting to FP8.
+    torch.testing.assert_close(actual.float(), expected, rtol=2**-4, atol=2**-10)
 
 
 def _make_inputs(n_loc: int, dtype: torch.dtype, pattern: str, seed: int = 0):
@@ -169,6 +177,83 @@ def test_set_casts_bf16_sources_into_fp8_buffer(n_loc, pattern):
     set_mla_kv_buffer_triton(kv, loc, k_nope, k_rope)
     torch.cuda.synchronize()
 
+    assert _bitwise_equal(kv, ref)
+
+
+@pytest.mark.parametrize("n_loc", [4, 600])
+@pytest.mark.parametrize(
+    ("nope_dtype", "rope_dtype"),
+    [
+        (torch.bfloat16, torch.float8_e4m3fn),
+        (torch.float8_e4m3fn, torch.bfloat16),
+    ],
+)
+def test_set_casts_mixed_sources_into_fp8_buffer(n_loc, nope_dtype, rope_dtype):
+    """Both dispatch branches accept independently typed cache components."""
+    loc, k_nope, _ = _make_inputs(n_loc, nope_dtype, "rand")
+    _, _, k_rope = _make_inputs(n_loc, rope_dtype, "rand", seed=1)
+    kv = _empty_kv(torch.float8_e4m3fn)
+    ref = _torch_set_reference(
+        kv,
+        loc,
+        k_nope.to(torch.float8_e4m3fn),
+        k_rope.to(torch.float8_e4m3fn),
+    )
+
+    set_mla_kv_buffer_triton(kv, loc, k_nope, k_rope)
+    torch.cuda.synchronize()
+
+    assert _bitwise_equal(kv, ref)
+
+
+def test_pool_scatter_quantizes_without_materializing_fp8_sources(monkeypatch):
+    import tokenspeed.runtime.layers.attention.kv_cache.mla as mla_pool_module
+
+    pool = object.__new__(MLATokenToKVPool)
+    pool.quant_method = "none"
+    pool.dtype = torch.float8_e4m3fn
+    pool.store_dtype = torch.uint8
+    pool.latent_write_sanitizes = False
+    storage = torch.empty(8, TOTAL_DIM, device="cuda", dtype=torch.uint8)
+    pool.kv_buffer = [storage]
+    k_nope = torch.randn(2, 1, NOPE_DIM, device="cuda", dtype=torch.bfloat16)
+    k_rope = torch.randn(2, 1, ROPE_DIM, device="cuda", dtype=torch.bfloat16)
+    loc = torch.tensor([1, 3], device="cuda", dtype=torch.int64)
+    captured = {}
+
+    def capture(kv_buffer, cache_loc, cache_k_nope, cache_k_rope, **kwargs):
+        captured.update(
+            kv_buffer=kv_buffer,
+            cache_loc=cache_loc,
+            cache_k_nope=cache_k_nope,
+            cache_k_rope=cache_k_rope,
+            kwargs=kwargs,
+        )
+
+    monkeypatch.setattr(mla_pool_module, "set_mla_kv_buffer_triton", capture)
+    layer = type("Layer", (), {"layer_id": 0})()
+    pool.set_mla_kv_buffer(layer, loc, k_nope, k_rope)
+
+    assert captured["kv_buffer"].dtype == torch.float8_e4m3fn
+    assert captured["kv_buffer"].untyped_storage().data_ptr() == storage.data_ptr()
+    assert captured["cache_loc"] is loc
+    assert captured["cache_k_nope"] is k_nope
+    assert captured["cache_k_rope"] is k_rope
+
+
+@pytest.mark.parametrize("n_loc", [4, 600])
+def test_set_supports_zero_width_rope_with_int32_locations(n_loc):
+    loc = torch.arange(n_loc, device="cuda", dtype=torch.int32)
+    k_nope = torch.randn(n_loc, 1, NOPE_DIM, device="cuda", dtype=torch.bfloat16)
+    k_rope = torch.empty(n_loc, 1, 0, device="cuda", dtype=torch.bfloat16)
+    kv = torch.full((n_loc + 8, NOPE_DIM), 7.5, device="cuda", dtype=torch.bfloat16)
+    ref = kv.clone()
+    ref[loc.long()] = k_nope[:, 0]
+
+    set_mla_kv_buffer_triton(kv, loc, k_nope, k_rope)
+    torch.cuda.synchronize()
+
+    assert loc.dtype == torch.int32
     assert _bitwise_equal(kv, ref)
 
 
@@ -343,7 +428,8 @@ def test_mla_rope_set_kv_buffer_matches_reference(is_neox, loc_dtype):
     torch.testing.assert_close(kv[loc.long()], kv_ref[loc.long()], atol=0.01, rtol=0.01)
 
 
-def test_mla_rope_set_kv_buffer_fp8_matches_two_kernel_path() -> None:
+def test_mla_rope_set_kv_buffer_fp8_matches_fp32_reference() -> None:
+    """Fused and split RoPE paths stay within the FP8 rounding bound."""
     torch.manual_seed(0)
     n_loc = 17
     num_heads = 3
@@ -386,8 +472,17 @@ def test_mla_rope_set_kv_buffer_fp8_matches_two_kernel_path() -> None:
     )
     torch.cuda.synchronize()
 
-    assert _bitwise_equal(query, query_ref)
-    assert _bitwise_equal(kv[loc], key_ref[:, 0])
+    assert _bitwise_equal(query[..., :NOPE_DIM], query_ref[..., :NOPE_DIM])
+    assert _bitwise_equal(kv[loc, :NOPE_DIM], key_ref[:, 0, :NOPE_DIM])
+    q_rope_ref = _rotate_rope_reference(q_rope.float(), cos_sin, positions, True)
+    k_rope_ref = _rotate_rope_reference(k_rope.float(), cos_sin, positions, True)
+    for actual, expected in (
+        (query[..., NOPE_DIM:], q_rope_ref),
+        (query_ref[..., NOPE_DIM:], q_rope_ref),
+        (kv[loc, NOPE_DIM:], k_rope_ref[:, 0]),
+        (key_ref[:, 0, NOPE_DIM:], k_rope_ref[:, 0]),
+    ):
+        _assert_fp8_rounding(actual, expected)
 
 
 @pytest.mark.parametrize("n_loc", [1, 17, 600])
@@ -442,10 +537,8 @@ def test_mla_set_kv_nope_matches_two_kernel_path(n_loc: int) -> None:
 
 @pytest.mark.parametrize("n_loc", [4, 600])
 @pytest.mark.parametrize("has_rope", [False, True])
-def test_fused_sanitize_matches_the_split_path_bytes(
-    n_loc: int, has_rope: bool
-) -> None:
-    """A sanitizing fused write lands the same latent bytes as the split path.
+def test_fused_sanitize_matches_the_split_path(n_loc: int, has_rope: bool) -> None:
+    """Fused writes preserve sanitization and FP8 accuracy of the split path.
 
     This is the property that lets Kimi-K3's pool declare
     ``latent_write_sanitizes`` instead of overriding the latent write: the
@@ -520,7 +613,29 @@ def test_fused_sanitize_matches_the_split_path_bytes(
 
     assert not torch.isnan(kv[loc.cpu()].float()).any()
     assert torch.isfinite(kv[loc.cpu()].float()).all()
-    assert _bitwise_equal(kv, kv_ref)
+    if not has_rope:
+        assert _bitwise_equal(kv, kv_ref)
+        return
+
+    # NoPE values and untouched slots still have an exact byte contract.
+    assert _bitwise_equal(kv[:, :NOPE_DIM], kv_ref[:, :NOPE_DIM])
+    untouched = torch.ones(NUM_PAGES, device="cuda", dtype=torch.bool)
+    untouched[loc] = False
+    assert _bitwise_equal(kv[untouched, NOPE_DIM:], kv_ref[untouched, NOPE_DIM:])
+
+    rope_ref = _rotate_rope_reference(k_rope.float(), cos_sin_cache, positions, False)[
+        :, 0
+    ]
+    finite = torch.isfinite(rope_ref)
+    actual_rope = kv[loc, NOPE_DIM:]
+    split_rope = kv_ref[loc, NOPE_DIM:]
+    # Non-finite inputs must produce exactly the split path's sanitized bytes.
+    assert torch.equal(
+        actual_rope.view(torch.uint8)[~finite],
+        split_rope.view(torch.uint8)[~finite],
+    )
+    for output in (actual_rope, split_rope):
+        _assert_fp8_rounding(output.float()[finite], rope_ref[finite])
 
 
 def _fake_mla_pool(dtype: torch.dtype = torch.float8_e4m3fn) -> MLATokenToKVPool:
@@ -722,3 +837,64 @@ def test_fused_write_follows_a_strided_cache_loc(n_loc: int) -> None:
 
     assert _bitwise_equal(query_strided, query_packed)
     assert _bitwise_equal(kv_strided[packed_loc], kv_packed[packed_loc])
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+@pytest.mark.parametrize("is_neox", [True, False])
+@pytest.mark.parametrize("sanitize", [False, True])
+def test_stacked_latent_write_matches_norm_rope_then_scatter(dtype, is_neox, sanitize):
+    """The DFlash MLA context write folds three steps into one launch.
+
+    The inputs are finite and within range, so sanitizing must leave every
+    stored byte where the unsanitized write puts it.
+    """
+    torch.manual_seed(0)
+    n_layers, n_loc, n_slots, eps_value = 3, 12, 64, 1e-6
+    latent = torch.randn(
+        n_loc, n_layers, TOTAL_DIM, device="cuda", dtype=torch.bfloat16
+    )
+    norm_weight = torch.randn(n_layers, NOPE_DIM, device="cuda", dtype=torch.bfloat16)
+    eps = torch.full((n_layers,), eps_value, device="cuda")
+    cos_sin = torch.randn(256, ROPE_DIM, device="cuda", dtype=torch.float32)
+    positions = torch.randint(256, (n_loc,), device="cuda")
+    loc = torch.randperm(n_slots, device="cuda")[:n_loc].to(torch.int32)
+    sentinel = torch.full(
+        (n_slots, TOTAL_DIM), 7.5, device="cuda", dtype=torch.bfloat16
+    ).to(dtype)
+    buffers = [sentinel.clone() for _ in range(n_layers)]
+
+    mla_latent_norm_rope_scatter(
+        latent,
+        norm_weight,
+        eps,
+        cos_sin,
+        positions,
+        loc,
+        torch.tensor([b.data_ptr() for b in buffers], dtype=torch.int64, device="cuda"),
+        buffers[0].stride(0),
+        dtype,
+        is_neox=is_neox,
+        sanitize=sanitize,
+    )
+
+    tolerance = 0.08 if dtype == torch.float8_e4m3fn else 0.02
+    for layer in range(n_layers):
+        nope = latent[:, layer, :NOPE_DIM].float()
+        normed = nope * torch.rsqrt(nope.pow(2).mean(-1, keepdim=True) + eps_value)
+        rope = _rotate_rope_reference(
+            latent[:, layer, NOPE_DIM:].float().unsqueeze(1),
+            cos_sin,
+            positions,
+            is_neox,
+        ).squeeze(1)
+        expected = sentinel.float()
+        expected[loc.long()] = torch.cat(
+            (normed * norm_weight[layer].float(), rope), dim=-1
+        )
+        torch.testing.assert_close(
+            buffers[layer].float(), expected, atol=tolerance, rtol=tolerance
+        )
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))

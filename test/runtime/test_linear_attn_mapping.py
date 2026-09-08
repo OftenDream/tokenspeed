@@ -262,5 +262,130 @@ class TestLinearAttnServerArgs(unittest.TestCase):
         self.assertTrue(linear.use_all_reduce(is_moe=True))
 
 
+class TestLinearAttnConfig(unittest.TestCase):
+    """LinearAttnConfig.generate: presence detection + unified geometry."""
+
+    @staticmethod
+    def _server_args(tp_size=1):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(
+            mapping=SimpleNamespace(linear_attn=SimpleNamespace(tp_size=tp_size))
+        )
+
+    @staticmethod
+    def _model(text_config):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(hf_config=SimpleNamespace(text_config=text_config))
+
+    def test_kimi_k3_geometry(self):
+        from tokenspeed.runtime.configs.kimi_k3_config import KimiLinearConfig
+        from tokenspeed.runtime.layers.attention.configs.linear_attn import (
+            LinearAttnConfig,
+        )
+
+        text_config = KimiLinearConfig()
+        spec = LinearAttnConfig.generate(
+            self._server_args(tp_size=8), self._model(text_config)
+        )
+        self.assertIsNotNone(spec)
+        self.assertEqual((spec.num_k_heads, spec.num_v_heads), (96, 96))
+        self.assertEqual((spec.head_k_dim, spec.head_v_dim), (128, 128))
+        self.assertEqual(spec.conv_kernel_size, 4)
+        self.assertEqual(spec.layer_ids, tuple(text_config.linear_layer_ids))
+        self.assertEqual(len(spec.layer_ids), 69)
+        self.assertEqual(spec.tp_size, 8)
+
+    def test_qwen35_gdn_geometry(self):
+        from tokenspeed.runtime.configs.qwen3_5_text_base_config import (
+            Qwen3_5BaseTextConfig,
+        )
+        from tokenspeed.runtime.layers.attention.configs.linear_attn import (
+            LinearAttnConfig,
+        )
+
+        # Real GDN checkpoints carry full_attention_interval; the bare base
+        # config has no linear layers (and generate correctly returns None
+        # for it — covered by test_non_hybrid_model_gets_none).
+        text_config = Qwen3_5BaseTextConfig(full_attention_interval=4)
+        spec = LinearAttnConfig.generate(self._server_args(), self._model(text_config))
+        self.assertIsNotNone(spec)
+        self.assertEqual((spec.num_k_heads, spec.num_v_heads), (16, 32))
+        self.assertEqual((spec.head_k_dim, spec.head_v_dim), (128, 128))
+        self.assertEqual(spec.layer_ids, tuple(text_config.linear_layer_ids))
+        # Every 4th layer is full attention, so index 3 is not a linear layer.
+        self.assertIn(0, spec.layer_ids)
+        self.assertNotIn(3, spec.layer_ids)
+        # Asymmetric-head state shapes: conv covers q/k (key geometry) + v.
+        self.assertEqual(
+            spec.conv_state_shape,
+            (2 * 16 * 128 + 32 * 128, spec.conv_kernel_size - 1),
+        )
+        self.assertEqual(spec.temporal_state_shape, (32, 128, 128))
+
+    def test_glm53_flash_kda_geometry(self):
+        from tokenspeed.runtime.configs.glm53_flash_config import (
+            Glm53FlashTextConfig,
+        )
+        from tokenspeed.runtime.layers.attention.configs.linear_attn import (
+            LinearAttnConfig,
+        )
+
+        text_config = Glm53FlashTextConfig(num_hidden_layers=4)
+        spec = LinearAttnConfig.generate(
+            self._server_args(tp_size=4), self._model(text_config)
+        )
+
+        self.assertIsNotNone(spec)
+        self.assertEqual(spec.layer_ids, (0, 1, 2))
+        self.assertEqual(spec.conv_state_shape, (3 * 64 * 128 // 4, 3))
+        self.assertEqual(spec.temporal_state_shape, (64 // 4, 128, 128))
+
+    def test_non_hybrid_model_gets_none(self):
+        from types import SimpleNamespace
+
+        from tokenspeed.runtime.layers.attention.configs.linear_attn import (
+            LinearAttnConfig,
+        )
+
+        plain = SimpleNamespace()  # no linear_layer_ids at all
+        self.assertIsNone(
+            LinearAttnConfig.generate(self._server_args(), self._model(plain))
+        )
+
+    def test_indivisible_heads_raise(self):
+        from tokenspeed.runtime.configs.kimi_k3_config import KimiLinearConfig
+        from tokenspeed.runtime.layers.attention.configs.linear_attn import (
+            LinearAttnConfig,
+        )
+
+        with self.assertRaises(ValueError):
+            LinearAttnConfig.generate(
+                self._server_args(tp_size=5), self._model(KimiLinearConfig())
+            )
+
+    def test_registered_alongside_family_configs(self):
+        # Hybrid architectures declare their linear component in the registry
+        # table, the same registration pattern as _CONFIG_CLS.
+        from tokenspeed.runtime.layers.attention.configs.linear_attn import (
+            LinearAttnConfig,
+        )
+        from tokenspeed.runtime.layers.attention.registry import _LINEAR_ATTN_CLS
+
+        self.assertIs(
+            _LINEAR_ATTN_CLS["KimiK3ForConditionalGeneration"], LinearAttnConfig
+        )
+        self.assertIs(_LINEAR_ATTN_CLS["Qwen3_5MoeForCausalLM"], LinearAttnConfig)
+        self.assertIs(
+            _LINEAR_ATTN_CLS["Glm53FlashForConditionalGeneration"],
+            LinearAttnConfig,
+        )
+        self.assertNotIn(
+            "Glm53FlashForConditionalGenerationNextN",
+            _LINEAR_ATTN_CLS,
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

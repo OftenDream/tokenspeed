@@ -42,7 +42,6 @@ from tokenspeed_kernel.ops.sampling.triton import (
     gather_and_expand_scalars,
     min_p_renorm_prob,
 )
-from tokenspeed_kernel.torch_compile import get_compiler_backend
 
 from tokenspeed.runtime.sampling.backends.base import (
     SPECULATIVE_ACCEPT_THRESHOLD_ACC,
@@ -197,7 +196,6 @@ class FlashInferFullSamplingBackend(FlashInferSamplingBackend):
     # ------------------------------------------------------------------
 
     @nvtx_range("sampling:penalties", color="yellow")
-    @torch.compile(dynamic=True, backend=get_compiler_backend())
     def _apply_penalties_and_bias(
         self,
         logits: torch.Tensor,
@@ -248,7 +246,6 @@ class FlashInferFullSamplingBackend(FlashInferSamplingBackend):
         return logits
 
     @nvtx_range("sampling:accum_counts", color="yellow")
-    @torch.compile(dynamic=True, backend=get_compiler_backend())
     def _accumulate_counts(
         self,
         pool_idx: torch.Tensor,
@@ -433,8 +430,11 @@ class FlashInferFullSamplingBackend(FlashInferSamplingBackend):
 
         target_probs = target_probs.reshape(bs, num_tokens_per_req, -1)
 
-        coins = self._coins_buf[:bs, :num_tokens_per_req]
-        coins_for_final_sampling = self._final_coins_buf[:bs]
+        # Coins were filled in the step's full batch order; a MIXED round's
+        # verify sees only the decode suffix (see FlashInferSamplingBackend).
+        row0 = sampling_info.batch_row_offset
+        coins = self._coins_buf[row0 : row0 + bs, :num_tokens_per_req]
+        coins_for_final_sampling = self._final_coins_buf[row0 : row0 + bs]
 
         chain_speculative_sampling_target_only(
             predicts=predict,

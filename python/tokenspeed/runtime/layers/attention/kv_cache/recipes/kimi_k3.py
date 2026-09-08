@@ -35,8 +35,11 @@ from functools import cached_property
 import torch
 from typing_extensions import override
 
+from tokenspeed.runtime.layers.attention.configs.linear_attn import (
+    LinearAttnConfig,
+)
+from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.base import (
-    CacheGroupDeclaration,
     CacheRecipe,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
@@ -51,6 +54,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     FULL_ATTENTION,
     LINEAR_ATTENTION,
+    CacheGroupDeclaration,
 )
 
 _KIMI_K3_LAYERS = 93
@@ -84,10 +88,9 @@ class KimiK3Recipe(CacheRecipe):
 
     # ---- layer vocabulary ----
 
-    @cached_property
+    @property
     def _text_config(self):
-        hf_config = self.model_config.hf_config
-        return getattr(hf_config, "text_config", hf_config)
+        return self.model_config.hf_text_config
 
     @cached_property
     def target_group_ids(self) -> tuple[str, ...]:
@@ -118,8 +121,9 @@ class KimiK3Recipe(CacheRecipe):
             or len(full_layer_ids) != _KIMI_K3_MLA_LAYERS
         ):
             raise ValueError(
-                "93-layer Kimi-K3 requires 69 KDA and 24 MLA layers, got "
-                f"{len(kda_layer_ids)} and {len(full_layer_ids)}"
+                f"{_KIMI_K3_LAYERS}-layer Kimi-K3 requires "
+                f"{_KIMI_K3_KDA_LAYERS} KDA and {_KIMI_K3_MLA_LAYERS} MLA "
+                f"layers, got {len(kda_layer_ids)} and {len(full_layer_ids)}"
             )
         if len(kda_layer_ids) % _KIMI_K3_STATE_GROUPS:
             raise ValueError(
@@ -189,10 +193,12 @@ class KimiK3Recipe(CacheRecipe):
 
     @cached_property
     def _kda_shapes(self):
-        """(conv shape, recurrent shape) per rank, validated against tp size."""
-        tp_size = self.server_args.mapping.linear_attn.tp_size
-        if tp_size <= 0:
-            raise ValueError(f"tp_size must be positive, got {tp_size}")
+        """(conv shape, recurrent shape) per rank, from the linear component.
+
+        Geometry, TP width, and divisibility validation live on
+        ``LinearAttnConfig`` (sourced from ``mapping.linear_attn``); the
+        recipe only validates the cache-dtype contract around them.
+        """
         cache_dtype = self.attn_config.kv_cache_dtype
         if cache_dtype not in (torch.float8_e4m3fn, torch.bfloat16):
             raise ValueError(
@@ -203,18 +209,10 @@ class KimiK3Recipe(CacheRecipe):
             raise ValueError("Kimi-K3 cache does not support per_token_head MLA cache")
         if getattr(self._text_config, "mla_use_nope", None) is not True:
             raise ValueError("Kimi-K3 cache requires mla_use_nope=True")
-        linear = self._text_config.linear_attn_config
-        num_heads = int(linear["num_heads"])
-        head_dim = int(linear["head_dim"])
-        kernel_size = int(linear["short_conv_kernel_size"])
-        if num_heads % tp_size:
-            raise ValueError(
-                f"KDA num_heads={num_heads} must be divisible by tp_size={tp_size}"
-            )
-        return (
-            (3 * num_heads * head_dim // tp_size, kernel_size - 1),
-            (num_heads // tp_size, head_dim, head_dim),
-        )
+        linear_attn = self.attn_config.component(LinearAttnConfig)
+        if linear_attn is None:
+            raise ValueError("Kimi-K3 cache requires a linear-attention component")
+        return (linear_attn.conv_state_shape, linear_attn.temporal_state_shape)
 
     @override
     def fields_for_layer(
@@ -227,7 +225,8 @@ class KimiK3Recipe(CacheRecipe):
                 if layer_id < self.num_target_layers
                 else self.draft_attn_config
             )
-            latent_width = config.kv_lora_rank + config.qk_rope_head_dim
+            spec = config.component(MLAConfig)
+            latent_width = spec.kv_lora_rank + spec.qk_rope_head_dim
             return (
                 CacheFieldSpec(
                     f"layer.{layer_id}.latent_kv",
@@ -308,14 +307,19 @@ class KimiK3Recipe(CacheRecipe):
         """Whether verify commits by replaying from one conv checkpoint row."""
         if self.server_args.speculative_algorithm is None:
             return False
-        from tokenspeed_kernel.ops.attention import (
+        from tokenspeed_kernel.ops.attention.kda import (
             kda_recurrent_layout,
             kda_replay_commit_supported,
         )
 
+        _, recurrent_shape = self._kda_shapes
+        heads, head_dim, _ = recurrent_shape
         return bool(
             kda_replay_commit_supported(
-                self.attn_config.dtype, recurrent_layout=kda_recurrent_layout()
+                self.attn_config.dtype,
+                recurrent_layout=kda_recurrent_layout(),
+                num_heads=heads,
+                head_dim=head_dim,
             )
         )
 
@@ -325,14 +329,18 @@ class KimiK3Recipe(CacheRecipe):
         if self.server_args.speculative_algorithm is None:
             return 0
         if self.replay_kda:
+            conv_shape, recurrent_shape = self._kda_shapes
+            heads, head_dim, _ = recurrent_shape
             # Replay starts from the committed convolution checkpoint and
             # reconstructs the accepted recurrent state.
-            from tokenspeed_kernel.ops.attention import (
+            from tokenspeed_kernel.ops.attention.kda import (
                 kda_batched_replay_uses_raw_gate,
             )
 
             replay_uses_raw_gate = kda_batched_replay_uses_raw_gate(
-                self.attn_config.dtype
+                self.attn_config.dtype,
+                num_heads=heads,
+                head_dim=head_dim,
             )
             # Raw-g replay reuses the committed convolution pool as verify scratch.
             conv_bytes = (
@@ -347,8 +355,6 @@ class KimiK3Recipe(CacheRecipe):
                     if field.field_id.endswith(".conv_state")
                 )
             )
-            conv_shape, recurrent_shape = self._kda_shapes
-            heads, head_dim, _ = recurrent_shape
             rows = self.attn_config.max_bs * int(
                 self.server_args.speculative_num_draft_tokens
             )
@@ -380,14 +386,6 @@ class KimiK3Recipe(CacheRecipe):
         )
 
     # ---- capacity: the scheduler's concurrency decides, then a search ----
-
-    @override
-    def num_lcm_blocks(self, layout: CacheLayout) -> int:
-        num_lcm_blocks = super().num_lcm_blocks(layout)
-        token_limit = self.token_limit
-        if token_limit is None:
-            return num_lcm_blocks
-        return min(num_lcm_blocks, self.parents_needed(layout, token_limit))
 
     @override
     def token_capacity(self, layout: CacheLayout, num_lcm_blocks: int) -> int:
@@ -426,7 +424,15 @@ class KimiK3Recipe(CacheRecipe):
                     + protected_pages
                 )
             else:
-                # Snapshot state rolls between two pages per live request.
-                child_pages = 2 * max_live_requests
+                # A finishing off-page prefill holds its input snapshot and
+                # aligned checkpoint, plus the final tail AND banked decode
+                # growth. Overlap protects one more decode reservation. With
+                # ordinary decode this is four state blocks per live request.
+                growth_tokens = max(
+                    page_tokens, (1 + depth) * limits["decode_input_tokens"]
+                )
+                child_pages = max_live_requests * (
+                    2 + math.ceil((page_tokens - 1 + growth_tokens) / page_tokens)
+                )
             parents += math.ceil(child_pages / packing)
         return parents

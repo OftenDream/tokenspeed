@@ -74,6 +74,10 @@ if platform.is_amd:
         gluon_mxfp_fused_moe,
         gluon_mxfp_precomputed_mxfp4_fused_moe,
     )
+    from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.situ_decode import (
+        _supports_a16w4_warp_decode_ep_gfx950,
+        gluon_a16w4_situ_warp_decode_ep_gfx950,
+    )
     from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.situ_grouped import (
         gluon_a16w4_grouped_ep_gfx950,
         gluon_a16w4_situ_grouped_ep_gfx950,
@@ -88,6 +92,12 @@ if platform.is_amd:
 
     def gluon_mxfp4_gfx950_moe_weights(plan: dict, w: torch.nn.Module):
         return preprocess_gluon_mxfp4_gfx950_moe_weights(plan, w, preshuffle=True)
+
+    def gluon_mxfp4_gfx950_a8w4_situ_ep_weights(plan: dict, w: torch.nn.Module) -> None:
+        if getattr(w, "activation_situ_linear_beta", None) is None:
+            validate_linear_mxfp4_moe_weights(plan, w)
+            return
+        gluon_mxfp4_gfx950_moe_weights(plan, w)
 
     def gluon_mxfp4_gfx1250_moe_weights(plan: dict, w: torch.nn.Module):
         return preprocess_gluon_mxfp4_gfx1250_moe_weights(plan, w)
@@ -165,8 +175,7 @@ if platform.is_amd:
         expert_start = int(getattr(w, "ep_rank", 0)) * num_local_experts
         output = getattr(w, "_situ_output_buffer", None)
         from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.situ_decode import (
-            _supports_a16w4_warp_decode_ep_gfx950,
-            gluon_a16w4_warp_decode_ep_gfx950,
+            gluon_a16w4_situ_warp_decode_ep_gfx950 as route_direct_decode,
         )
 
         use_route_direct_decode = _supports_a16w4_warp_decode_ep_gfx950(
@@ -181,7 +190,7 @@ if platform.is_amd:
         if use_route_direct_decode:
             # Both stages localize global expert IDs while consuming the linear
             # checkpoint layout, avoiding four pointwise localization kernels.
-            return gluon_a16w4_warp_decode_ep_gfx950(
+            return route_direct_decode(
                 x,
                 w.w13_weight,
                 w.w13_weight_scale,
@@ -256,7 +265,7 @@ if platform.is_amd:
             "ispp_alignment": frozenset({128}),
             "internal_activation_dtype": frozenset({"input"}),
         },
-        priority=Priority.SPECIALIZED + 3,
+        priority=Priority.SPECIALIZED,
     )
     def gluon_mxfp4_a8w4_situ_precomputed_moe_apply(
         plan: dict,
@@ -307,6 +316,122 @@ if platform.is_amd:
     @register_kernel(
         "moe",
         "apply",
+        name="gluon_mxfp4_a8w4_situ_ep_precomputed_moe_apply",
+        solution="gluon",
+        weight_preprocessor=gluon_mxfp4_gfx950_a8w4_situ_ep_weights,
+        capability=CapabilityRequirement(
+            vendors=frozenset({"amd"}),
+            min_arch_version=ArchVersion(9, 5),
+            max_arch_version=ArchVersion(9, 5),
+        ),
+        signatures=format_signatures("x", "dense", {torch.bfloat16}),
+        traits={
+            "weight_dtype": frozenset({"mxfp4"}),
+            "activation": frozenset({"situ"}),
+            "routing_mode": frozenset({"precomputed_topk"}),
+            "supports_deferred_finalize": frozenset({False}),
+            "supports_ep": frozenset({True}),
+            "supports_all_to_all_ep": frozenset({False}),
+            "ep_size": frozenset({8}),
+            "ispp": frozenset({3072}),
+            "internal_activation_dtype": frozenset({"input"}),
+            "supports_bias": frozenset({False}),
+        },
+        # The A8 preprocessor replaces the linear weights required by Kimi's
+        # joint routed/shared M<=4 decode pipeline. Keep the A16 plan as the
+        # automatic EP8 choice until the A8 plan can preserve that fast path.
+        priority=Priority.SPECIALIZED - 1,
+    )
+    def gluon_mxfp4_a8w4_situ_ep_precomputed_moe_apply(
+        plan: dict,
+        x: torch.Tensor,
+        w: torch.nn.Module,
+        router_logits: torch.Tensor,
+        topk_weights: torch.Tensor | None = None,
+        topk_ids: torch.Tensor | None = None,
+        num_tokens_global: int | None = None,
+        max_num_tokens_per_gpu: int | None = None,
+        do_finalize: bool = True,
+        enable_pdl: bool = False,
+    ):
+        del plan, router_logits, num_tokens_global, max_num_tokens_per_gpu
+        del enable_pdl
+        if not do_finalize:
+            raise ValueError("gfx950 A8W4 SiTU EP MoE cannot defer finalization")
+        if topk_weights is None or topk_ids is None:
+            raise ValueError("gfx950 A8W4 SiTU EP MoE requires precomputed top-k")
+        if x.ndim == 2 and x.shape[0] == 0:
+            if topk_weights.ndim != 2 or topk_ids.shape != topk_weights.shape:
+                raise ValueError("gfx950 A8W4 SiTU EP MoE requires matching top-k")
+            if topk_ids.shape[0] != 0:
+                raise ValueError("empty EP input requires empty top-k tensors")
+            output = getattr(w, "_situ_output_buffer", None)
+            if output is None:
+                return torch.empty_like(x)
+            if (
+                output.shape != x.shape
+                or output.dtype != x.dtype
+                or output.device != x.device
+            ):
+                raise ValueError("empty EP output must match the input tensor")
+            return output
+
+        situ_linear_beta = getattr(w, "activation_situ_linear_beta", None)
+        if situ_linear_beta is None:
+            return _gluon_mxfp4_a16w4_ep_precomputed_moe_apply(
+                x,
+                w,
+                topk_weights,
+                topk_ids,
+                activation="situ",
+                do_finalize=do_finalize,
+            )
+        if _supports_a16w4_warp_decode_ep_gfx950(
+            x,
+            w.w13_weight_triton_tensor,
+            w.w13_precision_config.b_mx_scale,
+            w.w2_weight_triton_tensor,
+            w.w2_precision_config.b_mx_scale,
+            linear_weights=False,
+        ):
+            num_local_experts = int(getattr(w, "num_local_experts"))
+            return gluon_a16w4_situ_warp_decode_ep_gfx950(
+                x,
+                w.w13_weight_triton_tensor,
+                w.w13_precision_config.b_mx_scale,
+                w.w2_weight_triton_tensor,
+                w.w2_precision_config.b_mx_scale,
+                topk_weights,
+                topk_ids,
+                situ_beta=float(getattr(w, "activation_situ_beta", 1.0)),
+                situ_linear_beta=float(situ_linear_beta),
+                expert_start=int(getattr(w, "ep_rank", 0)) * num_local_experts,
+                routed_out=getattr(w, "_situ_output_buffer", None),
+            )
+        num_local_experts = int(getattr(w, "num_local_experts"))
+        global_num_experts = int(getattr(w, "num_experts"))
+        out = gluon_mxfp4_fp8_precomputed_situ(
+            x,
+            topk_weights,
+            topk_ids,
+            w.w13_weight_triton_tensor,
+            w.w2_weight_triton_tensor,
+            w13_mx_scale=w.w13_precision_config.b_mx_scale,
+            w2_mx_scale=w.w2_precision_config.b_mx_scale,
+            situ_beta=float(getattr(w, "activation_situ_beta", 1.0)),
+            situ_linear_beta=float(situ_linear_beta),
+            out=getattr(w, "_situ_output_buffer", None),
+            expert_start=int(getattr(w, "ep_rank", 0)) * num_local_experts,
+            global_num_experts=global_num_experts,
+            prefill_activation_format="e4m3",
+        )
+        if out is None:
+            raise ValueError("gfx950 A8W4 SiTU EP MoE does not support this shape")
+        return out
+
+    @register_kernel(
+        "moe",
+        "apply",
         name="gluon_mxfp4_a16w4_situ_ep_precomputed_moe_apply",
         solution="gluon",
         weight_preprocessor=validate_linear_mxfp4_moe_weights,
@@ -334,10 +459,9 @@ if platform.is_amd:
             "ispp_alignment": frozenset({1}),
             "internal_activation_dtype": frozenset({"input"}),
         },
-        # Gfx950 A16W4 SiTU EP8 is the measured K3 fast path. Capability and
-        # ep_size traits keep this specialized priority from affecting other
-        # platforms or EP degrees.
-        priority=Priority.SPECIALIZED + 1,
+        # Capability and ep_size traits restrict this measured K3 fast path to
+        # gfx950 EP8, so it needs no intra-band priority offset.
+        priority=Priority.SPECIALIZED,
     )
     def gluon_mxfp4_a16w4_situ_ep_precomputed_moe_apply(
         plan: dict,
@@ -390,7 +514,7 @@ if platform.is_amd:
             "internal_activation_dtype": frozenset({"input"}),
             "supports_bias": frozenset({False}),
         },
-        priority=Priority.SPECIALIZED + 1,
+        priority=Priority.SPECIALIZED,
     )
     def gluon_mxfp4_a16w4_swiglu_ep_precomputed_moe_apply(
         plan: dict,
@@ -411,6 +535,98 @@ if platform.is_amd:
             topk_ids,
             activation="swiglu",
             do_finalize=do_finalize,
+        )
+
+    @register_kernel(
+        "moe",
+        "apply",
+        name="gluon_mxfp4_a8w4_situ_gfx1250_precomputed_moe_apply",
+        solution="gluon",
+        weight_preprocessor=gluon_mxfp4_gfx1250_moe_weights,
+        capability=CapabilityRequirement(
+            vendors=frozenset({"amd"}),
+            min_arch_version=ArchVersion(12, 5),
+            max_arch_version=ArchVersion(12, 5),
+        ),
+        signatures=format_signatures("x", "dense", {torch.bfloat16}),
+        traits={
+            "weight_dtype": frozenset({"mxfp4"}),
+            "activation": frozenset({"situ"}),
+            "routing_mode": frozenset({"precomputed_topk"}),
+            "supports_deferred_finalize": frozenset({False}),
+            "supports_ep": frozenset({False}),
+            "supports_all_to_all_ep": frozenset({False}),
+            # K3 TP8 shards the 3072-wide expert intermediate to 384 columns.
+            "ispp": frozenset({384}),
+            "ispp_alignment": frozenset({128}),
+            "internal_activation_dtype": frozenset({"input"}),
+        },
+        priority=Priority.SPECIALIZED,
+    )
+    def gluon_mxfp4_a8w4_situ_gfx1250_precomputed_moe_apply(
+        plan: dict,
+        x: torch.Tensor,
+        w: torch.nn.Module,
+        router_logits: torch.Tensor,
+        topk_weights: torch.Tensor | None = None,
+        topk_ids: torch.Tensor | None = None,
+        num_tokens_global: int | None = None,
+        max_num_tokens_per_gpu: int | None = None,
+        do_finalize: bool = True,
+        enable_pdl: bool = False,
+        shared_input: torch.Tensor | None = None,
+        shared_weight: torch.Tensor | None = None,
+        shared_out: torch.Tensor | None = None,
+    ):
+        del plan, router_logits, num_tokens_global, max_num_tokens_per_gpu
+        del enable_pdl
+        if not do_finalize:
+            raise ValueError("gfx1250 A8W4 SiTU MoE cannot defer finalization")
+        if topk_weights is None or topk_ids is None:
+            raise ValueError("gfx1250 A8W4 SiTU MoE requires precomputed top-k")
+        if (
+            shared_input is not None
+            or shared_weight is not None
+            or shared_out is not None
+        ):
+            raise ValueError(
+                "gfx1250 A8W4 SiTU MoE does not support shared projection fusion"
+            )
+
+        situ_beta = float(getattr(w, "activation_situ_beta", 1.0))
+        situ_linear_beta = getattr(w, "activation_situ_linear_beta", None)
+        if situ_linear_beta is None:
+            raise ValueError("gfx1250 A8W4 SiTU MoE requires linear_beta")
+        w13_pc = w.w13_precision_config
+        w2_pc = w.w2_precision_config
+        decode = _use_gfx1250_moe_decode(
+            topk_ids.numel(), w.w13_weight_triton_tensor.shape[0]
+        )
+
+        return fused_mxfp_gfx1250.gluon_mxfp_precomputed_mxfp4_fused_moe(
+            x,
+            topk_weights,
+            topk_ids,
+            w.w13_weight_triton_tensor,
+            w.w2_weight_triton_tensor,
+            w13_bias=(
+                None
+                if getattr(w, "_gluon_w13_bias_is_zero", False)
+                else getattr(w, "w13_weight_bias", None)
+            ),
+            w2_bias=(
+                None
+                if getattr(w, "_gluon_w2_bias_is_zero", False)
+                else getattr(w, "w2_weight_bias", None)
+            ),
+            w13_mx_scale=w13_pc.b_mx_scale,
+            w2_mx_scale=w2_pc.b_mx_scale,
+            out_dtype=w2_pc.out_dtype or torch.bfloat16,
+            activation="situ",
+            situ_beta=situ_beta,
+            situ_linear_beta=float(situ_linear_beta),
+            decode=decode,
+            out=getattr(w, "_situ_output_buffer", None),
         )
 
     @register_kernel(
@@ -440,7 +656,7 @@ if platform.is_amd:
             "internal_activation_dtype": frozenset({"fp8"}),
             "supports_bias": frozenset({True}),
         },
-        priority=Priority.SPECIALIZED + 4,
+        priority=Priority.SPECIALIZED,
     )
     def gluon_mxfp4_gfx1250_precomputed_moe_apply(
         plan: dict,
@@ -521,7 +737,10 @@ if platform.is_amd:
             "internal_activation_dtype": frozenset({"input"}),
             "supports_bias": frozenset({True}),
         },
-        priority=Priority.SPECIALIZED + 3,
+        # ``routing_mode=None`` deliberately leaves moe_plan unconstrained, so
+        # this and the precomputed sibling both match. Prefer kernel routing;
+        # an explicit precomputed_topk request still filters this entry out.
+        priority=Priority.SPECIALIZED + 1,
     )
     def gluon_mxfp4_dynamic_moe_apply(
         plan: dict,
@@ -611,7 +830,7 @@ if platform.is_amd:
             "internal_activation_dtype": frozenset({"input"}),
             "supports_bias": frozenset({True}),
         },
-        priority=Priority.SPECIALIZED + 2,
+        priority=Priority.SPECIALIZED,
     )
     def gluon_mxfp4_precomputed_moe_apply(
         plan: dict,

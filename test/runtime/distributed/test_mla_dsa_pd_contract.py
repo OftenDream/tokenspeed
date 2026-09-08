@@ -30,6 +30,7 @@ from __future__ import annotations
 import os
 import sys
 
+import pytest
 import torch
 
 _TEST_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -55,37 +56,40 @@ _NUM_LCM_BLOCKS = 6
 
 
 def _attn_config(family: str, pd_enabled: bool):
-    """A real MLA/DSA config: the recipe dispatches fields on the type."""
+    """A real MLA/DSA config: the recipe dispatches fields on the spec type."""
+    from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
     from tokenspeed.runtime.layers.attention.configs.dsa import DSAConfig
     from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
 
     common = dict(
-        device="cpu",
         backend_name="mla",
         num_attention_heads=64,
         num_kv_heads=64,
         attn_tp_size=1,
         head_dim=192,
-        dtype=torch.bfloat16,
-        kv_cache_dtype=torch.bfloat16,
-        context_len=1024,
-        max_graph_bs=1,
-        max_bs=1,
-        prefix_granularity=_P,
-        kernel_page_size=_P,
-        kv_cache_quant_method="",
         kv_lora_rank=512,
         qk_nope_head_dim=128,
         qk_rope_head_dim=64,
         v_head_dim=128,
         scaling=1.0,
         kv_cache_dim=576,
-        max_scheduled_tokens=_P,
-        pd_disaggregation_enabled=pd_enabled,
     )
     if family == "dsa":
-        return DSAConfig(index_topk=1, index_head_dim=128, index_n_heads=1, **common)
-    return MLAConfig(**common)
+        spec = DSAConfig(index_topk=1, index_head_dim=128, index_n_heads=1, **common)
+    else:
+        spec = MLAConfig(**common)
+    return AttnConfig(
+        device="cpu",
+        dtype=torch.bfloat16,
+        kv_cache_dtype=torch.bfloat16,
+        context_len=1024,
+        max_bs=1,
+        prefix_granularity=_P,
+        kernel_page_size=_P,
+        kv_cache_quant_method="",
+        pd_disaggregation_enabled=pd_enabled,
+        components=(spec,),
+    )
 
 
 def _recipe(family: str, pd_enabled: bool = False):
@@ -213,3 +217,7 @@ def test_pd_contract_refused_when_disabled() -> None:
     assert pool.arena.supports_disaggregation is False
     with pytest.raises(RuntimeError, match="no transfer policy"):
         build_arena_cache_transfer_contract(pool.arena)
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))

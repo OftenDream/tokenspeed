@@ -39,7 +39,7 @@ from tokenspeed.runtime.configs.utils import get_rope_theta as _get_rope_theta
 from tokenspeed.runtime.distributed.comm_manager import CommManager as _CommManager
 from tokenspeed.runtime.distributed.mapping import Mapping as _Mapping
 from tokenspeed.runtime.execution.context import ForwardContext as _ForwardContext
-from tokenspeed.runtime.execution.cuda_graph_wrapper import (
+from tokenspeed.runtime.execution.forward_step import (
     get_is_capture_mode as _get_is_capture_mode,
 )
 from tokenspeed.runtime.layers.layernorm import RMSNorm as _RMSNorm
@@ -540,7 +540,6 @@ class _RuntimeLongcatDecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         ctx: _ForwardContext,
-        out_cache_loc: torch.Tensor,
         comm_manager: _CommManager,
         selection,
     ):
@@ -550,7 +549,6 @@ class _RuntimeLongcatDecoderLayer(nn.Module):
                 positions=positions,
                 hidden_states=hidden_states,
                 ctx=ctx,
-                out_cache_loc=out_cache_loc,
                 comm_manager=comm_manager,
                 selection=selection,
             )
@@ -559,7 +557,6 @@ class _RuntimeLongcatDecoderLayer(nn.Module):
                 positions=positions,
                 hidden_states=hidden_states,
                 ctx=ctx,
-                out_cache_loc=out_cache_loc,
                 comm_manager=comm_manager,
             ),
             selection,
@@ -570,7 +567,6 @@ class _RuntimeLongcatDecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         ctx: _ForwardContext,
-        out_cache_loc: torch.Tensor,
         residual: torch.Tensor | None,
         capture_hidden_state: _Callable[[torch.Tensor], None] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
@@ -597,7 +593,6 @@ class _RuntimeLongcatDecoderLayer(nn.Module):
             positions,
             hidden_states,
             ctx,
-            out_cache_loc,
             self.moe_comm,
             None,
         )
@@ -632,7 +627,6 @@ class _RuntimeLongcatDecoderLayer(nn.Module):
             positions,
             hidden_states,
             ctx,
-            out_cache_loc,
             self.branch_comm[1],
             selection,
         )
@@ -743,7 +737,6 @@ class _RuntimeLongcatModel(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         ctx: _ForwardContext,
-        out_cache_loc: torch.Tensor,
         input_embeds: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, list[torch.Tensor] | None]:
         if input_embeds is not None:
@@ -771,7 +764,6 @@ class _RuntimeLongcatModel(nn.Module):
                     positions,
                     hidden_states,
                     ctx,
-                    out_cache_loc,
                     residual,
                     capture_hidden_state=capture_hidden_state,
                 )

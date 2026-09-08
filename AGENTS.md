@@ -3,6 +3,15 @@
 > If a `AGENTS.local.md` file exists alongside this file, read and respect it--
 > it contains developer-specific overrides that supplement this shared guidance.
 
+## Collaboration principle
+
+Core features will be designed and implemented by the TokenSpeed core team.
+This isn't a matter of distrust in external contributions — writing code has
+gotten cheaper, but reviewing it, validating it, and deploying it safely at
+production scale hasn't. If anything, that cost has gone up. As Steve Jobs
+put it, A players want to work with A players. We believe the gap between the
+best people and average people is more than tenfold.
+
 ## Development environment
 
 * Before any work, check local Python venv and activate if one exists.
@@ -11,6 +20,10 @@
 ## Code changes
 
 * Add tests and update docs for the changed code.
+* Avoid default parameter values; pass every argument explicitly at every call
+  site. Explicit arguments matter more than convenience: a default silently
+  supplies a value the caller never chose, so a missing or swallowed argument
+  goes unnoticed instead of failing at the call.
 * Use absolute imports instead of relative imports.
 * Use the repository's full MIT license header for copyright notices; do not use
   an abbreviated copyright-only header.
@@ -21,6 +34,18 @@
 * When creating commits, perform sign off on behalf of the author.
 
 ## Design principles
+
+We value one scheduling path and one execution path. Prefill/decode
+disaggregation or not, speculation or not, CUDA graph or not, overlap or not:
+these are parameters of the same path, never a second path. Make the general
+path cover the case instead of adding a mode-specific branch.
+
+When attention needs new per-request state, first ask whether the LCM cache
+subsystem and the C++ scheduler can own it — as a cache group with its own
+block granularity, allocated, prefix-matched, transferred and freed with the
+request's other blocks — before adding state maintenance inside a particular
+model or attention backend. Backend-private state is the exception, not the
+default.
 
 `docs/design/` records the deliberate invariants of each subsystem — what
 belongs where, and why. Read the document covering the code you are touching
@@ -35,6 +60,9 @@ change.
   between prefix matching, allocation and page geometry.
 * `docs/design/scheduler.md` — the C++ scheduler's admission granularity,
   what triggers retraction in each engine role, and the recovery protocol.
+* `docs/design/unified_path.md` — the unified decode path: one
+  refresh-in-place metadata contract for eager and CUDA-graph decode, the
+  padding contract, buffer sizing, and what stays graph-only.
 
 ## Public pull requests
 
@@ -58,6 +86,9 @@ Inside the root `tokenspeed-kernel/` directory:
 
 * All direct tokenspeed-triton imports should happen in `_triton.py` and then
   re-import to other places.
+* Avoid using `triton` directly; use `tokenspeed_triton` instead.
+* Avoid using `torch.compile`; prefer writing the fused kernel directly in
+  Triton.
 * All direct third-party code should be placed in `thirdparty/` and imported
   into `ops/` then registered via `register_kernel`.
 * Prefer CuteDSL for NVIDIA GPU kernels and Triton Gluon for AMD GPU kernels.
@@ -65,13 +96,23 @@ Inside the root `tokenspeed-kernel/` directory:
   stay optional, and other solutions may be used as temporary transitions, but
   new work should consolidate toward these backend choices.
 * Files under `ops/` should follow `<family>/<solution>` structure, like
-  `gemm/trtllm.py` or `attention/triton/`.
+  `gemm/trtllm.py`. Attention adds its variant before the solution, for example
+  `attention/mha/triton.py`; multi-file implementations keep helpers under a
+  private directory such as `attention/mha/_triton/`.
+* Top-level `README.md` should only contain high-level kernel system designs
+  geared for human understanding. For per-op details, use `README.md` files
+  under corresponding `ops/` directory.
+* Prefer to `@register_kernel` with the name as the Python `def` function
+  attached to, prefixed with its solution (e.g, `triton_mha_prefill`).
 * When defining new public APIs, explain arguments and returns in docstring.
+* Vendor-specific tests should be placed under `test/<vendor>/` subdirectory.
+  Tests for common infra and covering multi-vendors reside under `test/`
+  directly.
 
 ## tokenspeed-kernel-amd
 
 Inside the root `tokenspeed-kernel-amd/` directory:
 
 * There should be no dependency on `tokenspeed-kernel`.
-* AMD Gluon Kernel tests should live in `tokenspeed-kernel/test/` to reuse
+* AMD Gluon Kernel tests should live in `tokenspeed-kernel/test/amd/` to reuse
   common platform utilities and reference computations.

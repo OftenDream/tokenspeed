@@ -57,7 +57,7 @@ public:
     // The Host pool is available to explicit tier operations. Streaming controls
     // whether ordinary Device prefix publication also feeds the Host tier.
     CacheCoordinator(std::vector<CacheGroup> groups, std::int32_t prefix_granularity, BlockPool& pool,
-                     BlockPool* host_pool = nullptr, bool stream_device_cache_to_host = true);
+                     BlockPool* host_pool, bool stream_device_cache_to_host);
 
     std::int32_t NumGroups() const { return static_cast<std::int32_t>(groups_.size()); }
 
@@ -138,7 +138,7 @@ public:
     PrefixProbe ProbeDecodeDevicePrefix(std::span<const std::string> content_hashes) const;
     std::int32_t PromotionBoundaryTokens(const PrefixProbe& prefix) const;
     std::optional<AdmissionResult> Admit(PrefixProbe&& prefix, std::span<const GroupDemand> demands,
-                                         std::optional<std::uint64_t> request_access_epoch = std::nullopt);
+                                         std::optional<std::uint64_t> request_access_epoch);
     // Capacity views for scheduling code, counted in LCM parent blocks. The
     // counts are opaque capacity units to the scheduler: all packing/geometry
     // arithmetic stays behind these methods.
@@ -146,13 +146,18 @@ public:
     // Number of LCM blocks that become reclaimable after dropping the exact
     // request-owned refs in tables. Used only to rank Retraction victims.
     std::int32_t NumNewlyReleasableLcmBlocks(std::span<const BlockTable> tables) const;
+    // Empty parents plus parents whose every child is an unpinned cache entry.
+    // Scans the pool and every group's index: a diagnostic, not a per-step
+    // gauge. Per-step accounting composes NumEmptyLcmBlocks and
+    // NumActiveLcmBlocks instead.
     std::int32_t NumAvailableLcmBlocks() const;
+    std::int32_t NumEmptyLcmBlocks() const { return pool_.NumEmptyLcmBlocks(); }
     std::int32_t TotalLcmBlocks() const { return pool_.NumLcmBlocks(); }
     std::int32_t NumFreeHostLcmBlocks() const { return host_pool_ == nullptr ? 0 : host_pool_->NumEmptyLcmBlocks(); }
     // LCM blocks required to place group_pages[g] pages for every group g.
     std::int64_t LcmBlocksNeededFor(std::span<const std::int64_t> group_pages) const;
     // Distinct LCM blocks referenced by the given per-request table sets.
-    std::size_t NumActiveLcmBlocks(std::span<const std::span<const BlockTable>> request_tables) const;
+    std::int32_t NumActiveLcmBlocks(std::span<const std::span<const BlockTable>> request_tables) const;
     // Free pages (group page units) this group could still place, counting its
     // partially filled parents and every empty parent.
     std::int32_t GroupAvailablePages(std::int32_t group_index) const;
@@ -160,11 +165,11 @@ public:
     // Registers an exact range, used for transferred prefix blocks and tests.
     // Runtime publication during Admit follows each group's boundary contract.
     void CacheFullBlocks(std::span<BlockTable> tables, std::span<const std::string> content_hashes,
-                         std::uint64_t access_epoch, std::int32_t first_slot = 0,
-                         CacheBoundaryKind boundary_kind = CacheBoundaryKind::kChunk);
+                         std::uint64_t access_epoch, std::int32_t first_slot, CacheBoundaryKind boundary_kind);
     void CacheCompletedBlocks(std::span<BlockTable> tables, std::span<const std::string> prefix_hashes,
                               std::uint64_t access_epoch, std::int32_t first_new_prefix_page,
-                              std::int32_t num_computed_tokens, CacheBoundaryKind boundary_kind);
+                              std::int32_t num_computed_tokens, CacheBoundaryKind boundary_kind,
+                              bool stream_completed_to_host, std::int32_t materialized_state_boundary_tokens);
     void ReclaimExpired(std::span<BlockTable> tables, std::int32_t num_computed_tokens);
     void ConsumeReservedTokens(std::span<BlockTable> tables, std::int32_t num_tokens);
     void Free(std::span<BlockTable> tables);
@@ -178,11 +183,27 @@ public:
     struct StoreCandidate {
         CacheKey key;
     };
-    // Retry ordinary D2H Store for already-published Device cache entries.
+    struct HostAllocationStats {
+        std::size_t requested{0};
+        std::size_t allocated{0};
+        std::size_t unallocated{0};
+        std::size_t same_group_scans{0};
+        std::size_t cross_group_scans{0};
+    };
+    struct HostAllocationBatch {
+        std::vector<CacheBlockRef> blocks;
+        HostAllocationStats stats;
+    };
+    // Queue every already-published non-state Device cache entry for D2H Store.
     // Missing keys and an absent Host tier are silently skipped.
     void QueueCachedBlocksForStore(std::span<const std::string> prefix_hashes);
+    // Queue the newest Device-resident checkpoint from each snapshot-state
+    // group. State checkpoints are intentionally deferred from continuous
+    // Host streaming and persisted at request lifecycle boundaries instead.
+    void QueueLatestSnapshotBlocksForStore(std::span<const std::string> prefix_hashes);
     std::vector<StoreCandidate> TakePendingStores() { return std::exchange(pending_stores_, {}); }
     CacheBlockRef AcquireDeviceCachedBlock(const CacheKey& key) const;
+    HostAllocationBatch AcquireHostBlocks(std::span<const std::uint32_t> group_ids);
     CacheBlockRef AcquireHostBlock(std::uint32_t group_id);
     // Collection/pinning follows host-tier presence, so the slide credit flips count_uncached on this.
     bool StreamsDeviceCacheToHost() const { return stream_device_cache_to_host_; }
@@ -195,6 +216,12 @@ public:
     // Reports real device-cache entry insertions and removals. The scheduler
     // folds the per-group mutations into one externally visible prefix event.
     void SetCacheMutationSink(CacheMutationSink sink) { cache_mutation_sink_ = std::move(sink); }
+    // Device residency of one scheduler-level prefix boundary: the child
+    // entries every group holds for that content hash (one per group page
+    // within the prefix granularity). The boundary key's group and offset are
+    // ignored; only its namespace and content hash identify the boundary.
+    enum class BoundaryResidency { kNone, kPartial, kComplete };
+    BoundaryResidency DeviceBoundaryResidency(const CacheKey& boundary) const;
 
 private:
     friend struct CacheCoordinatorTestAccess;
@@ -221,7 +248,7 @@ private:
     template <CacheTier Tier>
     void cacheFullBlocksForGroup(std::size_t group_index, BlockTable& table, std::span<const CacheKey> keys,
                                  std::int32_t first_cache_block, std::uint64_t access_epoch,
-                                 CacheBoundaryKind boundary_kind);
+                                 CacheBoundaryKind boundary_kind, bool stream_completed_to_host);
     template <CacheTier Tier>
     void cacheCompletedBlocksForGroup(std::size_t group_index, const GroupDemand& demand, std::uint64_t access_epoch);
     void cacheDeviceCompletedBlocksForGroup(std::size_t group_index, const GroupDemand& demand,
@@ -248,7 +275,6 @@ private:
 // One CacheGroup per spec (group_id = index), sharing one scheduler prefix
 // domain P while each group may use a smaller cache-page token count.
 CacheCoordinator MakeCoordinator(std::span<const CacheGroupSpec> specs, std::int32_t prefix_granularity,
-                                 BlockPool& pool, BlockPool* host_pool = nullptr,
-                                 bool stream_device_cache_to_host = true);
+                                 BlockPool& pool, BlockPool* host_pool, bool stream_device_cache_to_host);
 
 }  // namespace tokenspeed

@@ -101,7 +101,7 @@ def test_flash_kda_registers_hybrid_mla_kda_attention() -> None:
 
 def test_fgbkda_backend_disables_incompatible_verify_replay(monkeypatch) -> None:
     from tokenspeed.runtime.layers.attention import registry
-    from tokenspeed.runtime.layers.attention.backends import hybrid_kda
+    from tokenspeed.runtime.layers.attention.backends.state import kda as hybrid_kda
     from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
         LINEAR_ATTENTION,
     )
@@ -408,7 +408,6 @@ class _CaptureLayer(torch.nn.Module):
         positions,
         hidden_states,
         ctx,
-        out_cache_loc,
         residual,
         capture_hidden_state=None,
     ):
@@ -439,7 +438,6 @@ def test_flash_lite_eagle3_captures_materialized_completed_layer_residual() -> N
         input_ids=torch.empty(1, dtype=torch.int64),
         positions=torch.empty(1, dtype=torch.int64),
         ctx=ctx,
-        out_cache_loc=torch.empty(1, dtype=torch.int64),
         input_embeds=torch.ones(1, 1),
     )
 

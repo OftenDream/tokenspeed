@@ -25,11 +25,9 @@ from typing import TYPE_CHECKING
 import torch
 from tokenspeed_kernel.ops.metadata import PrepTape, Reg
 
-from tokenspeed.runtime.execution.cache_loc_kernel import (
-    compute_out_cache_loc,
-    fused_decode_input_prep,
-)
+from tokenspeed.runtime.execution.cache_loc_kernel import fused_decode_input_prep
 from tokenspeed.runtime.execution.forward_batch_info import compute_position_triton
+from tokenspeed.runtime.execution.types import NGramInputs
 from tokenspeed.runtime.multimodal.inputs import Modality, substitute_mm_pad_
 from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.nvtx import nvtx_range
@@ -53,18 +51,16 @@ class InputBuffers:
         self,
         max_bs: int,
         max_num_tokens: int,
-        page_size: int,
-        dummy_kv_slot: int,
         state_write_padding_pool_index: int,
         device: str = "cuda",
     ):
         self.device = device
-        self.page_size = page_size
         self.max_num_tokens = max_num_tokens
-        self.dummy_kv_slot = dummy_kv_slot
         self.state_write_padding_pool_index = state_write_padding_pool_index
         self.max_bs = max_bs
         self.all_extends_mid_chunk = False
+        self.ngram_previous_tokens_buf: torch.Tensor | None = None
+        self.ngram_token_mask_buf: torch.Tensor | None = None
         # Per-modality in-vocab draft tokens; when set, fill rewrites the
         # drafter-only shift-1 buffer's media pad ids in place so drafters
         # only ever see embeddable input ids.
@@ -73,11 +69,12 @@ class InputBuffers:
         with torch.device(device):
             # Initialise buffers to the *padding* values the captured graph
             # expects for padded rows (input_ids=1, positions=0, req_pool=0,
-            # seq_lens=1, out_cache_loc=dummy_kv_slot). Each iteration overwrites
-            # the active prefix [:total_tokens]; fill_input_buffers refreshes the
-            # padding tail [total_tokens:] back to these defaults every step,
-            # because a larger prior iter can leave stale values past the
-            # current prefix.
+            # seq_lens=1). Each iteration overwrites the active prefix
+            # [:total_tokens]; fill_input_buffers refreshes the padding tail
+            # [total_tokens:] back to these defaults every step, because a
+            # larger prior iter can leave stale values past the current
+            # prefix. KV write locations are backend-owned (write_locations);
+            # no location buffer lives here.
             self.input_ids_buf = torch.ones((max_num_tokens,), dtype=torch.int32)
             # Used in draft prefill
             self.shifted_prefill_ids_buf = torch.ones_like(self.input_ids_buf)
@@ -98,12 +95,6 @@ class InputBuffers:
                 (max_bs,), state_write_padding_pool_index, dtype=torch.int64
             )
             self.seq_lens_buf = torch.ones((max_bs,), dtype=torch.int32)
-            # Initialise to dummy_kv_slot so that padding positions (never
-            # written by compute_out_cache_loc) always point to the reserved
-            # dummy KV slot and never corrupt real KV cache entries.
-            self.out_cache_loc_buf = torch.full(
-                (max_num_tokens,), dummy_kv_slot, dtype=torch.int32
-            )
             self.force_single_token_verify_buf = torch.zeros(max_bs, dtype=torch.bool)
             self.extend_prefix_lens_buf = torch.zeros(max_bs, dtype=torch.int32)
             self.extend_seq_lens_buf = torch.zeros(max_bs, dtype=torch.int32)
@@ -143,6 +134,125 @@ class InputBuffers:
         torch.cumsum(lengths, dim=0, out=offsets[1:])
         self.active_request_mask_buf[:batch_size].fill_(True)
 
+    def init_ngram_buffers(self, context_len: int) -> None:
+        """Allocate forward-sized, pointer-stable Engram inputs; no request cache."""
+        if context_len == 0:
+            return
+        self.ngram_previous_tokens_buf = torch.full(
+            (self.max_num_tokens, context_len),
+            -1,
+            dtype=torch.int64,
+            device=self.device,
+        )
+        self.ngram_token_mask_buf = torch.zeros(
+            self.max_num_tokens, dtype=torch.bool, device=self.device
+        )
+
+    def ngram_model_kwargs(self, num_tokens: int) -> dict[str, torch.Tensor]:
+        """Borrow the same raw-history/mask views for every model forward."""
+        if self.ngram_previous_tokens_buf is None:
+            return {}
+        assert self.ngram_token_mask_buf is not None
+        return {
+            "engram_previous_tokens": self.ngram_previous_tokens_buf[:num_tokens],
+            "engram_token_mask": self.ngram_token_mask_buf[:num_tokens],
+        }
+
+    def fill_ngram_inputs(
+        self,
+        snapshot: NGramInputs | None,
+        total_tokens: int,
+        runtime_states: RuntimeStates,
+        forward_op,
+    ) -> None:
+        """Assemble branch-local raw history before embedding-ID clamping.
+
+        ``snapshot`` holds one immutable host seed per request in ``forward_op``;
+        ``total_tokens`` is its packed input size. ``runtime_states`` owns the
+        accepted prefix, advanced with valid_cache_lengths. For token j and
+        distance d, use input[j-d] if j >= d, else accepted_prefix[d-j-1]. The
+        same rule covers prefill, N=1 decode and speculative verify. Returns None.
+        """
+        if self.ngram_previous_tokens_buf is None:
+            if snapshot is not None:
+                raise ValueError("N-gram snapshot supplied without input buffers")
+            return
+        assert self.ngram_token_mask_buf is not None
+        tail = runtime_states.ngram_accepted_tokens
+        needs_seed = runtime_states.ngram_needs_seed
+        assert tail is not None and needs_seed is not None
+        bs = len(forward_op.request_ids)
+        if (
+            snapshot is None
+            or len(snapshot.tokens) != bs
+            or len(snapshot.positions) != bs
+        ):
+            raise ValueError("Engram requires one history snapshot per request")
+        context_len = self.ngram_previous_tokens_buf.shape[1]
+        if any(len(row) != context_len + 1 for row in snapshot.tokens):
+            raise ValueError("Engram snapshot has the wrong history width")
+        self.ngram_previous_tokens_buf[total_tokens:].fill_(-1)
+        self.ngram_token_mask_buf[total_tokens:].zero_()
+        if bs == 0:
+            return
+
+        num_extends = forward_op.num_extends()
+        overrides = forward_op.decode_input_ids
+        reset = [
+            i < num_extends
+            or runtime_states.ngram_request_ids[slot] != rid
+            or (overrides is not None and overrides[i - num_extends] != -1)
+            for i, (rid, slot) in enumerate(
+                zip(forward_op.request_ids, forward_op.request_pool_indices)
+            )
+        ]
+        tokens_cpu, positions_cpu, reset_cpu = self._bulk_pinned(
+            (bs * (context_len + 1), torch.int64),
+            (bs, torch.int64),
+            (bs, torch.bool),
+        )
+        tokens_cpu.view(bs, -1).copy_(torch.tensor(snapshot.tokens, dtype=torch.int64))
+        positions_cpu.copy_(torch.tensor(snapshot.positions, dtype=torch.int64))
+        reset_cpu.copy_(torch.tensor(reset, dtype=torch.bool))
+        tokens = tokens_cpu.view(bs, -1).to(self.device, non_blocking=True)
+        positions = positions_cpu.to(self.device, non_blocking=True)
+        slots = self.req_pool_indices_buf[:bs]
+        seed = reset_cpu.to(self.device, non_blocking=True) | needs_seed[slots]
+        delta = runtime_states.valid_cache_lengths[slots] - positions
+        # Only lifecycle seeds need host coverage. In steady-state decode a
+        # delayed commit can leave delta much larger than the entire window.
+        torch._assert_async(
+            (~seed | ((delta >= 0) & (delta <= 1))).all(),
+            "Engram seed snapshot does not cover the accepted input frontier",
+        )
+        distances = torch.arange(1, context_len + 1, device=self.device)
+        columns = (distances - delta[:, None]).clamp(0, context_len)
+        prefix = torch.where(seed[:, None], tokens.gather(1, columns), tail[slots])
+        vocab_size = runtime_states.vocab_size
+        prefix.masked_fill_((prefix < 0) | (prefix >= vocab_size), -1)
+        tail[slots] = prefix
+        needs_seed[slots] = False
+        for rid, slot in zip(forward_op.request_ids, forward_op.request_pool_indices):
+            runtime_states.ngram_request_ids[slot] = rid
+        if total_tokens == 0:
+            return
+
+        lengths = self.input_lengths_buf[:bs]
+        ends = lengths.cumsum(0)
+        rows = torch.arange(total_tokens, device=self.device)
+        requests = torch.searchsorted(ends, rows, right=True)
+        local_rows = rows - (ends - lengths)[requests]
+        columns = (distances - local_rows[:, None] - 1).clamp(0, context_len - 1)
+        ids = self.input_ids_buf[:total_tokens]
+        previous = torch.where(
+            local_rows[:, None] >= distances,
+            ids[(rows[:, None] - distances).clamp_min(0)],
+            prefix[requests].gather(1, columns),
+        )
+        previous.masked_fill_((previous < 0) | (previous >= vocab_size), -1)
+        self.ngram_previous_tokens_buf[:total_tokens].copy_(previous)
+        self.ngram_token_mask_buf[:total_tokens].copy_((ids >= 0) & (ids < vocab_size))
+
     def _record_pad_tape(self) -> "PrepTape | None":
         """One launch for the whole padding-tail scrub.
 
@@ -155,9 +265,6 @@ class InputBuffers:
             return None
         tape = PrepTape(self.device)
         tape.filltail(self.input_ids_buf, Reg.TOKENS, self.max_num_tokens, 1)
-        tape.filltail(
-            self.out_cache_loc_buf, Reg.TOKENS, self.max_num_tokens, self.dummy_kv_slot
-        )
         tape.filltail(self.positions_buf, Reg.TOKENS, self.max_num_tokens, 0)
         tape.filltail(self.req_pool_indices_buf, Reg.BS, self.max_bs, 0)
         tape.filltail(
@@ -215,13 +322,9 @@ class InputBuffers:
         forward_op,
         runtime_states: RuntimeStates,
         total_tokens: int,
-        out_loc_table: torch.Tensor,
+        *,
+        ngram_inputs: NGramInputs | None,
     ):
-        # out_cache_loc derives from this batch-ordered table (row i == batch
-        # position i): the scheduler's full-history table on the target path,
-        # the staged draft table on the drafter path. Its column grain is the
-        # ctor's page_size; the name stays unit-neutral because the two paths
-        # feed tables of different provenance.
         batch_size = len(forward_op.request_ids)
         num_extends = forward_op.num_extends()
 
@@ -340,22 +443,19 @@ class InputBuffers:
             ] = force_single_token
             runtime_states.remote_spec_candidate_ready[decode_req_pool_indices] = False
 
-        # Decode-only fast path: one fused Triton kernel writes out_cache_loc,
-        # positions, and seq_lens in a single launch and reads
-        # valid_cache_lengths[pool_idx] directly, so the indexSelect + cumsum
-        # path + compute_position + seq_lens add are all gone.
+        # Decode-only fast path: one fused Triton kernel writes positions and
+        # seq_lens in a single launch and reads valid_cache_lengths[pool_idx]
+        # directly, so the indexSelect + compute_position + seq_lens add are
+        # all gone.
         if num_extends == 0 and batch_size > 0:
             fused_decode_input_prep(
-                out_cache_loc_ptr=self.out_cache_loc_buf[:total_tokens],
                 positions_ptr=self.positions_buf[:total_tokens],
                 seq_lens_out_ptr=self.seq_lens_buf[:batch_size],
                 req_pool_indices=req_pool_indices_device,
                 valid_cache_lengths=runtime_states.valid_cache_lengths,
                 uniform_input_length=total_tokens // batch_size,
-                page_table=out_loc_table,
-                page_size=self.page_size,
             )
-            # Decode path's seq_lens / positions / out_cache_loc are done.
+            # Decode path's seq_lens / positions are done.
             valid_cache_lengths = None
         else:
             # Mixed / pure-prefill: keep the per-kernel pipeline. indexSelect
@@ -363,13 +463,6 @@ class InputBuffers:
             # the seq_lens add use it.
             valid_cache_lengths = runtime_states.valid_cache_lengths.index_select(
                 0, req_pool_indices_device
-            )
-            compute_out_cache_loc(
-                out_cache_loc_ptr=self.out_cache_loc_buf[:total_tokens],
-                input_lengths=input_lengths_device,
-                cache_start=valid_cache_lengths,
-                page_table=out_loc_table,
-                page_size=self.page_size,
             )
 
             # Compute positions. In mixed batches, prefill rows use their extend
@@ -466,6 +559,7 @@ class InputBuffers:
         # sampled token), and every id the drafters consume is sampled or
         # substituted in-vocab by construction.
         vocab_size = runtime_states.vocab_size
+        self.fill_ngram_inputs(ngram_inputs, total_tokens, runtime_states, forward_op)
         self.input_ids_buf[:total_tokens].clamp_(0, vocab_size - 1)
 
         if valid_cache_lengths is not None:
@@ -478,15 +572,14 @@ class InputBuffers:
         # Refresh the padding tail of the persistent buffers every iteration.
         # The captured graph replays at a padded batch size and DOES read the
         # padded rows; a previous iter with a *larger* total_tokens / batch_size
-        # leaves stale values in the tail (real cache locations, per-request seq
-        # lengths, positions, token ids, req-pool slots). Reusing those for
-        # padded tokens routes KV writes into real cache slots (corruption),
-        # forces attention to scan oversize ranges, and -- for a stale
-        # out-of-range token id -- trips the embedding gather's device-side
-        # assert that tears the server down. The __init__ safe defaults
-        # (input_ids=1, req_pool=0, positions=0) are not enough on their own
-        # once a larger iter has overwritten the tail, so scrub it back here
-        # (cheap tail-only fills; the active prefix was written above).
+        # leaves stale values in the tail (per-request seq lengths, positions,
+        # token ids, req-pool slots). Reusing those for padded tokens forces
+        # attention to scan oversize ranges and -- for a stale out-of-range
+        # token id -- trips the embedding gather's device-side assert that
+        # tears the server down. The __init__ safe defaults (input_ids=1,
+        # req_pool=0, positions=0) are not enough on their own once a larger
+        # iter has overwritten the tail, so scrub it back here (cheap
+        # tail-only fills; the active prefix was written above).
         if self._pad_tape is not None:
             self._pad_tape.run({Reg.TOKENS: total_tokens, Reg.BS: batch_size})
             if total_tokens < self.max_num_tokens:
@@ -494,7 +587,6 @@ class InputBuffers:
         else:
             if total_tokens < self.max_num_tokens:
                 self.input_ids_buf[total_tokens:].fill_(1)
-                self.out_cache_loc_buf[total_tokens:].fill_(self.dummy_kv_slot)
                 self.positions_buf[total_tokens:].fill_(0)
                 self.mrope_positions_buf[:, total_tokens:].zero_()
             if batch_size < self.max_bs:
@@ -504,16 +596,21 @@ class InputBuffers:
                 )
                 self.seq_lens_buf[batch_size:].fill_(1)
 
+        self.input_lengths_buf[batch_size:].zero_()
         return decode_input_ids
 
     def fill_dummy_decode_buffers(self, batch_size: int, total_tokens: int):
         """Prepare padded decode graph inputs for a rank with no real tokens."""
+        if self.ngram_previous_tokens_buf is not None:
+            assert self.ngram_token_mask_buf is not None
+            self.ngram_previous_tokens_buf[:total_tokens].fill_(-1)
+            self.ngram_token_mask_buf[:total_tokens].zero_()
         if total_tokens > 0:
             self.input_ids_buf[:total_tokens].fill_(1)
-            self.out_cache_loc_buf[:total_tokens].fill_(self.dummy_kv_slot)
             self.positions_buf[:total_tokens].fill_(0)
             self.mrope_positions_buf[:, :total_tokens].zero_()
         if batch_size > 0:
+            self.input_lengths_buf[:batch_size].zero_()
             self.req_pool_indices_buf[:batch_size].fill_(0)
             self.state_write_req_pool_indices_buf[:batch_size].fill_(
                 self.state_write_padding_pool_index

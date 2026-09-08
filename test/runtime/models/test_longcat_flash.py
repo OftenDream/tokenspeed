@@ -362,7 +362,6 @@ class _CaptureLayer(nn.Module):
         positions,
         hidden_states,
         ctx,
-        out_cache_loc,
         residual,
         capture_hidden_state=None,
     ):
@@ -420,7 +419,6 @@ class TestLongcatDFlashCapture(unittest.TestCase):
             input_ids=torch.empty(1, dtype=torch.int64),
             positions=torch.empty(1, dtype=torch.int64),
             ctx=ctx,
-            out_cache_loc=torch.empty(1, dtype=torch.int64),
             input_embeds=torch.ones(1, 1),
         )
 

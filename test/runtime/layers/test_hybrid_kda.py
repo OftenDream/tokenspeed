@@ -22,7 +22,7 @@ import torch
 
 
 def test_fgbkda_channel_beta_matches_training_order() -> None:
-    from tokenspeed.runtime.layers.attention.backends.hybrid_linear_attn import (
+    from tokenspeed.runtime.layers.attention.backends.state.mamba import (
         apply_fgbkda_channel_beta,
     )
 

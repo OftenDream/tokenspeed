@@ -57,6 +57,10 @@ def _lite_recipe(
     overlap_schedule_depth: int = 0,
 ) -> Any:
     try:
+        from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
+        from tokenspeed.runtime.layers.attention.configs.linear_attn import (
+            LinearAttnConfig,
+        )
         from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
         from tokenspeed.runtime.layers.attention.kv_cache.recipes.checkpointed_tail_oe import (
             CheckpointedTailOERecipe,
@@ -68,29 +72,39 @@ def _lite_recipe(
 
     text_config = FLASHLocalConfig()
     text_config.architectures = [_ARCHITECTURE]
-    attn_config = MLAConfig(
-        device=device,
-        context_len=token_limit,
+    mla = MLAConfig(
         backend_name="mla",
         num_attention_heads=text_config.num_attention_heads,
         num_kv_heads=text_config.num_key_value_heads,
         head_dim=text_config.qk_nope_head_dim + text_config.qk_rope_head_dim,
         attn_tp_size=1,
-        dtype=torch.bfloat16,
-        kv_cache_dtype=torch.bfloat16,
-        kv_cache_quant_method=None,
-        prefix_granularity=128,
-        max_bs=max_bs,
-        max_graph_bs=max_bs,
-        speculative_num_draft_tokens=1,
         kv_lora_rank=text_config.kv_lora_rank,
         qk_nope_head_dim=text_config.qk_nope_head_dim,
         qk_rope_head_dim=text_config.qk_rope_head_dim,
         v_head_dim=text_config.v_head_dim,
         scaling=(text_config.qk_nope_head_dim + text_config.qk_rope_head_dim) ** -0.5,
         kv_cache_dim=text_config.kv_lora_rank + text_config.qk_rope_head_dim,
-        layer_types=tuple(text_config.layer_types),
-        max_scheduled_tokens=128,
+    )
+    kda = text_config.linear_attn_config
+    linear = LinearAttnConfig(
+        num_k_heads=kda["num_heads"],
+        num_v_heads=kda["num_heads"],
+        head_k_dim=kda["head_dim"],
+        head_v_dim=kda["head_dim"],
+        conv_kernel_size=kda["short_conv_kernel_size"],
+        layer_ids=tuple(text_config.linear_layer_ids),
+        tp_size=tp_size,
+    )
+    attn_config = AttnConfig(
+        device=device,
+        context_len=token_limit,
+        dtype=torch.bfloat16,
+        kv_cache_dtype=torch.bfloat16,
+        kv_cache_quant_method=None,
+        prefix_granularity=128,
+        max_bs=max_bs,
+        speculative_num_draft_tokens=1,
+        components=(mla, linear),
         pd_disaggregation_enabled=True,
     )
     return CheckpointedTailOERecipe(
@@ -538,7 +552,7 @@ def test_lite_pool_binds_one_arena_and_distinct_layer_views() -> None:
 def test_lite_graph_state_indices_refresh_without_reallocation() -> None:
     try:
         from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
-        from tokenspeed.runtime.layers.attention.backends.hybrid_linear_attn import (
+        from tokenspeed.runtime.layers.attention.backends.state.mamba import (
             MambaAttnBackend,
         )
     except RuntimeError as exc:
@@ -547,7 +561,7 @@ def test_lite_graph_state_indices_refresh_without_reallocation() -> None:
         raise
 
     recipe, pool = _pool()
-    backend = MambaAttnBackend(recipe.attn_config)
+    backend = MambaAttnBackend(recipe.attn_config, recipe.attn_config.components[0])
     backend.set_kv_pool(pool)
     backend.init_cuda_graph_state(2)
     backend.init_forward_metadata_capture_cuda_graph(

@@ -23,7 +23,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 import torch.nn.functional as F
-from tokenspeed_kernel.ops.attention import (
+from tokenspeed_kernel.ops.attention.kda import (
     _attention_format_signature,
     kda_paged_prefill,
 )

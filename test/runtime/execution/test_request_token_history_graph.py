@@ -22,11 +22,11 @@ from types import SimpleNamespace
 
 import torch
 
-from tokenspeed.runtime.execution.cuda_graph_wrapper import CudaGraphWrapper
+from tokenspeed.runtime.execution.forward_step import ForwardStepRunner
 
 
 def test_decode_graph_history_layout_masks_padding_rows() -> None:
-    wrapper = CudaGraphWrapper.__new__(CudaGraphWrapper)
+    wrapper = ForwardStepRunner.__new__(ForwardStepRunner)
     wrapper.runtime_states = SimpleNamespace(has_request_token_history=True)
     wrapper.input_buffers = SimpleNamespace(
         input_start_offsets_buf=torch.empty(4, dtype=torch.int32),

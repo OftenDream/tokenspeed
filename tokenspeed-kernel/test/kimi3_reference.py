@@ -58,10 +58,11 @@ def kda_recurrent(
     a_log: torch.Tensor,
     dt_bias: torch.Tensor,
     *,
-    lower_bound: float | None = -5.0,
-    eps: float = 1e-6,
+    output_dtype: torch.dtype,
+    lower_bound: float | None,
+    eps: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Sequential KDA oracle for both prefill and decode."""
+    """Sequential KDA oracle with explicitly controlled output precision."""
 
     if q.shape != k.shape or q.shape != raw_g.shape:
         raise ValueError("q, k, and raw_g must have matching shapes")
@@ -90,7 +91,7 @@ def kda_recurrent(
         running = running + torch.einsum("hv,hk->hvk", delta, k_t)
         outputs.append(torch.einsum("hvk,hk->hv", running, q_t))
 
-    return torch.stack(outputs).to(q.dtype), running.to(state.dtype)
+    return torch.stack(outputs).to(output_dtype), running.to(state.dtype)
 
 
 _E2M1_VALUES = torch.tensor(
@@ -141,11 +142,15 @@ def _mxfp4_linear(
     x: torch.Tensor,
     packed_weight: torch.Tensor,
     scales: torch.Tensor,
+    *,
+    activation_dtype: torch.dtype,
+    output_dtype: torch.dtype,
 ) -> torch.Tensor:
-    return F.linear(x.float(), dequantize_mxfp4(packed_weight, scales)).to(x.dtype)
+    x = x.to(activation_dtype).float()
+    return F.linear(x, dequantize_mxfp4(packed_weight, scales)).to(output_dtype)
 
 
-def a16w4_mxfp4_moe_reference(
+def mxfp4_moe_reference(
     hidden_states: torch.Tensor,
     w13_packed: torch.Tensor,
     w13_scales: torch.Tensor,
@@ -154,10 +159,11 @@ def a16w4_mxfp4_moe_reference(
     topk_ids: torch.Tensor,
     topk_weights: torch.Tensor,
     *,
+    activation_dtype: torch.dtype,
     situ_beta: float = 1.0,
     situ_linear_beta: float | None = None,
 ) -> torch.Tensor:
-    """A16W4 routed experts with BF16 boundaries around FP32 SiTU."""
+    """Routed MXFP4 experts with explicit activation-quantization boundaries."""
 
     combined = torch.zeros_like(hidden_states, dtype=torch.float32)
     for expert_id in range(w13_packed.shape[0]):
@@ -169,6 +175,8 @@ def a16w4_mxfp4_moe_reference(
             hidden_states.index_select(0, token_ids),
             w13_packed[expert_id],
             w13_scales[expert_id],
+            activation_dtype=activation_dtype,
+            output_dtype=hidden_states.dtype,
         )
         output = _mxfp4_linear(
             situ_and_mul(
@@ -178,6 +186,8 @@ def a16w4_mxfp4_moe_reference(
             ),
             w2_packed[expert_id],
             w2_scales[expert_id],
+            activation_dtype=activation_dtype,
+            output_dtype=hidden_states.dtype,
         )
         route_weights = topk_weights[token_ids, slot_ids].float().unsqueeze(-1)
         combined.index_add_(0, token_ids, output.float() * route_weights)

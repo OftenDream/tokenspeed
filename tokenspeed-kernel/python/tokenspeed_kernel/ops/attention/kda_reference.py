@@ -26,7 +26,7 @@ import math
 
 import torch
 import torch.nn.functional as F
-from tokenspeed_kernel.ops.attention.kda_utils import KdaPrefillResult
+from tokenspeed_kernel.ops.attention.kda import KdaPrefillResult
 
 
 def _require_finite(name: str, tensor: torch.Tensor) -> None:

@@ -28,7 +28,8 @@ nothing else is spawned here — an external frontend such as ``smg serve
 this engine dials in at ``tcp://{--data-parallel-address}:
 {--data-parallel-rpc-port}`` (default ``tcp://127.0.0.1:30500``). Headless
 mode implies ``--zmq-msgpack`` + ``--skip-tokenizer-init`` (see
-``launch_scheduler_headless``)."""
+``launch_scheduler_headless``).
+"""
 
 from __future__ import annotations
 
@@ -37,6 +38,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import signal
 import sys
 from pathlib import Path
@@ -54,7 +56,7 @@ from tokenspeed.cli._proc import (
     wait_grpc_serving,
     wait_http_ready,
 )
-from tokenspeed.runtime.utils.launcher import detect_topology
+from tokenspeed.runtime.utils.launcher import _ephemeral_port_range, detect_topology
 from tokenspeed.runtime.utils.network import get_free_port
 from tokenspeed.runtime.utils.process import kill_process_tree
 
@@ -65,6 +67,7 @@ DEFAULT_GATEWAY_PORT = 8000
 DEFAULT_REASONING_PARSER = "passthrough"
 DEEPSEEK_V4_REASONING_PARSER = "deepseek_v31"
 DEEPSEEK_V4_TOOL_CALL_PARSER = "deepseek_v4"
+DEEPSEEK_V41_REASONING_PARSER = "deepseek_v41"
 GLM_REASONING_PARSER = "glm45"
 GLM_TOOL_CALL_PARSER = "glm47_moe"
 INKLING_REASONING_PARSER = "inkling"
@@ -260,6 +263,41 @@ def _gateway_args_with_default_log_level(gateway_args: list[str]) -> list[str]:
     return [*gateway_args, "--log-level", DEFAULT_SMG_LOG_LEVEL]
 
 
+_FREE_PORT_MAX_ATTEMPTS = 5
+
+
+def _free_port_avoiding_ephemeral_range() -> int:
+    """Allocate a free TCP port, retrying one that falls in the ephemeral range.
+
+    ``get_free_port()`` samples via ``bind(("", 0))``, which the kernel
+    satisfies from the very same ephemeral range it uses to auto-assign
+    *source* ports to outbound connections (health probes, gRPC dials, HF
+    Hub downloads, ...). The gap between that sample and the freshly spawned
+    smg subprocess actually binding it is real (process spawn + Python/PyO3
+    import + router construction), and on a host running several
+    ``ts serve`` replicas at once — each doing its own outbound networking —
+    an unrelated connection can grab that exact port first. smg's Rust
+    listeners don't set ``SO_REUSEADDR``, so the late bind then fails with
+    ``AddrInUse``, and because a dead listener aborts the whole
+    ``router.start()`` call, this is fatal to the gateway regardless of
+    which listener (main port, Prometheus, ...) lost the race.
+
+    Retrying a handful of times against a *known* ephemeral range keeps the
+    returned port out of it; on hosts where the range can't be read (e.g.
+    non-Linux), this degrades to a plain ``get_free_port()`` call.
+    """
+    ephemeral = _ephemeral_port_range()
+    port = get_free_port()
+    if ephemeral is None:
+        return port
+    low, high = ephemeral
+    for _ in range(_FREE_PORT_MAX_ATTEMPTS - 1):
+        if not (low <= port <= high):
+            return port
+        port = get_free_port()
+    return port
+
+
 def _gateway_args_with_default_prometheus_port(gateway_args: list[str]) -> list[str]:
     """Bind the smg Prometheus exporter to a freshly allocated free port.
 
@@ -277,10 +315,20 @@ def _gateway_args_with_default_prometheus_port(gateway_args: list[str]) -> list[
     outbound connection (engine bootstrap, readiness probes) as an ephemeral
     source port, failing the gateway bind. Callers that need a stable scrape
     target can still pass an explicit ``--prometheus-port``.
+
+    The port itself is drawn via ``_free_port_avoiding_ephemeral_range()``
+    rather than a bare ``get_free_port()``: even allocated "right before"
+    spawn, a candidate sampled from the ephemeral range can still be raced
+    away by an unrelated outbound connection during subprocess startup —
+    see that helper's docstring.
     """
     if "--prometheus-port" in gateway_args:
         return gateway_args
-    return [*gateway_args, "--prometheus-port", str(get_free_port())]
+    return [
+        *gateway_args,
+        "--prometheus-port",
+        str(_free_port_avoiding_ephemeral_range()),
+    ]
 
 
 def _load_model_config(model_id: str | None) -> dict:
@@ -298,8 +346,22 @@ def _load_model_config(model_id: str | None) -> dict:
     return config if isinstance(config, dict) else {}
 
 
-def _is_deepseek_v4_model(model_id: str | None) -> bool:
+def _is_deepseek_v41_model(model_id: str | None) -> bool:
     if not model_id:
+        return False
+    config = _load_model_config(model_id)
+    if config.get("model_type") in {"deepseek_v41", "deepseek_v41_text"} or (
+        "DeepseekV41ForCausalLM" in (config.get("architectures") or [])
+    ):
+        return True
+    return (
+        re.search(r"deepseek[-_]?v4[._-]?1(?:[-_/]|$)", model_id, re.IGNORECASE)
+        is not None
+    )
+
+
+def _is_deepseek_v4_model(model_id: str | None) -> bool:
+    if not model_id or _is_deepseek_v41_model(model_id):
         return False
     normalized = model_id.lower().replace("_", "-")
     if "deepseek-v4" in normalized or "deepseekv4" in normalized.replace("-", ""):
@@ -373,7 +435,17 @@ def _args_with_default_model_parsers(
     engine_result = list(engine_args)
     gateway_result = list(gateway_args)
 
-    if _is_deepseek_v4_model(model_id):
+    if _is_deepseek_v41_model(model_id):
+        if (
+            "--reasoning-parser" not in engine_result
+            and "--reasoning-parser" not in gateway_result
+        ):
+            engine_result.extend(["--reasoning-parser", DEEPSEEK_V41_REASONING_PARSER])
+            gateway_result.extend(["--reasoning-parser", DEEPSEEK_V41_REASONING_PARSER])
+        if "--tool-call-parser" not in gateway_result:
+            gateway_result.extend(["--tool-call-parser", "deepseek_v41"])
+
+    elif _is_deepseek_v4_model(model_id):
         if (
             "--reasoning-parser" not in engine_result
             and "--reasoning-parser" not in gateway_result
@@ -482,7 +554,7 @@ def _add_rl_control_port(engine_args: list[str]) -> tuple[list[str], str]:
     pinned = _get_from_args(engine_args, "--rl-control-port")
     if pinned is not None:
         return engine_args, f"http://127.0.0.1:{int(pinned)}"
-    port = get_free_port()
+    port = _free_port_avoiding_ephemeral_range()
     return [*engine_args, "--rl-control-port", str(port)], (f"http://127.0.0.1:{port}")
 
 
@@ -609,7 +681,7 @@ async def run_smg(
             pass  # Windows: signal handlers via asyncio aren't supported. Out of scope.
 
     try:
-        engine_port = get_free_port()
+        engine_port = _free_port_avoiding_ephemeral_range()
 
         # Wire the in-engine RL control-plane port (always on). Must happen
         # before spawn_engine.

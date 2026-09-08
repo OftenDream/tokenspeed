@@ -1,5 +1,8 @@
 import argparse
 import json
+import os
+import re
+import shlex
 import subprocess
 import textwrap
 from pathlib import Path
@@ -9,10 +12,12 @@ from slurm_submit import (
     Submission,
     Task,
     gpu_count,
+    harden_bootstrap,
     load_task,
     main,
     parse_args,
     parse_pr_number,
+    parse_runner_alias,
     pr_worktree,
     print_progress,
     print_target,
@@ -135,6 +140,68 @@ def test_load_task_supports_multi_node_gb300_runner(tmp_path):
     )
 
 
+@pytest.mark.parametrize("declared", ["b200-4gpu", "gb200-4gpu"])
+def test_load_task_maps_logical_blackwell_runner_to_gb300(tmp_path, declared):
+    config = write_task(tmp_path, runner=declared)
+
+    assert load_task(tmp_path, config, declared, "gb300-4gpu") == Task(
+        config,
+        "example",
+        "eval",
+        "gb300-4gpu",
+        4,
+        1,
+        declared,
+    )
+
+
+def test_load_task_maps_multinode_gb200_runner_to_gb300(tmp_path):
+    config = write_task(
+        tmp_path,
+        runner="slurm-gb200-4node-4gpu",
+        nodes=4,
+        gpus_per_node=4,
+    )
+
+    assert load_task(
+        tmp_path,
+        config,
+        "slurm-gb200-4node-4gpu",
+        "slurm-gb300-4node-4gpu",
+    ) == Task(
+        config,
+        "example",
+        "eval",
+        "slurm-gb300-4node-4gpu",
+        4,
+        4,
+        "slurm-gb200-4node-4gpu",
+    )
+
+
+def test_parse_runner_alias_rejects_incomplete_value():
+    with pytest.raises(ValueError, match="DECLARED=EFFECTIVE"):
+        parse_runner_alias("b200-4gpu")
+
+
+def test_select_config_rejects_duplicate_runner_alias(tmp_path):
+    config = write_task(tmp_path, runner="gb300-4gpu")
+    args = argparse.Namespace(
+        config=config,
+        runner=[],
+        runner_alias=[
+            "gb300-4gpu=gb300-4gpu",
+            "gb300-4gpu=gb300-4gpu",
+        ],
+        task_types=["eval"],
+        match=None,
+        trigger=None,
+    )
+
+    with pytest.raises(ValueError, match="duplicate declared runner"):
+        select_tasks(args, tmp_path)
+
+
 def test_render_script_passes_declared_gb300_runner_unchanged():
     script = render_script(
         Task(
@@ -152,6 +219,27 @@ def test_render_script_passes_declared_gb300_runner_unchanged():
 
     assert "--runner=gb300-1gpu" in script
     assert "--runner-override" not in script
+    assert 'gpu_ids="${SLURM_JOB_GPUS:-${CUDA_VISIBLE_DEVICES:-}}"' in script
+
+
+def test_render_script_passes_declared_and_effective_runners():
+    script = render_script(
+        Task(
+            "test/ci/eval/example.yaml",
+            "example",
+            "eval",
+            "gb300-4gpu",
+            4,
+            declared_runner="b200-4gpu",
+        ),
+        Path("/shared/source.tar"),
+        Path("/shared/runs"),
+        Path("/shared/cache"),
+        "ghcr.io/example/image@sha256:abc",
+    )
+
+    assert "--runner=b200-4gpu" in script
+    assert "--runner-override=gb300-4gpu" in script
     assert 'gpu_ids="${SLURM_JOB_GPUS:-${CUDA_VISIBLE_DEVICES:-}}"' in script
 
 
@@ -179,6 +267,53 @@ def test_select_all_filters_exact_runner(monkeypatch, tmp_path):
     assert select_tasks(args, tmp_path) == [
         Task(config, "example", "eval", "gb200-1gpu", 1)
     ]
+
+
+def test_select_all_keeps_logical_tasks_and_maps_only_effective_runners(
+    monkeypatch, tmp_path
+):
+    config = write_task(tmp_path, "gb200-1gpu", "eval")
+    unit_config = write_task(tmp_path, "b200-2gpu", "ut")
+    monkeypatch.setattr(
+        "slurm_submit.build_matrix",
+        lambda *_: {
+            "include": [
+                {"config": config, "type": "eval", "runner": "gb200-1gpu"},
+                {"config": unit_config, "type": "ut", "runner": "b200-2gpu"},
+            ]
+        },
+    )
+    args = argparse.Namespace(
+        config=None,
+        runner=[],
+        runner_alias=[
+            "gb200-1gpu=gb300-1gpu",
+            "b200-2gpu=gb300-2gpu",
+        ],
+        task_types=["eval", "ut"],
+        match=None,
+        trigger=None,
+    )
+
+    assert select_tasks(args, tmp_path) == [
+        Task(config, "example", "eval", "gb300-1gpu", 1, 1, "gb200-1gpu"),
+        Task(unit_config, "example", "ut", "gb300-2gpu", 2, 1, "b200-2gpu"),
+    ]
+
+
+def test_select_all_rejects_duplicate_runner_alias(monkeypatch, tmp_path):
+    monkeypatch.setattr("slurm_submit.build_matrix", lambda *_: {"include": []})
+    args = argparse.Namespace(
+        config=None,
+        runner=[],
+        runner_alias=["b200-4gpu=gb300-4gpu", "b200-4gpu=gb300-4gpu"],
+        task_types=["eval"],
+        match=None,
+        trigger=None,
+    )
+
+    with pytest.raises(ValueError, match="duplicate runner alias"):
+        select_tasks(args, tmp_path)
 
 
 def test_select_all_supports_multiple_runners_types_and_model_match(
@@ -392,6 +527,88 @@ def test_render_script_contains_cluster_requirements():
     assert unset in script
     assert script.index(unset) < script.index('srun "${srun_args[@]}"')
     subprocess.run(["bash", "-n"], input=script, text=True, check=True)
+
+
+@pytest.mark.parametrize("nodes", [1, 2])
+@pytest.mark.parametrize(
+    "yaml_status,failures,attempts,status",
+    [(0, 0, 0, 0), (1, 2, 3, 0), (1, 3, 3, 1)],
+)
+def test_retained_bootstrap_retries_and_stops_before_evaluation(
+    tmp_path, monkeypatch, nodes, yaml_status, failures, attempts, status
+):
+    original = render_script(
+        Task("test/ci/eval/example.yaml", "example", "eval", "gb200-4gpu", 4, nodes),
+        Path("/shared/original.tar"),
+        Path("/shared/runs"),
+        Path("/shared/cache"),
+        "ghcr.io/example/original@sha256:abc",
+    )
+    script = harden_bootstrap(original)
+    assert harden_bootstrap(script) == script
+    pattern = r"^(?:container|server|client)_command=\(\n(.*?)\n\)$"
+    old_commands = [shlex.split(s) for s in re.findall(pattern, original, re.M | re.S)]
+    commands = [shlex.split(s) for s in re.findall(pattern, script, re.M | re.S)]
+    assert len(commands) == (1 if nodes == 1 else 2)
+    for old, new in zip(old_commands, commands):
+        assert old[:2] + old[3:] == new[:2] + new[3:]
+        assert new[2] == commands[0][2]
+    for before, after in zip(original.splitlines(), script.splitlines()):
+        if "python3 -m pip install" not in before:
+            assert before == after
+    pip_log, sleep_log, pipeline_log = (
+        tmp_path / name for name in ("pip", "sleep-log", "pipeline")
+    )
+    (tmp_path / "python3").write_text(textwrap.dedent("""\
+        #!/bin/bash
+        if [ "$1" = -c ]; then exit "$YAML_STATUS"; fi
+        if [ "$1" = -m ] && [ "$2" = pip ]; then
+          printf '%s\\n' "$*" >> "$PIP_LOG"
+          [ "$(wc -l < "$PIP_LOG")" -le "$PIP_FAILURES" ] && exit 7
+          exit 0
+        fi
+        printf '%s\\n' "$*" >> "$PIPELINE_LOG"
+        exit 0
+        """))
+    (tmp_path / "sleep").write_text(
+        '#!/bin/bash\nprintf "%s\\n" "$1" >> "$SLEEP_LOG"\n'
+    )
+    for name in ("python3", "sleep"):
+        (tmp_path / name).chmod(0o755)
+    for name, value in {
+        "PATH": f"{tmp_path}:{os.environ['PATH']}",
+        "YAML_STATUS": str(yaml_status),
+        "PIP_FAILURES": str(failures),
+        "PIP_LOG": str(pip_log),
+        "SLEEP_LOG": str(sleep_log),
+        "PIPELINE_LOG": str(pipeline_log),
+    }.items():
+        monkeypatch.setenv(name, value)
+    result = subprocess.run(commands[0], capture_output=True, text=True)
+    assert result.returncode == status
+    calls = pip_log.read_text().splitlines() if pip_log.exists() else []
+    assert len(calls) == attempts
+    for call in calls:
+        assert "--timeout 120" in call and "--progress-bar off" in call
+        assert "--target=/tmp/tokenspeed-ci-python PyYAML>=6,<7" in call
+        assert "--no-cache-dir" not in call
+    sleeps = sleep_log.read_text().splitlines() if sleep_log.exists() else []
+    assert sleeps == ["10"] * max(0, attempts - 1)
+    assert pipeline_log.exists() == (status == 0)
+
+
+def test_render_script_carries_the_tokenspeed_mla_override_into_the_container():
+    script = render_script(
+        Task("test/ci/eval/example.yaml", "example", "eval", "gb300-4gpu", 4, nodes=2),
+        Path("/shared/source.tar"),
+        Path("/shared/runs"),
+        Path("/shared/cache"),
+        "ghcr.io/example/image@sha256:abc",
+    )
+
+    container_env = [line for line in script.splitlines() if "--container-env=" in line]
+    assert len(container_env) == 2
+    assert all("INSTALL_TOKENSPEED_MLA_FROM_SOURCE," in line for line in container_env)
 
 
 def test_render_script_mounts_only_allocated_gb300_devices():

@@ -155,6 +155,14 @@ def _mhc_pre_reduce_apply_kernel(
         gl.store(comb_mix + token * 16 + comb_offsets, comb, mask=active)
 
 
+def _mhc_pre_reduce_apply_block_h(
+    num_tokens: int, hidden_size: int, n_splits: int
+) -> int:
+    if (num_tokens, hidden_size, n_splits) == (64, 4096, 64):
+        return 1024
+    return 512
+
+
 def gluon_mhc_pre_reduce_apply_gfx950(
     gemm_out_mul: torch.Tensor,
     gemm_out_sqrsum: torch.Tensor,
@@ -180,14 +188,19 @@ def gluon_mhc_pre_reduce_apply_gfx950(
         raise ValueError("residual must have shape [tokens, 4, hidden_size]")
     if layer_input.shape != (num_tokens, hidden_size):
         raise ValueError("layer_input must have shape [tokens, hidden_size]")
-    if hidden_size != 7168 or n_splits != 112:
-        raise ValueError("GFX950 mHC specialization requires hidden_size=7168")
+    expected_splits = hidden_size // 64
+    if hidden_size not in (4096, 7168) or n_splits != expected_splits:
+        raise ValueError(
+            "GFX950 mHC specialization requires hidden_size=4096 or 7168 "
+            "with the matching split-K decomposition"
+        )
     if sinkhorn_iters != 20:
         raise ValueError("GFX950 mHC specialization requires 20 Sinkhorn iterations")
-    if not 1 <= num_tokens <= 6:
-        raise ValueError("GFX950 mHC specialization requires 1-6 tokens")
+    if not 1 <= num_tokens <= 64:
+        raise ValueError("GFX950 mHC specialization requires 1-64 tokens")
 
-    _mhc_pre_reduce_apply_kernel[(num_tokens, 14)](
+    block_h = _mhc_pre_reduce_apply_block_h(num_tokens, hidden_size, n_splits)
+    _mhc_pre_reduce_apply_kernel[(num_tokens, hidden_size // block_h)](
         gemm_out_mul,
         gemm_out_sqrsum,
         hc_scale,
@@ -202,6 +215,6 @@ def gluon_mhc_pre_reduce_apply_gfx950(
         HC_EPS=hc_eps,
         SINKHORN_ITERS=sinkhorn_iters,
         N_SPLITS=n_splits,
-        BLOCK_H=512,
+        BLOCK_H=block_h,
         num_warps=1,
     )

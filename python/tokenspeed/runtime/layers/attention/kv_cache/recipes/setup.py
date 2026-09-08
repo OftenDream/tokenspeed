@@ -27,13 +27,19 @@ from dataclasses import dataclass, replace
 from functools import partial
 from typing import Literal
 
-from tokenspeed.runtime.layers.attention.configs.base import BaseAttnConfig
+from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.base import CacheRecipe
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.checkpointed_tail_oe import (
     CheckpointedTailOERecipe,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.deepseek_v4 import (
     DeepseekV4Recipe,
+)
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.deepseek_v41 import (
+    DeepseekV41Recipe,
+)
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.glm53_flash import (
+    Glm53FlashRecipe,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.inkling import (
     InklingRecipe,
@@ -64,7 +70,9 @@ CacheModelFamily = Literal[
     "qwen4_exp",
     "inkling",
     "kimi_k3",
+    "glm53_flash",
     "deepseek_v4",
+    "deepseek_v41",
 ]
 
 
@@ -165,7 +173,9 @@ _RECIPES: dict[CacheModelFamily, Callable[..., CacheRecipe]] = {
     "qwen4_exp": Qwen4ExpRecipe,
     "inkling": InklingRecipe,
     "kimi_k3": KimiK3Recipe,
+    "glm53_flash": Glm53FlashRecipe,
     "deepseek_v4": DeepseekV4Recipe,
+    "deepseek_v41": DeepseekV41Recipe,
 }
 
 
@@ -174,9 +184,9 @@ def prepare_cache_setup(
     family: CacheModelFamily,
     server_args,
     model_config,
-    attn_config: BaseAttnConfig,
+    attn_config: AttnConfig,
     draft_model_config,
-    draft_attn_config: BaseAttnConfig | None,
+    draft_attn_config: AttnConfig | None,
     cache_budget_bytes: int,
     decode_input_tokens: int,
     overlap_schedule_depth: int,

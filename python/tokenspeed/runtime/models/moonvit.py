@@ -62,7 +62,7 @@ except ImportError:
 
 
 from tokenspeed.runtime.multimodal.encoder_cudagraph import (
-    EncoderCudaGraphWrapper,
+    EncoderForwardStepRunner,
     VisionEncoderCudaGraphAdapter,
 )
 from tokenspeed.runtime.multimodal.inputs import Modality, MultimodalDataItem
@@ -416,7 +416,6 @@ def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
 
 
 @get_rope_shape_decorate
-@torch.compile(dynamic=True)
 def get_rope_shape(org, interpolation_mode, shape):
     return (
         F.interpolate(
@@ -989,8 +988,8 @@ class MoonViTVisionPath(nn.Module):
 
     def make_encoder_cudagraph_wrapper(
         self, mapping: Mapping
-    ) -> EncoderCudaGraphWrapper:
-        return EncoderCudaGraphWrapper(
+    ) -> EncoderForwardStepRunner:
+        return EncoderForwardStepRunner(
             adapter=VisionEncoderCudaGraphAdapter(
                 tower=self.vision_tower.encoder,
                 pre_encode=self.pre_encode,

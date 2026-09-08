@@ -34,10 +34,11 @@ global_server_args_dict: dict = {
     "deepseek_v4_mega_moe_max_num_tokens": ServerArgs.deepseek_v4_mega_moe_max_num_tokens,
     "deepseek_v4_indexer_prefill_max_logits_mb": ServerArgs.deepseek_v4_indexer_prefill_max_logits_mb,
     "deepseek_v4_prefill_chunk_size": ServerArgs.deepseek_v4_prefill_chunk_size,
-    "triton_attention_reduce_in_fp32": ServerArgs.triton_attention_reduce_in_fp32,
+    "engram_host_table": ServerArgs.engram_host_table,
+    "engram_host_table_dir": ServerArgs.engram_host_table_dir,
+    "engram_host_table_layout": ServerArgs.engram_host_table_layout,
     "kv_cache_dtype": ServerArgs.kv_cache_dtype,
     "enable_nan_detection": ServerArgs.enable_nan_detection,
-    "enable_p2p_check": ServerArgs.enable_p2p_check,
     "mapping": ServerArgs.mapping,
     "force_deterministic_rsag": ServerArgs.force_deterministic_rsag,
     "low_latency_max_num_tokens_per_gpu": ServerArgs.low_latency_max_num_tokens_per_gpu,
@@ -81,10 +82,11 @@ def global_server_args_dict_update(server_args: ServerArgs):
             "deepseek_v4_mega_moe_max_num_tokens": server_args.deepseek_v4_mega_moe_max_num_tokens,
             "deepseek_v4_indexer_prefill_max_logits_mb": server_args.deepseek_v4_indexer_prefill_max_logits_mb,
             "deepseek_v4_prefill_chunk_size": server_args.deepseek_v4_prefill_chunk_size,
-            "triton_attention_reduce_in_fp32": server_args.triton_attention_reduce_in_fp32,
+            "engram_host_table": server_args.engram_host_table,
+            "engram_host_table_dir": server_args.engram_host_table_dir,
+            "engram_host_table_layout": server_args.engram_host_table_layout,
             "kv_cache_dtype": server_args.kv_cache_dtype,
             "enable_nan_detection": server_args.enable_nan_detection,
-            "enable_p2p_check": server_args.enable_p2p_check,
             "mapping": server_args.mapping,
             "force_deterministic_rsag": server_args.force_deterministic_rsag,
             "low_latency_max_num_tokens_per_gpu": server_args.low_latency_max_num_tokens_per_gpu,
@@ -242,6 +244,7 @@ class Envs:
     TOKENSPEED_CUDA_COREDUMP = EnvBool(False)
     TOKENSPEED_CUDA_COREDUMP_DIR = EnvStr("/tmp/tokenspeed_cuda_coredumps")
     TOKENSPEED_PROFILE_WITH_STACK = EnvBool(True)
+    TOKENSPEED_CUPTI_GRAPH_WARMUP = EnvBool(False)
     TOKENSPEED_TEST_REQUEST_TIME_STATS = EnvBool(False)
     TOKENSPEED_LOG_SPEC_ACCEPT_LENGTHS = EnvBool(False)
     TOKENSPEED_PROFILER_DIR = EnvStr("/tmp")
@@ -281,7 +284,6 @@ class Envs:
 
     # Quantization
     TOKENSPEED_NVFP4_GEMM_SWIGLU_NVFP4_QUANT = EnvBool(True)
-    TOKENSPEED_MINIMAX_AR_USE_TRITON = EnvBool(False)
 
     # EPLB
     TOKENSPEED_EXPERT_DISTRIBUTION_RECORDER_DIR = EnvStr("/tmp")

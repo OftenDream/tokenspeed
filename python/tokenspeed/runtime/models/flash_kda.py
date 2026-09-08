@@ -44,7 +44,7 @@ from tokenspeed.runtime.configs.utils import get_rope_theta as _get_rope_theta
 from tokenspeed.runtime.distributed.comm_manager import CommManager as _CommManager
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import ForwardContext
-from tokenspeed.runtime.execution.cuda_graph_wrapper import (
+from tokenspeed.runtime.execution.forward_step import (
     get_is_capture_mode as _get_is_capture_mode,
 )
 from tokenspeed.runtime.layers.layernorm import RMSNorm
@@ -955,7 +955,6 @@ class SeperateFLASHLocal(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
         comm_manager,
         block_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
@@ -991,7 +990,6 @@ class SeperateFLASHLocal(nn.Module):
             k=None,
             v=None,
             layer=None,
-            out_cache_loc=out_cache_loc,
             token_to_kv_pool=ctx.token_to_kv_pool,
             forward_mode=ctx.forward_mode,
             bs=ctx.bs,
@@ -1189,7 +1187,6 @@ class FLASHLocalDecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
     ) -> torch.Tensor:
         """Attention forward (MLA or KDA) with pre-attn comm fusion."""
         hidden_states = self.moe_comm.pre_attn_comm(hidden_states, ctx)
@@ -1197,7 +1194,6 @@ class FLASHLocalDecoderLayer(nn.Module):
             positions=positions,
             hidden_states=hidden_states,
             ctx=ctx,
-            out_cache_loc=out_cache_loc,
             comm_manager=self.moe_comm,
         )
         return attn_out
@@ -1243,7 +1239,6 @@ class FLASHLocalDecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
         residual: torch.Tensor | None,
         capture_hidden_state: Callable[[torch.Tensor], None] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
@@ -1266,7 +1261,7 @@ class FLASHLocalDecoderLayer(nn.Module):
         )
         if capture_hidden_state is not None:
             capture_hidden_state(self.moe_comm.gather_residual(residual, ctx).clone())
-        attn_out = self._forward_attn(positions, hidden_states, ctx, out_cache_loc)
+        attn_out = self._forward_attn(positions, hidden_states, ctx)
         hidden_states, residual = self._post_attn(attn_out, residual, ctx)
 
         # --- FFN: Group-MoE (EveryLayer-MoE, no dense shortcut) ---
@@ -1394,7 +1389,6 @@ class FLASHLocalModel(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
         input_embeds: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, list[torch.Tensor] | None]:
         if input_embeds is not None:
@@ -1422,7 +1416,6 @@ class FLASHLocalModel(nn.Module):
                     positions,
                     hidden_states,
                     ctx,
-                    out_cache_loc,
                     residual,
                     capture_hidden_state=capture_hidden_state,
                 )

@@ -26,7 +26,7 @@ from dataclasses import dataclass, replace
 from typing import Any
 
 import torch
-from tokenspeed_kernel.ops.attention import dsa_decode_topk, dsa_prefill_topk
+from tokenspeed_kernel.ops.attention.dsa import dsa_decode_topk, dsa_prefill_topk
 from torch import nn
 from transformers import PretrainedConfig
 
@@ -756,7 +756,6 @@ class LongCatDSAAttention(DeepseekV3AttentionMLA):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
         comm_manager: CommManager,
         *,
         selection: LongCatDSASelection | None,
@@ -766,7 +765,6 @@ class LongCatDSAAttention(DeepseekV3AttentionMLA):
             positions,
             hidden_states,
             ctx,
-            out_cache_loc,
             comm_manager,
             block_scale,
             selection,
@@ -782,7 +780,6 @@ class LongCatDSAAttention(DeepseekV3AttentionMLA):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
         comm_manager: CommManager,
         block_scale: torch.Tensor | None,
         selection: LongCatDSASelection | None,
@@ -806,9 +803,7 @@ class LongCatDSAAttention(DeepseekV3AttentionMLA):
         metadata = getattr(ctx.attn_backend, "forward_metadata", None)
         token_to_req = getattr(metadata, "token_to_req_indices", None)
         if current_forward_ctx() is not None and token_to_req is not None:
-            positions, qkv, out_cache_loc = slice_to_real_tokens(
-                token_to_req.numel(), positions, qkv, out_cache_loc
-            )
+            positions, qkv = slice_to_real_tokens(token_to_req.numel(), positions, qkv)
         q_a, latent_cache = qkv.split(
             [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim], dim=-1
         )
@@ -826,18 +821,29 @@ class LongCatDSAAttention(DeepseekV3AttentionMLA):
             total_tokens=int(q_norm.shape[0]),
         )
         num_prefill_tokens = window.start
+        write_locations = []
+        if ctx.num_extends > 0:
+            write_locations.append(
+                ctx.attn_backend.write_locations(self.attn_mqa, ForwardMode.EXTEND)
+            )
+        if window.num_tokens > 0:
+            write_locations.append(
+                ctx.attn_backend.write_locations(self.attn_mqa, ForwardMode.DECODE)
+            )
+        out_cache_loc = (
+            write_locations[0]
+            if len(write_locations) == 1
+            else torch.cat(write_locations)
+        )
         if self.computes_selection:
             indexer_hidden = comm_manager.pre_attn_comm(hidden_states, ctx)
             indexer_hidden = _slice_indexer_rows(
                 indexer_hidden, expected_rows=int(q_norm.shape[0])
             )
             indexer_output = self._require_indexer()(indexer_hidden, q_norm, positions)
-            index_cache_loc = ctx.attn_backend.select_out_cache_loc(
-                self.attn_mqa, out_cache_loc, ctx.forward_mode
-            )
             ctx.token_to_kv_pool.set_index_k_buffer(
                 self.selection_owner_layer_id,
-                index_cache_loc,
+                out_cache_loc,
                 indexer_output.key,
             )
             if ctx.num_extends > 0:
@@ -959,7 +965,6 @@ class LongCatDSAAttention(DeepseekV3AttentionMLA):
             key,
             key[..., : self.kv_lora_rank] if key is not None else None,
             ctx,
-            out_cache_loc,
             save_kv_cache=need_save_kv,
             topk_indices=topk_indices,
             topk_lens=topk_lens,

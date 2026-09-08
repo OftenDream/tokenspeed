@@ -22,7 +22,7 @@
 
 import pytest
 import torch
-from tokenspeed_kernel.ops.attention.triton.dsa_topk import (
+from tokenspeed_kernel.ops.attention.dsa._triton.topk import (
     mark_forced_initial_local_logits,
 )
 

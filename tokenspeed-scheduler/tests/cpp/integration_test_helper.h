@@ -51,8 +51,7 @@ protected:
         cfg.enable_l3_storage = false;
         cfg.cache_groups.push_back(CacheGroupConfig{
             .group_id = "full_attention",
-            .rows_per_page = cfg.prefix_granularity,
-            .entry_stride_tokens = 1,
+            .block_granularity = cfg.prefix_granularity,
             .total_pages = cfg.device_allocator.total_pages,
             .retention = CacheGroupConfig::Retention::FullHistory,
             .family = CacheGroupFamily::History,
@@ -115,6 +114,14 @@ protected:
         scheduler_->Advance(std::move(event));
     }
 
+    void AckWriteBacks(const ExecutionPlan& plan) {
+        for (const CacheOperation& op : ExtractCacheOpsOfKind<WriteBackBatch>(plan)) {
+            for (std::uint32_t id : std::get<WriteBackBatch>(op).op_ids) {
+                SendWriteBackDone(id);
+            }
+        }
+    }
+
     void SendLoadBackDone(std::uint32_t op_id) {
         ExecutionEvent event;
         event.With(cache::LoadBackDone{
@@ -135,8 +142,8 @@ protected:
         scheduler_->Advance(std::move(event));
     }
 
-    // Send Finish (generation complete) to the scheduler.
-    // This triggers FinishEvent: Decoding → Draining (or Finished if no writeback needed).
+    // Send Finish (generation complete) to the scheduler. Finish-created
+    // transfer tickets retain writeback sources after the request reaches Finished.
     void SendFinish(const std::string& request_id) {
         ExecutionEvent event;
         event.With(forward::Finish{
@@ -218,8 +225,7 @@ protected:
         for (std::size_t i = 0; i < GroupIds().size(); ++i) {
             CacheGroupConfig group;
             group.group_id = GroupIds()[i];
-            group.rows_per_page = cfg.prefix_granularity;
-            group.entry_stride_tokens = 1;
+            group.block_granularity = cfg.prefix_granularity;
             group.total_pages = cfg.device_allocator.total_pages;
             group.retention = CacheGroupConfig::Retention::FullHistory;
             group.family = i == 0 ? CacheGroupFamily::History : CacheGroupFamily::State;

@@ -42,9 +42,11 @@ from tokenspeed_kernel.ops.gemm.deep_gemm import (
     transform_sf_into_required_layout,
 )
 from tokenspeed_kernel.ops.gemm.flashinfer import (
+    has_flashinfer_cute_dsl_nvfp4_a16,
     has_flashinfer_fp8_blockscale,
     has_flashinfer_mxfp8,
     prepare_flashinfer_fp8_blockscale_weight_scales,
+    prepare_nvfp4_a16_weights,
     use_flashinfer_fp8_blockscale_prepacked,
 )
 from tokenspeed_kernel.ops.gemm.fp8_utils import swizzle_mxfp8_scale
@@ -69,7 +71,11 @@ from tokenspeed_kernel.platform import (
 )
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.registry import KernelRegistry
-from tokenspeed_kernel.selection import SelectedKernel, select_kernel
+from tokenspeed_kernel.selection import (
+    NoKernelFoundError,
+    SelectedKernel,
+    select_kernel,
+)
 from tokenspeed_kernel.signature import (
     ScaleFormat,
     dense_tensor_format,
@@ -88,6 +94,8 @@ __all__ = [
     "dsv4_grouped_output_projection_warmup_model",
     "dsv4_linear_fp32",
     "fp8_linear",
+    "quantize_fp8_group32_for_linear",
+    "has_flashinfer_cute_dsl_nvfp4_a16",
     "linear_attnres_partials",
     "linear_attnres_partials_available",
     "kimi3_latent_projection",
@@ -100,6 +108,7 @@ __all__ = [
     "mm",
     "prepare_fp8_linear",
     "prepare_weight_nz",
+    "prepare_nvfp4_a16_weights",
     "warmup_prepared_fp8_linears",
 ]
 
@@ -252,6 +261,44 @@ def _require_fp8_linear_plan(plan: object) -> _PreparedFp8Linear:
     if not isinstance(plan, _PreparedFp8Linear):
         raise TypeError("plan must be returned by prepare_fp8_linear")
     return plan
+
+
+def quantize_fp8_group32_for_linear(
+    plan: object,
+    x: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize exact group-32 inputs in the prepared GEMM's scale layout.
+
+    Args:
+        plan: Opaque plan returned by prepare_fp8_linear for [1,32] weights.
+        x: CUDA BF16/FP16 [M,K], K divisible by32. The activation rule preserves
+            the1e-4 amax floor and IEEE upward power-of-two scale rounding.
+
+    Returns:
+        FP8 values and UE8M0 scales ready for fp8_linear(input_scales=...).
+        FlashInfer plans receive fully initialized1D F8_128x4 scales directly;
+        portable/other plans retain the2D row-major scale contract. Outputs
+        belong to this call and are never cached across eager or graph calls.
+    """
+    typed_plan = _require_fp8_linear_plan(plan)
+    if typed_plan.block_size != (1, 32):
+        raise ValueError("Exact group-32 plan quantization requires [1,32] weights")
+    from tokenspeed_kernel.ops.quantization import (
+        quantize_fp8_group32_ue8m0_swizzled,
+        quantize_fp8_with_scale,
+    )
+
+    if typed_plan.override == "flashinfer_mm_mxfp8":
+        return quantize_fp8_group32_ue8m0_swizzled(x, override=None, solution="triton")
+    return quantize_fp8_with_scale(
+        x,
+        granularity="token_group",
+        group_size=32,
+        scale_encoding="ue8m0",
+        enable_pdl=False,
+        override="triton_quantize_fp8_group32_ue8m0",
+        solution=None,
+    )
 
 
 def fp8_linear(
@@ -682,6 +729,69 @@ def dsv4_grouped_output_projection_warmup_model(
         )
 
 
+def grouped_bf16_projection(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    out: torch.Tensor | None,
+    solution: str | None,
+) -> torch.Tensor:
+    """Compute ``einsum('tgd,grd->tgr', x, weight)`` from canonical BF16 weights.
+
+    Args:
+        x: BF16 ``[tokens, groups, input_dim]`` activations. Strided group and
+            token views, including a slice of padded attention heads, are valid.
+        weight: BF16 ``[groups, output_dim, input_dim]`` live weights. No packing,
+            copying or persistent weight cache is created. Group/row strides are
+            explicit; nonunit inner strides use the original torch fallback.
+        out: Optional contiguous BF16 ``[tokens, groups, output_dim]`` result.
+            Must not overlap either input. None allocates a fresh result.
+        solution: Optional registered solution restriction ("triton" or "torch").
+            None selects an implementation from the input geometry.
+
+    Returns:
+        BF16 ``[tokens, groups, output_dim]``; out when provided. Registered
+        implementations declare their supported geometry; unmatched inputs use
+        torch.einsum. Eager and graph execution use the same selection path.
+    """
+    if x.ndim != 3 or weight.ndim != 3:
+        raise ValueError("Grouped projection requires two rank-3 tensors")
+    if x.dtype != torch.bfloat16 or weight.dtype != torch.bfloat16:
+        raise ValueError("Grouped projection requires BF16 operands")
+    if x.device != weight.device or x.shape[1:] != (weight.shape[0], weight.shape[2]):
+        raise ValueError(
+            "Grouped projection operands must share device/groups/input_dim"
+        )
+    expected = (x.shape[0], weight.shape[0], weight.shape[1])
+    if out is not None and (
+        tuple(out.shape) != expected
+        or out.dtype != x.dtype
+        or out.device != x.device
+        or not out.is_contiguous()
+    ):
+        raise ValueError(
+            "Grouped projection out must be contiguous BF16 with matching shape/device"
+        )
+    kernel = select_kernel(
+        "gemm",
+        "grouped_bf16_projection",
+        format_signature(
+            x=dense_tensor_format(torch.bfloat16),
+            weight=dense_tensor_format(torch.bfloat16),
+        ),
+        traits={
+            "batch": weight.shape[0],
+            "m": x.shape[0],
+            "n": weight.shape[1],
+            "k": weight.shape[2],
+            "is_cuda": x.is_cuda,
+            "a_inner_stride_one": x.stride(-1) == 1,
+            "b_inner_stride_one": weight.stride(-1) == 1,
+        },
+        solution=solution,
+    )
+    return kernel(x, weight, out)
+
+
 def dsv4_linear_fp32(
     hidden_states: torch.Tensor,
     weight: torch.Tensor,
@@ -722,15 +832,25 @@ def dsv4_linear_fp32(
         hidden_states=dense_tensor_format(hidden_states.dtype),
         weight=dense_tensor_format(weight.dtype),
     )
-    kernel = select_kernel(
-        "gemm",
-        "dsv4_linear_fp32",
-        signature,
-        traits=traits,
-        override=override,
-        solution=solution,
-    )
     k = int(weight.shape[1])
+    try:
+        kernel = select_kernel(
+            "gemm",
+            "dsv4_linear_fp32",
+            signature,
+            traits=traits,
+            override=override,
+            solution=solution,
+        )
+    except NoKernelFoundError:
+        if override is not None or solution is not None:
+            raise
+        flat = hidden_states.reshape(-1, k)
+        if flat.is_cuda and flat.dtype == weight.dtype:
+            output = torch.mm(flat, weight.t(), out_dtype=torch.float32)
+        else:
+            output = torch.mm(flat.float(), weight.float().t())
+        return output.reshape(*hidden_states.shape[:-1], weight.shape[0])
     shape_params = {
         "M": int(prod(hidden_states.shape[:-1])),
         "N": int(weight.shape[0]),
@@ -769,6 +889,7 @@ _KERNELS_WITH_FUSED_BIAS: frozenset[str] = frozenset(
 _KERNELS_WITH_PDL: frozenset[str] = frozenset(
     {
         "deep_gemm_mm_fp8_blockscale",
+        "flashinfer_cute_dsl_mm_nvfp4_a16",
         "flashinfer_mm_nvfp4",
     }
 )
@@ -831,6 +952,20 @@ def _gemm_format_signature(
         return format_signature(
             a=tensor_format("scaled-fp8", A.dtype, scale=scale),
             b=tensor_format("scaled-fp8", B.dtype, scale=scale),
+        )
+    if quant == "nvfp4_a16":
+        if A_scales is not None:
+            raise ValueError("nvfp4_a16 requires A_scales=None for dense activations")
+        if B_scales is None:
+            raise ValueError("nvfp4_a16 format selection requires B_scales")
+        b_scale = ScaleFormat(
+            storage_dtype=B_scales.dtype,
+            granularity="block",
+            block_shape=(16,),
+        )
+        return format_signature(
+            a=dense_tensor_format(A.dtype),
+            b=tensor_format("nvfp4", B.dtype, scale=b_scale),
         )
     if quant == "nvfp4":
         a_scale = ScaleFormat(
@@ -1040,12 +1175,13 @@ def mm(
         out: Optional output buffer. The output may be a strided view
             but must have contiguous rows (``stride(-1) == 1``).
         out_dtype: Output dtype (defaults to ``A.dtype``).
-        alpha: Global scaling factor (nvfp4 only).
+        alpha: Global scaling factor (nvfp4 modes only).
         block_size: Block size for block-wise quantization, e.g.
             ``[128, 128]``
-        quant: Explicit quant type override.  One of ``"mxfp8"``,
-            ``"fp8"``, ``"nvfp4"``, ``"mxfp4"``, ``"none"``.
-            If ``None``, inferred from input dtypes and scales.
+        quant: Explicit quant type override. One of ``"mxfp8"``, ``"fp8"``,
+            ``"nvfp4"``, ``"nvfp4_a16"``, ``"mxfp4"``, ``"none"``.
+            ``"nvfp4_a16"`` uses dense BF16 activations and prepared packed
+            NVFP4 weights. If ``None``, inferred from input dtypes and scales.
         override: Force selection of a specific kernel by name (e.g.
             ``"cublaslt_mm_nvfp4"``). Bypasses heuristic scoring.
         prepacked_scales: Whether the FP8 block scales already use the selected
@@ -1058,6 +1194,9 @@ def mm(
     M = A.shape[0]
     if quant == "mxfp4":
         K = A.shape[-1] * 2
+        N = B.shape[0]
+    elif quant == "nvfp4_a16":
+        K = A.shape[-1]
         N = B.shape[0]
     else:
         K = A.shape[-1]

@@ -492,19 +492,19 @@ def _kda_fused_decode_kernel(
 
 @gluon.jit
 def _kda_fused_verify_kernel(
-    mixed_qkv,
-    conv_weights,
-    conv_pool,
-    raw_g,
-    beta_logits,
-    state_pool,
-    read_indices,
+    mixed_qkv: tl.const,
+    conv_weights: tl.const,
+    conv_pool: tl.const,
+    raw_g: tl.const,
+    beta_logits: tl.const,
+    state_pool: tl.const,
+    read_indices: tl.const,
     output,
     replay_mixed_qkv,
     replay_gate,
     replay_beta,
-    a_log,
-    dt_bias,
+    a_log: tl.const,
+    dt_bias: tl.const,
     H: gl.constexpr,
     D: gl.constexpr,
     TOKENS_PER_SEQUENCE: gl.constexpr,
@@ -520,12 +520,18 @@ def _kda_fused_verify_kernel(
     REPLAY_MIXED_ROW_STRIDE: gl.constexpr,
     REPLAY_GATE_ROW_STRIDE: gl.constexpr,
     REPLAY_BETA_ROW_STRIDE: gl.constexpr,
+    CAPTURE_REPLAY: gl.constexpr,
     STATE_POOL_PAGE_STRIDE: gl.constexpr,
     NUM_POOL_SLOTS: gl.constexpr,
     HAS_LOWER_BOUND: gl.constexpr,
     LOWER_BOUND: gl.constexpr,
 ):
-    """Run dense no-store verify while capturing its raw replay payload."""
+    """Run dense no-store verify, optionally capturing its raw replay payload."""
+    # Every input pointer is const, so none of them may be written -- including
+    # through a replay name pointed at the same tensor, which the compiler
+    # cannot see. ``CAPTURE_REPLAY`` off prunes the three replay stores, and
+    # with it on the launch wrapper rejects a replay buffer that aliases an
+    # input.
     head_program_idx = gl.program_id(0)
     head_idx = head_program_idx // VALUE_SPLITS
     value_split_idx = head_program_idx % VALUE_SPLITS
@@ -609,12 +615,13 @@ def _kda_fused_verify_kernel(
         qkv_input = gl.load(mixed_qkv + token_idx * MIXED_ROW_STRIDE + qkv_channel).to(
             gl.float32
         )
-        replay_owner = (slot_id != 3) & (value_split_idx == 0)
-        gl.store(
-            replay_mixed_qkv + token_idx * REPLAY_MIXED_ROW_STRIDE + qkv_channel,
-            qkv_input,
-            mask=replay_owner,
-        )
+        if CAPTURE_REPLAY:
+            replay_owner = (slot_id != 3) & (value_split_idx == 0)
+            gl.store(
+                replay_mixed_qkv + token_idx * REPLAY_MIXED_ROW_STRIDE + qkv_channel,
+                qkv_input,
+                mask=replay_owner,
+            )
         qkv_value = _kda_conv_step(
             qkv_history0,
             qkv_history1,
@@ -629,12 +636,13 @@ def _kda_fused_verify_kernel(
         raw_gate_value = gl.load(
             raw_g + token_idx * GATE_ROW_STRIDE + decay_channel
         ).to(gl.float32)
-        replay_owner = is_decay & (value_split_idx == 0)
-        gl.store(
-            replay_gate + token_idx * REPLAY_GATE_ROW_STRIDE + decay_channel,
-            raw_gate_value,
-            mask=replay_owner,
-        )
+        if CAPTURE_REPLAY:
+            replay_owner = is_decay & (value_split_idx == 0)
+            gl.store(
+                replay_gate + token_idx * REPLAY_GATE_ROW_STRIDE + decay_channel,
+                raw_gate_value,
+                mask=replay_owner,
+            )
         decay_value = _kda_decay(
             raw_gate_value,
             gl.load(dt_bias + decay_channel).to(gl.float32),
@@ -669,12 +677,13 @@ def _kda_fused_verify_kernel(
         beta_value = gl.load(beta_logits + token_idx * BETA_ROW_STRIDE + head_idx).to(
             gl.float32
         )
-        replay_owner = value_split_idx == 0
-        gl.store(
-            replay_beta + token_idx * REPLAY_BETA_ROW_STRIDE + head_idx,
-            beta_value,
-            mask=replay_owner,
-        )
+        if CAPTURE_REPLAY:
+            replay_owner = value_split_idx == 0
+            gl.store(
+                replay_beta + token_idx * REPLAY_BETA_ROW_STRIDE + head_idx,
+                beta_value,
+                mask=replay_owner,
+            )
         beta_value = 1.0 / (1.0 + gl.exp(-beta_value))
         value_panels = _kda_value_panels(vectors, D, value_layout)
         q_values = q_values + (q_value,)
@@ -742,6 +751,7 @@ def _kda_fused_verify_kernel(
 @gluon.jit
 def _kda_fused_replay_kernel(
     descriptors,
+    group_indices,
     read_indices,
     write_indices,
     accepted_length,
@@ -759,7 +769,6 @@ def _kda_fused_replay_kernel(
     STATE_POOL_PAGE_STRIDE: gl.constexpr,
     HAS_LOWER_BOUND: gl.constexpr,
     LOWER_BOUND: gl.constexpr,
-    LAYERS_PER_GROUP: gl.constexpr,
     BATCH_SIZE: gl.constexpr,
 ):
     """Replay accepted raw-g prefixes for every descriptor layer.
@@ -803,7 +812,8 @@ def _kda_fused_replay_kernel(
         gl.load(descriptors + descriptor_base + 9),
         gl.pointer_type(gl.bfloat16),
     )
-    group_offset = (layer_idx // LAYERS_PER_GROUP) * BATCH_SIZE
+    group_idx = gl.load(group_indices + layer_idx).to(gl.int64)
+    group_offset = group_idx * BATCH_SIZE
     read_indices += group_offset
     write_indices += group_offset
 
@@ -1361,9 +1371,35 @@ def gluon_kda_fused_verify_gfx950(
     read_indices = read_indices.to(
         device=mixed_qkv.device, dtype=torch.int32
     ).contiguous()
-    replay_mixed_qkv = replay_mixed_qkv if replay_mixed_qkv is not None else mixed_qkv
-    replay_gate = replay_gate if replay_gate is not None else raw_g
-    replay_beta = replay_beta if replay_beta is not None else beta_logits
+    supplied = (
+        replay_mixed_qkv is not None,
+        replay_gate is not None,
+        replay_beta is not None,
+    )
+    if len(set(supplied)) != 1:
+        raise ValueError(
+            "replay_mixed_qkv, replay_gate and replay_beta must be supplied "
+            "together or all left unset"
+        )
+    capture_replay = supplied[0]
+    if capture_replay:
+        # The kernel declares the projections const, so it may not write them.
+        # Capturing into one would do exactly that, and the store would be
+        # invisible to the compiler: it targets a different parameter name.
+        aliased = [
+            name
+            for name, destination, source in (
+                ("replay_mixed_qkv", replay_mixed_qkv, mixed_qkv),
+                ("replay_gate", replay_gate, raw_g),
+                ("replay_beta", replay_beta, beta_logits),
+            )
+            if destination.data_ptr() == source.data_ptr()
+        ]
+        if aliased:
+            raise ValueError(
+                f"{', '.join(aliased)} must not alias the projections the "
+                "verify kernel reads; the replay payload needs its own buffers"
+            )
     output = torch.empty(
         (1, tokens, num_heads, head_dim),
         dtype=mixed_qkv.dtype,
@@ -1396,9 +1432,10 @@ def gluon_kda_fused_verify_gfx950(
         CONV_POOL_HISTORY_STRIDE=conv_pool.stride(2),
         GATE_ROW_STRIDE=raw_g.stride(0),
         BETA_ROW_STRIDE=beta_logits.stride(0),
-        REPLAY_MIXED_ROW_STRIDE=replay_mixed_qkv.stride(0),
-        REPLAY_GATE_ROW_STRIDE=replay_gate.stride(0),
-        REPLAY_BETA_ROW_STRIDE=replay_beta.stride(0),
+        REPLAY_MIXED_ROW_STRIDE=(replay_mixed_qkv.stride(0) if capture_replay else 0),
+        REPLAY_GATE_ROW_STRIDE=replay_gate.stride(0) if capture_replay else 0,
+        REPLAY_BETA_ROW_STRIDE=replay_beta.stride(0) if capture_replay else 0,
+        CAPTURE_REPLAY=capture_replay,
         STATE_POOL_PAGE_STRIDE=state_pool.stride(0),
         NUM_POOL_SLOTS=state_pool.shape[0],
         HAS_LOWER_BOUND=lower_bound is not None,
@@ -1411,6 +1448,7 @@ def gluon_kda_fused_verify_gfx950(
 
 def gluon_kda_fused_replay_gfx950(
     descriptors: torch.Tensor,
+    group_indices: torch.Tensor,
     read_indices: torch.Tensor,
     write_indices: torch.Tensor,
     accepted_length: torch.Tensor,
@@ -1426,7 +1464,6 @@ def gluon_kda_fused_replay_gfx950(
     state_stride: int,
     gate_stride: int,
     conv_width: int,
-    layers_per_group: int,
     lower_bound: float,
 ) -> None:
     """Replay every raw-g layer through the established Gluon recurrence."""
@@ -1437,6 +1474,17 @@ def gluon_kda_fused_replay_gfx950(
         raise ValueError("descriptors must have shape [layers, 10]")
     if descriptors.dtype != torch.uint64 or not descriptors.is_contiguous():
         raise ValueError("descriptors must be contiguous uint64")
+    layers = descriptors.shape[0]
+    if group_indices.shape != (layers,):
+        raise ValueError(
+            f"group_indices must have shape ({layers},), got {group_indices.shape}"
+        )
+    if group_indices.dtype != torch.int32:
+        raise TypeError("group_indices must use torch.int32")
+    if group_indices.device != descriptors.device:
+        raise ValueError("group_indices and descriptors must be on the same device")
+    if not group_indices.is_contiguous():
+        raise ValueError("group_indices must be contiguous")
     if read_indices.ndim != 2 or write_indices.shape != read_indices.shape:
         raise ValueError(
             "replay page indices must have matching [groups, batch] shapes"
@@ -1446,6 +1494,7 @@ def gluon_kda_fused_replay_gfx950(
         raise ValueError("accepted_length must match the replay batch")
     _kda_fused_replay_kernel[(num_heads, batch, descriptors.shape[0])](
         descriptors,
+        group_indices,
         read_indices,
         write_indices,
         accepted_length,
@@ -1463,7 +1512,6 @@ def gluon_kda_fused_replay_gfx950(
         STATE_POOL_PAGE_STRIDE=state_stride,
         HAS_LOWER_BOUND=True,
         LOWER_BOUND=lower_bound,
-        LAYERS_PER_GROUP=layers_per_group,
         BATCH_SIZE=batch,
         num_warps=4,
         num_stages=2,

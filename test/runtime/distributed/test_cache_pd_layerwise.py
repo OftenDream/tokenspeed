@@ -562,7 +562,7 @@ def test_layerwise_fanout_is_layer_major_and_completes_once() -> None:
 
     manager._cache_transfer_blocks = cache_transfer_blocks
 
-    def transfer_data(session, blocks):
+    def transfer_data(session, blocks, packer=None):
         events.append(("send", session, tuple(blocks)))
         return 0
 
@@ -631,7 +631,7 @@ def test_layerwise_fanout_failure_aborts_before_later_intervals() -> None:
     )
     manager._cache_transfer_blocks = lambda **_kwargs: iter(((1, 2, 3),))
 
-    def transfer(session, _blocks):
+    def transfer(session, _blocks, packer=None):
         events.append(("send", session))
         return -1 if session == "session-1" else 0
 
@@ -656,7 +656,7 @@ def test_dsa_sparse_prefill_publishes_one_cache_step_after_cache_use(
 ) -> None:
     import torch
 
-    from tokenspeed.runtime.layers.attention.backends import dsa as dsa_backend
+    from tokenspeed.runtime.layers.attention.backends.paged import dsa as dsa_backend
 
     events = []
     backend = object.__new__(dsa_backend.DSABackend)
@@ -696,6 +696,7 @@ def test_dsa_sparse_prefill_publishes_one_cache_step_after_cache_use(
         ),
         page_table=torch.zeros((1, 1), dtype=torch.int32),
         seq_lens=torch.ones(1, dtype=torch.int32),
+        kv_seq_lens=torch.ones(1, dtype=torch.int32),
         workspace_indices=torch.zeros((1, 2), dtype=torch.int64),
         topk_lens=torch.ones(1, dtype=torch.int32),
         kv_workspace_slots=torch.zeros(1, dtype=torch.int64),

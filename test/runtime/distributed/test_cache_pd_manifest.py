@@ -61,6 +61,16 @@ def _group_spec(
     retention: str = "full_history",
     sliding_window_tokens: int | None = None,
 ) -> CacheGroupSpec:
+    # A state group is one checkpoint per block; a history group is rows.
+    if family == "state":
+        return CacheGroupSpec(
+            group_id=group_id,
+            retention=retention,
+            sliding_window_tokens=sliding_window_tokens,
+            family=family,
+            transfer_policy=policy,
+            checkpoint_granularity=prefix_granularity,
+        )
     return CacheGroupSpec(
         group_id=group_id,
         retention=retention,
@@ -162,7 +172,7 @@ def test_recipe_layer_owns_transfer_schema_api() -> None:
         model_config=SimpleNamespace(
             num_attention_layers=1,
             num_key_value_heads=8,
-            hf_config=SimpleNamespace(),
+            hf_text_config=SimpleNamespace(),
         ),
     )
 
@@ -595,6 +605,7 @@ def test_pd_derives_ordinary_transfer_metadata_from_physical_plan(
 ) -> None:
     import torch
 
+    from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
     from tokenspeed.runtime.layers.attention.configs.dsa import DSAConfig
     from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
     from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
@@ -603,19 +614,11 @@ def test_pd_derives_ordinary_transfer_metadata_from_physical_plan(
     )
 
     common = {
-        "device": "cpu",
         "backend_name": "test",
         "num_attention_heads": 8,
         "num_kv_heads": 4,
         "head_dim": 8,
         "attn_tp_size": 2,
-        "dtype": torch.bfloat16,
-        "kv_cache_dtype": torch.bfloat16,
-        "prefix_granularity": 16,
-        "context_len": 256,
-        "max_bs": 4,
-        "max_graph_bs": 4,
-        "kv_cache_quant_method": "none",
     }
     classes = {"mha": MHAConfig, "mla": MLAConfig, "dsa": DSAConfig}
     extras = {}
@@ -630,11 +633,21 @@ def test_pd_derives_ordinary_transfer_metadata_from_physical_plan(
         )
     if family == "dsa":
         extras.update(index_topk=4, index_head_dim=128, index_n_heads=1)
-    config = classes[family](
+    spec = classes[family](
         **common,
         **extras,
-        layer_types=(),
+        cache_layer_types=(),
+    )
+    config = AttnConfig(
+        device="cpu",
+        dtype=torch.bfloat16,
+        kv_cache_dtype=torch.bfloat16,
+        prefix_granularity=16,
+        context_len=256,
+        max_bs=4,
+        kv_cache_quant_method="none",
         pd_disaggregation_enabled=True,
+        components=(spec,),
     )
 
     recipe = OrdinaryRecipe(
@@ -658,7 +671,7 @@ def test_pd_derives_ordinary_transfer_metadata_from_physical_plan(
     model_config = SimpleNamespace(
         num_attention_layers=2,
         num_key_value_heads=4,
-        hf_config=SimpleNamespace(),
+        hf_text_config=SimpleNamespace(),
     )
     layout = replace(
         layout,

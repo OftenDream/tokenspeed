@@ -49,6 +49,13 @@ CacheCoordinator::CacheCoordinator(std::vector<CacheGroup> groups, std::int32_t 
                 "group block_granularity must be a positive divisor of the prefix granularity");
         _assert(groups_[i].Allocator().CacheBlocksPerLcmBlock() == groups_[i].Spec().cache_blocks_per_lcm_block,
                 "group allocator packing must match its group spec");
+        _assert(groups_[i].Allocator().ShardCount() == groups_[i].Spec().shard_count,
+                "group allocator shard count must match its group spec");
+        const auto& spec = groups_[i].Spec();
+        pool_.RegisterGroup(groups_[i].Id(), spec.cache_blocks_per_lcm_block, spec.shard_count);
+        if (host_pool_ != nullptr) {
+            host_pool_->RegisterGroup(groups_[i].Id(), spec.cache_blocks_per_lcm_block, spec.shard_count);
+        }
         geometry_.emplace_back(group_block_granularity);
         if (groups_[i].Matcher().IsPrefixClosed()) {
             match_order_.push_back(i);
@@ -70,12 +77,12 @@ bool CacheCoordinator::ClearDeviceCache() {
     std::vector<std::pair<std::uint32_t, CacheBlockLocation>> cached_locations;
     for (const CacheGroup& group : groups_) {
         const PrefixCacheIndex& index = group.Index();
-        std::vector<CacheBlockLocation> group_locations = index.EvictableLocations(pool_);
-        if (static_cast<std::int32_t>(group_locations.size()) != index.NumEntries(pool_)) {
+        const std::vector<PrefixCacheIndex::EvictionCandidate> group_entries = index.EvictableCandidates(pool_);
+        if (static_cast<std::int32_t>(group_entries.size()) != index.NumEntries(pool_)) {
             return false;
         }
-        for (CacheBlockLocation location : group_locations) {
-            cached_locations.emplace_back(group.Id(), location);
+        for (const PrefixCacheIndex::EvictionCandidate& entry : group_entries) {
+            cached_locations.emplace_back(group.Id(), entry.location);
         }
     }
 
@@ -94,12 +101,12 @@ bool CacheCoordinator::ClearCache() {
     std::vector<std::pair<std::uint32_t, CacheBlockLocation>> host_locations;
     for (const CacheGroup& group : groups_) {
         const PrefixCacheIndex& index = group.Index();
-        std::vector<CacheBlockLocation> group_locations = index.EvictableLocations(*host_pool_);
-        if (static_cast<std::int32_t>(group_locations.size()) != index.NumEntries(*host_pool_)) {
+        const std::vector<PrefixCacheIndex::EvictionCandidate> group_entries = index.EvictableCandidates(*host_pool_);
+        if (static_cast<std::int32_t>(group_entries.size()) != index.NumEntries(*host_pool_)) {
             return false;
         }
-        for (CacheBlockLocation location : group_locations) {
-            host_locations.emplace_back(group.Id(), location);
+        for (const PrefixCacheIndex::EvictionCandidate& entry : group_entries) {
+            host_locations.emplace_back(group.Id(), entry.location);
         }
     }
 
@@ -113,6 +120,28 @@ bool CacheCoordinator::ClearCache() {
                 "clearable Host cache entry disappeared");
     }
     return true;
+}
+
+CacheCoordinator::BoundaryResidency CacheCoordinator::DeviceBoundaryResidency(const CacheKey& boundary) const {
+    std::int32_t cached = 0;
+    std::int32_t total = 0;
+    for (std::size_t group_index = 0; group_index < groups_.size(); ++group_index) {
+        const std::int32_t pages_per_prefix_hash = prefix_granularity_ / geometry_[group_index].BlockGranularity();
+        for (std::int32_t offset = 0; offset < pages_per_prefix_hash; ++offset) {
+            const CacheKey key{
+                .namespace_id = boundary.namespace_id,
+                .group_id = groups_[group_index].Id(),
+                .content_hash = boundary.content_hash,
+                .page_offset = offset,
+            };
+            cached += groups_[group_index].Index().Contains(pool_, key) ? 1 : 0;
+            ++total;
+        }
+    }
+    if (cached == 0) {
+        return BoundaryResidency::kNone;
+    }
+    return cached == total ? BoundaryResidency::kComplete : BoundaryResidency::kPartial;
 }
 
 std::vector<CacheKey> CacheCoordinator::keysForGroup(std::span<const std::string> content_hashes,
@@ -332,6 +361,11 @@ CacheCoordinator::AcquiredPrefix CacheCoordinator::acquirePrefix(PrefixProbe&& p
     return out;
 }
 
+// A full-pool census, and deliberately so: whether a parent is reclaimable
+// depends on whether a request still owns one of its children, and a reference
+// being dropped is not an event the pool or the index can observe. This is an
+// observability call, not part of admission or placement; those answer their
+// capacity questions from the pool's own counters.
 std::int32_t CacheCoordinator::NumAvailableLcmBlocks() const {
     std::int32_t available = 0;
     for (std::int32_t parent_id = 1; parent_id <= pool_.NumLcmBlocks(); ++parent_id) {
@@ -355,18 +389,27 @@ std::int64_t CacheCoordinator::LcmBlocksNeededFor(std::span<const std::int64_t> 
     return prefix_blocks;
 }
 
-std::size_t CacheCoordinator::NumActiveLcmBlocks(std::span<const std::span<const BlockTable>> request_tables) const {
-    std::unordered_set<std::int32_t> active;
+std::int32_t CacheCoordinator::NumActiveLcmBlocks(std::span<const std::span<const BlockTable>> request_tables) const {
+    // Parent ids are dense in [1, NumLcmBlocks], so a bitmap dedupes shared
+    // prefixes without hashing every block reference of every live request.
+    std::vector<bool> seen(static_cast<std::size_t>(pool_.NumLcmBlocks()) + 1, false);
+    std::int32_t active = 0;
     for (std::span<const BlockTable> tables : request_tables) {
         for (const BlockTable& table : tables) {
             for (const CacheBlockRef& block_ref : table.Blocks()) {
-                if (block_ref) {
-                    active.insert(block_ref->Location().lcm_block_id);
+                if (!block_ref) {
+                    continue;
+                }
+                std::vector<bool>::reference parent_seen =
+                    seen[static_cast<std::size_t>(block_ref->Location().lcm_block_id)];
+                if (!parent_seen) {
+                    parent_seen = true;
+                    ++active;
                 }
             }
         }
     }
-    return active.size();
+    return active;
 }
 
 std::int32_t CacheCoordinator::GroupAvailablePages(std::int32_t group_index) const {
@@ -374,13 +417,7 @@ std::int32_t CacheCoordinator::GroupAvailablePages(std::int32_t group_index) con
             "cache group index out of range");
     const std::int32_t slots_per_parent =
         groups_[static_cast<std::size_t>(group_index)].Allocator().CacheBlocksPerLcmBlock();
-    std::int32_t available = pool_.NumEmptyLcmBlocks() * slots_per_parent;
-    for (std::int32_t id = 1; id <= pool_.NumLcmBlocks(); ++id) {
-        if (pool_.BoundGroup(id) == static_cast<std::uint32_t>(group_index)) {
-            available += slots_per_parent - pool_.OccupiedCount(id);
-        }
-    }
-    return available;
+    return pool_.NumEmptyLcmBlocks() * slots_per_parent + pool_.NumFreeSlots(static_cast<std::uint32_t>(group_index));
 }
 
 std::int32_t CacheCoordinator::NumNewlyReleasableLcmBlocks(std::span<const BlockTable> tables) const {
@@ -445,7 +482,7 @@ void CacheCoordinator::CacheFullBlocks(std::span<BlockTable> tables, std::span<c
         std::vector<CacheKey> keys = keysForGroup(content_hashes, groups_[i].Id());
         const std::int32_t pages_per_prefix_hash = prefix_granularity_ / geometry_[i].BlockGranularity();
         cacheFullBlocksForGroup<CacheTier::kDevice>(i, tables[i], keys, first_slot * pages_per_prefix_hash,
-                                                    access_epoch, boundary_kind);
+                                                    access_epoch, boundary_kind, /*stream_completed_to_host=*/false);
     }
 }
 
@@ -454,6 +491,9 @@ void CacheCoordinator::QueueCachedBlocksForStore(std::span<const std::string> pr
         return;
     }
     for (const CacheGroup& group : groups_) {
+        if (group.Spec().kind == AttnKind::kMambaState) {
+            continue;
+        }
         for (CacheKey& key : keysForGroup(prefix_hashes, group.Id())) {
             if (group.Index().Contains(pool_, key)) {
                 pending_stores_.push_back(StoreCandidate{.key = std::move(key)});
@@ -462,9 +502,29 @@ void CacheCoordinator::QueueCachedBlocksForStore(std::span<const std::string> pr
     }
 }
 
+void CacheCoordinator::QueueLatestSnapshotBlocksForStore(std::span<const std::string> prefix_hashes) {
+    if (host_pool_ == nullptr) {
+        return;
+    }
+    for (const CacheGroup& group : groups_) {
+        if (group.Spec().kind != AttnKind::kMambaState) {
+            continue;
+        }
+        std::vector<CacheKey> keys = keysForGroup(prefix_hashes, group.Id());
+        for (auto key = keys.rbegin(); key != keys.rend(); ++key) {
+            if (group.Index().Contains(pool_, *key)) {
+                pending_stores_.push_back(StoreCandidate{.key = std::move(*key)});
+                break;
+            }
+        }
+    }
+}
+
 void CacheCoordinator::CacheCompletedBlocks(std::span<BlockTable> tables, std::span<const std::string> prefix_hashes,
                                             std::uint64_t access_epoch, std::int32_t first_new_prefix_page,
-                                            std::int32_t num_computed_tokens, CacheBoundaryKind boundary_kind) {
+                                            std::int32_t num_computed_tokens, CacheBoundaryKind boundary_kind,
+                                            bool stream_completed_to_host,
+                                            std::int32_t materialized_state_boundary_tokens) {
     _assert(tables.size() == groups_.size(), "tables/groups size mismatch");
     _assert(first_new_prefix_page >= 0 && static_cast<std::size_t>(first_new_prefix_page) < prefix_hashes.size(),
             "completed page range must be non-empty");
@@ -475,6 +535,8 @@ void CacheCoordinator::CacheCompletedBlocks(std::span<BlockTable> tables, std::s
             .new_prefix_hash_begin = first_new_prefix_page,
             .completed_boundary_kind = boundary_kind,
             .num_computed_tokens = num_computed_tokens,
+            .stream_completed_to_host = stream_completed_to_host,
+            .materialized_state_boundary_tokens = materialized_state_boundary_tokens,
         };
         cacheDeviceCompletedBlocksForGroup(i, demand, access_epoch);
     }
@@ -483,16 +545,22 @@ void CacheCoordinator::CacheCompletedBlocks(std::span<BlockTable> tables, std::s
 template <CacheTier Tier>
 void CacheCoordinator::cacheFullBlocksForGroup(std::size_t group_index, BlockTable& table,
                                                std::span<const CacheKey> keys, std::int32_t first_cache_block,
-                                               std::uint64_t access_epoch, CacheBoundaryKind boundary_kind) {
+                                               std::uint64_t access_epoch, CacheBoundaryKind boundary_kind,
+                                               bool stream_completed_to_host) {
     std::vector<std::pair<CacheKey, CacheBlockRef>> newly_cached;
+    const bool automatically_streams_to_host =
+        stream_device_cache_to_host_ &&
+        (groups_[group_index].Spec().kind == AttnKind::kSlidingWindow || stream_completed_to_host);
     auto* inserted = [&]() -> std::vector<std::pair<CacheKey, CacheBlockRef>>* {
         if constexpr (Tier == CacheTier::kDevice) {
-            return stream_device_cache_to_host_ || cache_mutation_sink_ ? &newly_cached : nullptr;
+            return automatically_streams_to_host || cache_mutation_sink_ ? &newly_cached : nullptr;
         }
         return nullptr;
     }();
-    groups_[group_index].Index().RegisterFullBlocks(tierPool<Tier>(), table, keys, access_epoch, first_cache_block,
-                                                    boundary_kind, inserted);
+    CacheGroup& group = groups_[group_index];
+    group.Index().RegisterFullBlocks(tierPool<Tier>(),
+                                     group.Allocator().BlocksToPublish(table, first_cache_block, keys.size()), keys,
+                                     access_epoch, first_cache_block, boundary_kind, inserted);
     if constexpr (Tier == CacheTier::kHost) {
         return;
     }
@@ -500,7 +568,7 @@ void CacheCoordinator::cacheFullBlocksForGroup(std::size_t group_index, BlockTab
         if (cache_mutation_sink_) {
             cache_mutation_sink_(key, CacheMutation::kStored);
         }
-        if (!stream_device_cache_to_host_) {
+        if (!automatically_streams_to_host) {
             continue;
         }
         pending_stores_.push_back(StoreCandidate{
@@ -516,74 +584,151 @@ CacheBlockRef CacheCoordinator::AcquireDeviceCachedBlock(const CacheKey& key) co
     return groups_[key.group_id].Index().Find(pool_, key);
 }
 
-CacheBlockRef CacheCoordinator::AcquireHostBlock(std::uint32_t group_id) {
-    _assert(host_pool_ != nullptr, "AcquireHostBlock requires a host pool");
-    _assert(group_id < groups_.size(), "Host block group id out of range");
-    GroupAllocator& target = groups_[group_id].Allocator();
-    const std::int32_t packing = target.CacheBlocksPerLcmBlock();
-    if (CacheBlockRef block_ref = host_pool_->AcquireBlock(group_id, packing)) {
-        return block_ref;
-    }
+CacheCoordinator::HostAllocationBatch CacheCoordinator::AcquireHostBlocks(std::span<const std::uint32_t> group_ids) {
+    _assert(host_pool_ != nullptr, "AcquireHostBlocks requires a host pool");
+    HostAllocationBatch batch;
+    batch.blocks.resize(group_ids.size());
+    batch.stats.requested = group_ids.size();
+    _assert(group_ids.size() <= static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max()),
+            "Host allocation batch request exceeds int32 range");
 
-    const auto value = [&](std::uint32_t candidate_group, CacheBlockLocation location) {
-        const auto metadata = groups_[candidate_group].Index().MetadataFor(*host_pool_, location);
-        _assert(metadata.has_value(), "evictable Host block has no cache metadata");
-        return std::tuple{metadata->was_acquired, metadata->last_access_epoch, candidate_group, location.lcm_block_id,
+    std::vector<std::uint32_t> group_order;
+    group_order.reserve(groups_.size());
+    std::vector<bool> seen_group(groups_.size(), false);
+    for (std::size_t i = 0; i < group_ids.size(); ++i) {
+        _assert(group_ids[i] < groups_.size(), "Host block group id out of range");
+        if (!seen_group[group_ids[i]]) {
+            seen_group[group_ids[i]] = true;
+            group_order.push_back(group_ids[i]);
+        }
+    }
+    std::vector<std::vector<std::size_t>> unresolved_by_group(groups_.size());
+    const auto assign = [&](std::span<const std::size_t> indices, std::vector<CacheBlockRef> refs) {
+        _assert(refs.size() <= indices.size(), "Host allocation returned too many blocks");
+        for (std::size_t i = 0; i < refs.size(); ++i) {
+            batch.blocks[indices[i]] = std::move(refs[i]);
+        }
+        return indices.subspan(refs.size());
+    };
+
+    batch.blocks = host_pool_->AcquireAvailableBlocksInOrder(group_ids);
+    for (std::size_t i = 0; i < batch.blocks.size(); ++i) {
+        if (!batch.blocks[i]) {
+            unresolved_by_group[group_ids[i]].push_back(i);
+        }
+    }
+    // Retention value of one Host cache entry: keep what a request has already
+    // proven useful, then the most recently accessed, then a stable tie-break.
+    const auto value = [](std::uint32_t candidate_group, CacheBlockLocation location,
+                          const PrefixCacheIndex::CachedBlockMetadata& metadata) {
+        return std::tuple{metadata.was_acquired, metadata.last_access_epoch, candidate_group, location.lcm_block_id,
                           location.slot_index};
     };
-    using HostCacheValue = decltype(value(group_id, CacheBlockLocation{}));
+    const auto lookup_value = [&](std::uint32_t candidate_group, CacheBlockLocation location) {
+        const auto metadata = groups_[candidate_group].Index().MetadataFor(*host_pool_, location);
+        _assert(metadata.has_value(), "evictable Host block has no cache metadata");
+        return value(candidate_group, location, *metadata);
+    };
+    using HostCacheValue = decltype(lookup_value(std::uint32_t{}, CacheBlockLocation{}));
 
-    // Reusing one child of an already-bound parent destroys less cache than
-    // rebinding a complete parent from another group.
-    std::vector<CacheBlockLocation> local_victims = groups_[group_id].Index().EvictableLocations(*host_pool_);
-    if (!local_victims.empty()) {
-        const auto victim = std::ranges::min_element(
-            local_victims, {}, [&](CacheBlockLocation location) { return value(group_id, location); });
-        _assert(groups_[group_id].Index().Evict(*host_pool_, *victim).has_value(),
-                "selected Host child is not evictable");
-        CacheBlockRef block_ref = host_pool_->AcquireBlock(group_id, packing);
-        _assert(static_cast<bool>(block_ref), "evicting a same-group Host child did not free a placement");
-        return block_ref;
-    }
-
-    std::optional<std::int32_t> victim_parent;
-    std::optional<HostCacheValue> victim_value;
-    for (std::int32_t parent_id = 1; parent_id <= host_pool_->NumLcmBlocks(); ++parent_id) {
-        const std::optional<std::uint32_t> bound_group = host_pool_->BoundGroup(parent_id);
-        if (!bound_group || !groups_[*bound_group].Index().ParentIsFullyEvictable(
-                                *host_pool_, parent_id, groups_[*bound_group].Allocator().CacheBlocksPerLcmBlock())) {
+    for (std::uint32_t group_id : group_order) {
+        std::vector<std::size_t>& unresolved = unresolved_by_group[group_id];
+        if (unresolved.empty()) {
             continue;
         }
-        std::optional<HostCacheValue> parent_value;
-        for (std::int32_t slot = 0; slot < groups_[*bound_group].Allocator().CacheBlocksPerLcmBlock(); ++slot) {
-            const CacheBlockLocation location{.lcm_block_id = parent_id, .slot_index = slot};
-            if (!host_pool_->IsOccupied(location)) {
+        ++batch.stats.same_group_scans;
+        // Host retention ranks was_acquired before epoch, unlike the eviction
+        // index. Finding the best victims still requires a full group scan;
+        // partial_sort below reduces only the ordering work.
+        std::vector<PrefixCacheIndex::EvictionCandidate> local_victims =
+            groups_[group_id].Index().EvictableCandidates(*host_pool_);
+        const std::size_t victim_count = std::min(unresolved.size(), local_victims.size());
+        // Only the entries actually evicted have to be ordered, and the batch
+        // asks for far fewer than the tier holds.
+        std::ranges::partial_sort(local_victims, local_victims.begin() + static_cast<std::ptrdiff_t>(victim_count), {},
+                                  [&](const PrefixCacheIndex::EvictionCandidate& candidate) {
+                                      return value(group_id, candidate.location, candidate.metadata);
+                                  });
+        for (std::size_t i = 0; i < victim_count; ++i) {
+            _assert(groups_[group_id].Index().Evict(*host_pool_, local_victims[i].location).has_value(),
+                    "selected Host child is not evictable");
+        }
+        std::vector<CacheBlockRef> refs =
+            host_pool_->AcquireUpToBlocks(group_id, static_cast<std::int32_t>(unresolved.size()));
+        const std::span<const std::size_t> remaining = assign(unresolved, std::move(refs));
+        unresolved.erase(unresolved.begin(), unresolved.end() - static_cast<std::ptrdiff_t>(remaining.size()));
+    }
+    const bool has_unresolved = std::ranges::any_of(
+        unresolved_by_group, [](const std::vector<std::size_t>& unresolved) { return !unresolved.empty(); });
+    if (has_unresolved) {
+        ++batch.stats.cross_group_scans;
+        std::vector<std::pair<HostCacheValue, std::int32_t>> victim_parents;
+        victim_parents.reserve(static_cast<std::size_t>(host_pool_->NumLcmBlocks()));
+        for (std::int32_t parent_id = 1; parent_id <= host_pool_->NumLcmBlocks(); ++parent_id) {
+            const std::optional<std::uint32_t> bound_group = host_pool_->BoundGroup(parent_id);
+            if (!bound_group ||
+                !groups_[*bound_group].Index().ParentIsFullyEvictable(
+                    *host_pool_, parent_id, groups_[*bound_group].Allocator().CacheBlocksPerLcmBlock())) {
                 continue;
             }
-            const auto child_value = value(*bound_group, location);
-            parent_value = parent_value ? std::max(*parent_value, child_value) : child_value;
+            std::optional<HostCacheValue> parent_value;
+            for (std::int32_t slot = 0; slot < groups_[*bound_group].Allocator().CacheBlocksPerLcmBlock(); ++slot) {
+                const CacheBlockLocation location{.lcm_block_id = parent_id, .slot_index = slot};
+                if (!host_pool_->IsOccupied(location)) {
+                    continue;
+                }
+                const auto child_value = lookup_value(*bound_group, location);
+                parent_value = parent_value ? std::max(*parent_value, child_value) : child_value;
+            }
+            _assert(parent_value.has_value(), "evictable Host parent has no children");
+            victim_parents.emplace_back(*parent_value, parent_id);
         }
-        _assert(parent_value.has_value(), "evictable Host parent has no children");
-        if (!victim_value || *parent_value < *victim_value) {
-            victim_parent = parent_id;
-            victim_value = *parent_value;
-        }
-    }
-    if (!victim_parent) {
-        return {};
-    }
+        std::ranges::sort(victim_parents);
 
-    const std::uint32_t bound_group = *host_pool_->BoundGroup(*victim_parent);
-    for (std::int32_t slot = 0; slot < groups_[bound_group].Allocator().CacheBlocksPerLcmBlock(); ++slot) {
-        const CacheBlockLocation location{.lcm_block_id = *victim_parent, .slot_index = slot};
-        if (host_pool_->IsOccupied(location)) {
-            _assert(groups_[bound_group].Index().Evict(*host_pool_, location).has_value(),
-                    "selected Host parent changed before eviction");
+        std::size_t victim_index = 0;
+        for (std::size_t result_index = 0; result_index < group_ids.size() && victim_index < victim_parents.size();
+             ++result_index) {
+            if (batch.blocks[result_index]) {
+                continue;
+            }
+            const std::uint32_t target_group = group_ids[result_index];
+            std::vector<std::size_t>& unresolved = unresolved_by_group[target_group];
+            while (!unresolved.empty() && victim_index < victim_parents.size()) {
+                const std::int32_t victim_parent = victim_parents[victim_index++].second;
+                const std::optional<std::uint32_t> bound_group = host_pool_->BoundGroup(victim_parent);
+                if (!bound_group ||
+                    !groups_[*bound_group].Index().ParentIsFullyEvictable(
+                        *host_pool_, victim_parent, groups_[*bound_group].Allocator().CacheBlocksPerLcmBlock())) {
+                    continue;
+                }
+                const std::int32_t victim_packing = groups_[*bound_group].Allocator().CacheBlocksPerLcmBlock();
+                for (std::int32_t slot = 0; slot < victim_packing; ++slot) {
+                    const CacheBlockLocation location{.lcm_block_id = victim_parent, .slot_index = slot};
+                    if (host_pool_->IsOccupied(location)) {
+                        _assert(groups_[*bound_group].Index().Evict(*host_pool_, location).has_value(),
+                                "selected Host parent changed before eviction");
+                    }
+                }
+
+                std::vector<CacheBlockRef> refs = host_pool_->AcquireUpToBlocksFromEmptyParent(
+                    target_group, victim_parent, static_cast<std::int32_t>(unresolved.size()));
+                _assert(!refs.empty(), "evicting a Host parent did not free a placement");
+                const std::span<const std::size_t> remaining = assign(unresolved, std::move(refs));
+                unresolved.erase(unresolved.begin(), unresolved.end() - static_cast<std::ptrdiff_t>(remaining.size()));
+                break;
+            }
         }
     }
-    CacheBlockRef block_ref = host_pool_->AcquireBlock(group_id, packing);
-    _assert(static_cast<bool>(block_ref), "evicting a Host parent did not free a placement");
-    return block_ref;
+    batch.stats.allocated = static_cast<std::size_t>(
+        std::ranges::count_if(batch.blocks, [](const CacheBlockRef& block) { return static_cast<bool>(block); }));
+    batch.stats.unallocated = batch.stats.requested - batch.stats.allocated;
+    return batch;
+}
+
+CacheBlockRef CacheCoordinator::AcquireHostBlock(std::uint32_t group_id) {
+    const std::array groups{group_id};
+    HostAllocationBatch batch = AcquireHostBlocks(groups);
+    return batch.blocks.empty() ? CacheBlockRef{} : std::move(batch.blocks.front());
 }
 
 bool CacheCoordinator::evictCachedBlock(std::uint32_t group_id, CacheBlockLocation location) {
@@ -607,17 +752,18 @@ void CacheCoordinator::cacheCompletedBlocksForGroup(std::size_t group_index, con
                          groups_[group_index].Id());
         cacheFullBlocksForGroup<Tier>(group_index, *demand.table, keys,
                                       demand.new_prefix_hash_begin * pages_per_prefix_hash, access_epoch,
-                                      *demand.completed_boundary_kind);
+                                      *demand.completed_boundary_kind, demand.stream_completed_to_host);
         return;
     }
     if (demand.num_computed_tokens < 0) {
         return;
     }
-    // Mamba can publish only a state checkpoint that the kernel materialized
-    // exactly at this boundary. SWA pages are ordinary KV, so an unaligned
-    // endpoint can still publish its trailing complete-page boundary.
+    // Prefill can produce an internal snapshot, but speculative decode commits
+    // only the accepted endpoint. Never infer a written snapshot from an
+    // allocated slot or a completed token hash (including finish/retraction).
+    const std::int32_t boundary_tokens = static_cast<std::int32_t>(demand.prefix_hashes.size()) * prefix_granularity_;
     if (groups_[group_index].Spec().kind == AttnKind::kMambaState &&
-        demand.num_computed_tokens % prefix_granularity_ != 0) {
+        demand.materialized_state_boundary_tokens != boundary_tokens) {
         return;
     }
 
@@ -632,7 +778,8 @@ void CacheCoordinator::cacheCompletedBlocksForGroup(std::size_t group_index, con
     std::vector<CacheKey> keys = keysForGroup(demand.prefix_hashes, groups_[group_index].Id());
     cacheFullBlocksForGroup<Tier>(group_index, *demand.table,
                                   std::span<const CacheKey>{keys}.subspan(static_cast<std::size_t>(first_cache_block)),
-                                  first_cache_block, access_epoch, *demand.completed_boundary_kind);
+                                  first_cache_block, access_epoch, *demand.completed_boundary_kind,
+                                  demand.stream_completed_to_host);
 }
 
 void CacheCoordinator::cacheDeviceCompletedBlocksForGroup(std::size_t group_index, const GroupDemand& demand,
@@ -703,7 +850,9 @@ std::int32_t CacheCoordinator::NumPinnedHostCachedBlocks() const {
 void CacheCoordinator::CacheHostBlock(CacheBlockRef& block_ref, const CacheKey& key) {
     _assert(host_pool_ != nullptr, "CacheHostBlock requires a host pool");
     _assert(key.group_id < groups_.size(), "CacheHostBlock group id out of range");
-    groups_[key.group_id].Index().Register(*host_pool_, block_ref, key, ++next_access_epoch_);
+    groups_[key.group_id].Index().Register(*host_pool_, block_ref, key, ++next_access_epoch_,
+                                           /*logical_block_index=*/-1, CacheBoundaryKind::kChunk,
+                                           /*newly_cached=*/nullptr);
 }
 
 CacheCoordinator MakeCoordinator(std::span<const CacheGroupSpec> specs, std::int32_t prefix_granularity,
@@ -721,7 +870,7 @@ CacheCoordinator MakeCoordinator(std::span<const CacheGroupSpec> specs, std::int
         const std::int32_t group_block_granularity = spec.block_granularity;
         _assert(group_block_granularity > 0 && prefix_granularity % group_block_granularity == 0,
                 "group block_granularity must be a positive divisor of the prefix granularity");
-        auto allocator = std::make_unique<GroupAllocator>(spec.cache_blocks_per_lcm_block, group_id);
+        auto allocator = std::make_unique<GroupAllocator>(spec.cache_blocks_per_lcm_block, group_id, spec.shard_count);
         std::unique_ptr<PrefixMatcher> matcher;
         switch (spec.kind) {
             case AttnKind::kFull:

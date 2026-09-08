@@ -38,10 +38,6 @@ from tokenspeed.runtime.configs.utils import get_rope_parameters
 from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import ForwardContext
-from tokenspeed.runtime.layers.attention.backends.qwen4_exp import (
-    bind_qwen4_exp_side_state,
-)
-from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import FULL_ATTENTION
 from tokenspeed.runtime.layers.attention.linear.layernorm_gated import rmsnorm_fn
 from tokenspeed.runtime.layers.hyperconnection import (
     GatedResidualSimple,
@@ -55,6 +51,11 @@ from tokenspeed.runtime.layers.moe import (
 )
 from tokenspeed.runtime.layers.paged_attention import PagedAttention
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
+from tokenspeed.runtime.layers.qwen4_exp_ple import (
+    Qwen4ExpNGramEmbedding,
+    Qwen4ExpPLELayer,
+    quantize_ple_embedding_rows,
+)
 from tokenspeed.runtime.layers.rotary_embedding import get_rope
 from tokenspeed.runtime.model_loader.weight_utils import (
     default_weight_loader,
@@ -72,11 +73,6 @@ from tokenspeed.runtime.models.qwen3_5 import (
 from tokenspeed.runtime.models.qwen3_5_moe import (
     Qwen3_5MoeMLP,
     Qwen3_5MoeSparseMoeBlock,
-)
-from tokenspeed.runtime.models.qwen4_exp_ple import (
-    Qwen4ExpNGramEmbedding,
-    Qwen4ExpPLELayer,
-    quantize_ple_embedding_rows,
 )
 from tokenspeed.runtime.models.utils import validate_attention_partition
 from tokenspeed.runtime.moe.distribution_recorder import (
@@ -151,7 +147,6 @@ class _Qwen4ExpRMSNormGated(nn.Module):
             return rmsnorm_fn(
                 x,
                 self.weight,
-                None,
                 z=z,
                 eps=self.eps,
                 norm_before_gate=True,
@@ -412,7 +407,6 @@ class Qwen4ExpAttentionDecoderLayer(
             self.scaling,
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
-            group_id=FULL_ATTENTION,
         )
         self.mlp, self.is_moe = _build_qwen4_exp_mlp(
             config,
@@ -438,7 +432,6 @@ class Qwen4ExpAttentionDecoderLayer(
 
             self.indexer = QSAIndexer(
                 config=config,
-                mapping=mapping,
                 layer_id=layer_id,
                 quant_config=quant_config,
                 prefix=add_prefix("indexer", prefix),
@@ -451,30 +444,16 @@ class Qwen4ExpAttentionDecoderLayer(
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
     ) -> torch.Tensor:
         q, k, v, gate = self._project_qkv_rope(positions, hidden_states)
-        if self.indexer is not None:
-            topk_indices = self.indexer(hidden_states, positions, ctx)
-            attention_output = self._qsa_attention(
-                q=q,
-                k=k,
-                v=v,
-                gate=gate,
-                attention_layer=self.attn,
-                ctx=ctx,
-                out_cache_loc=out_cache_loc,
-                topk_indices=topk_indices,
-            )
-        else:
-            attention_output = self._attn(q, k, v, gate, ctx, out_cache_loc)
+        selected_slots = (
+            self.indexer(hidden_states, positions, ctx)
+            if self.indexer is not None
+            else None
+        )
+        attention_output = self._attn(q, k, v, gate, ctx, topk_indices=selected_slots)
         output, _ = self.o_proj(attention_output)
         return output
-
-    def _qsa_attention(self, **kwargs) -> torch.Tensor:
-        """Sparse-attention hook specialized by the MTP draft layer."""
-
-        return self.indexer.sparse_attention(**kwargs)
 
     def forward(
         self,
@@ -482,7 +461,6 @@ class Qwen4ExpAttentionDecoderLayer(
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
         input_ids: torch.Tensor,
         **kwargs,
     ):
@@ -491,7 +469,7 @@ class Qwen4ExpAttentionDecoderLayer(
         attention_output = (
             mixed
             if ctx.forward_mode.is_idle()
-            else self.self_attention(positions, mixed, ctx, out_cache_loc)
+            else self.self_attention(positions, mixed, ctx)
         )
         hidden_states = self._finish_attention(attention_output, residuals, ctx)
         return self._run_mlp(hidden_states, ctx), None
@@ -521,11 +499,6 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
             hc_per_branch_norm=True,
         )
         self.hyper_connection_mixer = GatedResidualSimple(hc_config, use_combine=False)
-        self.ple_layers = tuple(
-            layer.ple
-            for layer in self.layers
-            if getattr(layer, "ple", None) is not None
-        )
         self.qsa_indexers = tuple(
             layer.indexer
             for layer in self.layers
@@ -557,17 +530,11 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
         input_embeds: torch.Tensor | None = None,
         pp_proxy_tensors=None,
         input_deepstack_embeds: torch.Tensor | None = None,
     ):
         del pp_proxy_tensors
-        bind_qwen4_exp_side_state(
-            ctx.attn_backend,
-            self.ple_layers,
-            self.qsa_indexers,
-        )
         hidden_states = (
             self.embed_tokens(input_ids) if input_embeds is None else input_embeds
         )
@@ -579,7 +546,6 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
                     hidden_states=hidden_states,
                     residual=residual,
                     ctx=ctx,
-                    out_cache_loc=out_cache_loc,
                     input_ids=input_ids,
                 )
             if (

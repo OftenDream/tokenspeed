@@ -41,35 +41,19 @@ protected:
         Submit(MakeRequestSpec("r_seed", /*num_pages=*/2, /*start=*/1));
         PlanOnce();
         SendForwardDone("r_seed", {42});
-        auto plan_wb = PlanOnce();
+        const ExecutionPlan seed_stream = PlanOnce();
+        ASSERT_FALSE(ExtractCacheOpsOfKind<WriteBackBatch>(seed_stream).empty());
+        AckWriteBacks(seed_stream);
         SendFinish("r_seed");
-        const WriteBackBatch* wb = nullptr;
-        for (const auto& op : plan_wb.Operations()) {
-            if (auto* cop = std::get_if<CacheOperation>(&op)) {
-                if (auto* w = std::get_if<WriteBackBatch>(cop)) {
-                    wb = w;
-                    break;
-                }
-            }
-        }
-        ASSERT_NE(wb, nullptr);
-        ASSERT_FALSE(wb->op_ids.empty());
-        SendWriteBackDone(wb->op_ids[0]);
+        AckWriteBacks(PlanOnce());
         PlanOnce();
 
         Submit(MakeRequestSpec("r_fill", /*num_pages=*/3, /*start=*/100));
         PlanOnce();
         SendForwardDone("r_fill", {200});
-        auto plan_wb2 = PlanOnce();
+        AckWriteBacks(PlanOnce());
         SendFinish("r_fill");
-        for (const auto& op : plan_wb2.Operations()) {
-            if (auto* cop = std::get_if<CacheOperation>(&op)) {
-                if (auto* w = std::get_if<WriteBackBatch>(cop)) {
-                    if (!w->op_ids.empty()) SendWriteBackDone(w->op_ids[0]);
-                    break;
-                }
-            }
-        }
+        AckWriteBacks(PlanOnce());
         PlanOnce();
     }
 };
@@ -281,7 +265,7 @@ protected:
         SchedulerConfig cfg = SchedulerKvCacheEventTestSuite::MakeConfig();
         cfg.device_allocator.total_pages = 4;
         auto& group = cfg.cache_groups.front();
-        group.rows_per_page = 1;
+        group.block_granularity = 1;
         group.total_pages = 2 * cfg.device_allocator.total_pages;
         group.cache_blocks_per_lcm_block = 2;
         return cfg;
@@ -368,14 +352,10 @@ protected:
 
 TEST_F(HybridPrefixPromotionTestSuite, ThirdRequestReusesPromotedStateBoundary) {
     Submit(MakeHybridRequest("seed", 100));
-    const ExecutionPlan seed_body_plan = PlanOnce();
-    const ForwardBatch* seed_body = FindForwardBatch(seed_body_plan);
-    ASSERT_NE(seed_body, nullptr);
-    EXPECT_EQ(seed_body->input_lengths, std::vector<std::int32_t>{10});
-    const ExecutionPlan seed_tail_plan = PlanOnce();
-    const ForwardBatch* seed_tail = FindForwardBatch(seed_tail_plan);
-    ASSERT_NE(seed_tail, nullptr);
-    EXPECT_EQ(seed_tail->input_lengths, std::vector<std::int32_t>{1});
+    const ExecutionPlan seed_plan = PlanOnce();
+    const ForwardBatch* seed = FindForwardBatch(seed_plan);
+    ASSERT_NE(seed, nullptr);
+    EXPECT_EQ(seed->input_lengths, std::vector<std::int32_t>{11});
     SendForwardDone("seed", {900});
     PlanOnce();
     SendFinish("seed");
@@ -387,14 +367,10 @@ TEST_F(HybridPrefixPromotionTestSuite, ThirdRequestReusesPromotedStateBoundary) 
     ASSERT_NE(promotion, nullptr);
     ASSERT_EQ(promotion->request_ids, std::vector<std::string>{"promote"});
     EXPECT_EQ(promotion->input_lengths, std::vector<std::int32_t>{8});
-    const ExecutionPlan promotion_body_plan = PlanOnce();
-    const ForwardBatch* promotion_body = FindForwardBatch(promotion_body_plan);
-    ASSERT_NE(promotion_body, nullptr);
-    EXPECT_EQ(promotion_body->input_lengths, std::vector<std::int32_t>{2});
-    const ExecutionPlan promotion_tail_plan = PlanOnce();
-    const ForwardBatch* promotion_tail = FindForwardBatch(promotion_tail_plan);
-    ASSERT_NE(promotion_tail, nullptr);
-    EXPECT_EQ(promotion_tail->input_lengths, std::vector<std::int32_t>{1});
+    const ExecutionPlan remainder_plan = PlanOnce();
+    const ForwardBatch* remainder = FindForwardBatch(remainder_plan);
+    ASSERT_NE(remainder, nullptr);
+    EXPECT_EQ(remainder->input_lengths, std::vector<std::int32_t>{3});
     SendForwardDone("promote", {901});
     PlanOnce();
     SendFinish("promote");
@@ -415,8 +391,7 @@ TEST(SchedulerConstructionTest, ValidatesConfigBeforeBuildingPools) {
     cfg.max_batch_size = 8;
     cfg.cache_groups.push_back(CacheGroupConfig{
         .group_id = "full_attention",
-        .rows_per_page = cfg.prefix_granularity,
-        .entry_stride_tokens = 1,
+        .block_granularity = cfg.prefix_granularity,
         .total_pages = 32,
     });
     // device_allocator.total_pages stays 0, so the block pool would be built

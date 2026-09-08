@@ -26,12 +26,19 @@ import math
 
 import torch
 from tokenspeed_kernel_amd._triton import gl, gluon, tl, triton
+from tokenspeed_kernel_amd.ops.gfx950.attention.dsv4.sparse_prefill import (
+    gluon_dsv4_sparse_prefill_gfx950,
+)
 
-__all__ = ["gluon_dsv4_selected_attention_gfx950"]
+__all__ = ["gluon_dsv4_prefill_gfx950"]
+
+
+def _use_sparse_prefill(q: torch.Tensor, indices: torch.Tensor) -> bool:
+    return q.shape[1] in (64, 128) and indices.shape[1] >= 128
 
 
 @gluon.jit
-def _dsv4_selected_attention_kernel(
+def _dsv4_prefill_kernel(
     q,
     kv,
     indices,
@@ -450,7 +457,7 @@ def _validate_inputs(
             raise ValueError(f"out must not alias {name}")
 
 
-def gluon_dsv4_selected_attention_gfx950(
+def gluon_dsv4_prefill_gfx950(
     q: torch.Tensor,
     kv: torch.Tensor,
     indices: torch.Tensor,
@@ -497,10 +504,21 @@ def gluon_dsv4_selected_attention_gfx950(
         output.zero_()
         return output
 
+    if _use_sparse_prefill(q, indices):
+        return gluon_dsv4_sparse_prefill_gfx950(
+            q=q,
+            kv=kv,
+            indices=indices,
+            lens=lens,
+            attn_sink=attn_sink,
+            softmax_scale=scale,
+            out=output,
+        )
+
     kv_rows = kv.reshape(-1, 512)
     sink_values = attn_sink.reshape(-1)
     grid = (q.shape[0], triton.cdiv(q.shape[1], 16))
-    _dsv4_selected_attention_kernel[grid](
+    _dsv4_prefill_kernel[grid](
         q,
         kv_rows,
         indices,

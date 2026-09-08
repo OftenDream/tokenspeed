@@ -194,7 +194,7 @@ def test_missing_public_artifact_falls_back_unless_explicit(monkeypatch):
 
 @pytest.mark.skipif(not _npu_available(), reason="requires an Ascend NPU")
 def test_npu_selection_and_large_prefill_match_torch():
-    from tokenspeed_kernel.ops.attention import (
+    from tokenspeed_kernel.ops.attention.kda import (
         _attention_format_signature,
         kda_causal_conv1d,
     )
@@ -278,7 +278,7 @@ def test_npu_selection_and_large_prefill_match_torch():
 
 @pytest.mark.skipif(not _npu_available(), reason="requires an Ascend NPU")
 def test_npu_decode_graph_replays_updated_input_and_pages():
-    from tokenspeed_kernel.ops.attention import kda_causal_conv1d
+    from tokenspeed_kernel.ops.attention.kda import kda_causal_conv1d
 
     torch.npu.set_device(0)
     device = torch.device("npu:0")

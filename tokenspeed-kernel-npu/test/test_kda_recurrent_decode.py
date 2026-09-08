@@ -194,7 +194,7 @@ def test_tensor_decode_rejects_nonnegative_lower_bound():
 
 @pytest.mark.skipif(not _npu_available(), reason="requires an Ascend NPU")
 def test_npu_decode_selection_and_graph_replay_updated_values():
-    from tokenspeed_kernel.ops.attention import (
+    from tokenspeed_kernel.ops.attention.kda import (
         _attention_format_signature,
         kda_paged_decode,
     )

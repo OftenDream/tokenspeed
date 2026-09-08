@@ -45,7 +45,6 @@ def _stage1_warp_gemv_gluon(
     topk_ids_ptr,  # (num_tokens, topk) int32
     D,
     I_r,
-    num_tokens,
     top_k,
     stride_xm,
     stride_xk,
@@ -133,7 +132,6 @@ def invoke_stage1_warp_decode_gluon(
         topk_ids,
         D,
         I_r,
-        num_tokens,
         topk,
         hidden_states.stride(0),
         hidden_states.stride(1),
@@ -161,7 +159,6 @@ def _stage2_warp_gemv_gluon(
     topk_weights_ptr,  # (num_tokens, topk) float32
     D,
     I_r,
-    num_tokens,
     top_k,
     stride_im,
     stride_ik,
@@ -238,13 +235,17 @@ def invoke_stage2_warp_decode_gluon(
     topk_weights,
     out,
     topk,
-    BLOCK_D: int = 64,
-    BLOCK_K: int = 256,
+    BLOCK_D: int = 8,
+    BLOCK_K: int | None = None,
     num_warps: int = 4,
 ):
     assert inter_states.dtype == torch.bfloat16 and w2.dtype == torch.bfloat16
     assert out.dtype == torch.bfloat16
     E, D, I_r = w2.shape
+    if BLOCK_K is None:
+        BLOCK_K = min(1024, triton.next_power_of_2(I_r))
+        while I_r % BLOCK_K != 0:
+            BLOCK_K //= 2
     num_tokens = out.shape[0]
     assert out.shape == (num_tokens, D)
     assert inter_states.shape == (num_tokens * topk, I_r) and I_r % BLOCK_K == 0
@@ -259,7 +260,6 @@ def invoke_stage2_warp_decode_gluon(
         topk_weights,
         D,
         I_r,
-        num_tokens,
         topk,
         inter_states.stride(0),
         inter_states.stride(1),

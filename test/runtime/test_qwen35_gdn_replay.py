@@ -43,12 +43,15 @@ register_cuda_ci(est_time=30, suite="runtime-1gpu")
 if not torch.cuda.is_available():
     pytest.skip("CUDA required", allow_module_level=True)
 
-from test.runtime.test_gdn_state_paging import _CacheMetadata, _ContractPool
+from test.runtime.test_gdn_state_paging import (
+    _ContractPool,
+    _mamba_config_pair,
+)
 
-from tokenspeed_kernel.ops.attention import gdn_replay_commit_supported
+from tokenspeed_kernel.ops.attention.gdn import gdn_replay_commit_supported
 
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
-from tokenspeed.runtime.layers.attention.backends.hybrid_linear_attn import (
+from tokenspeed.runtime.layers.attention.backends.state.mamba import (
     MambaAttnBackend,
 )
 
@@ -66,15 +69,13 @@ DEVICE = "cuda"
 
 
 def _config(*, replay: bool):
-    return SimpleNamespace(
-        device=DEVICE,
-        num_attention_heads=NUM_K_HEADS,
-        num_kv_heads=NUM_K_HEADS,
-        attn_tp_size=1,
-        dtype=torch.bfloat16,
+    """(AttnConfig, primary spec) with replay_ssm on the linear component."""
+    return _mamba_config_pair(
+        torch,
+        heads=NUM_K_HEADS,
         head_dim=HEAD_K_DIM,
-        is_draft=False,
-        speculative_num_draft_tokens=DRAFT_TOKENS,
+        spec_tokens=DRAFT_TOKENS,
+        device=DEVICE,
         replay_ssm=replay,
     )
 
@@ -86,8 +87,11 @@ def _make_backend(conv_state, recurrent_state, *, replay: bool):
         4,
         {0: ("linear_attention", conv_state, recurrent_state)},
     )
-    backend = MambaAttnBackend(_config(replay=replay))
+    backend = MambaAttnBackend(*_config(replay=replay))
     backend.set_kv_pool(pool)
+    # The persistent decode buffers exist from construction, as at the
+    # wrapper (the verify refresh writes into them).
+    backend.init_cuda_graph_state(BATCH)
     return backend, pool
 
 
@@ -153,13 +157,13 @@ def _forward_verify(backend, pool, inputs, *, layer_id=0):
 
 def _prepare_verify(backend, pool, inputs):
     tables = torch.tensor([[1, 5], [2, 6]], dtype=torch.int32, device=DEVICE)
-    backend.init_forward_metadata(
-        bs=BATCH,
-        req_pool_indices=torch.tensor([0, 1], dtype=torch.int32, device=DEVICE),
-        seq_lens=torch.tensor([7, 7], dtype=torch.int32, device=DEVICE),
+    backend.refresh_decode_metadata(
+        BATCH,
+        BATCH,
+        torch.tensor([0, 1], dtype=torch.int32, device=DEVICE),
+        torch.tensor([7, 7], dtype=torch.int32, device=DEVICE),
         forward_mode=ForwardMode.DECODE,
-        tokens_per_req=DRAFT_TOKENS,
-        cache_metadata=_CacheMetadata({"linear_attention": tables}),
+        block_tables={"linear_attention": tables},
     )
     return _forward_verify(backend, pool, inputs)
 
@@ -272,7 +276,6 @@ def test_qwen_replay_commit_matches_per_position_scratch_fallback(state_dtype):
 def test_qwen_replay_payload_and_commit_survive_cuda_graph_replay():
     conv, recurrent = _initial_pools()
     backend, pool = _make_backend(conv, recurrent, replay=True)
-    backend.init_cuda_graph_state(BATCH)
     backend.preallocate_verify_workspace(BATCH, DRAFT_TOKENS)
     inputs = _inputs(seed=37)
 
@@ -305,12 +308,14 @@ def test_qwen_replay_payload_and_commit_survive_cuda_graph_replay():
     payload_ptr = payload.data_ptr()
     captured_key = payload[:, :KEY_DIM].clone()
     tables = torch.tensor([[1, 5], [2, 6]], dtype=torch.int32, device=DEVICE)
-    backend.init_forward_metadata_replay_cuda_graph(
+    backend.refresh_decode_metadata(
+        BATCH,
         BATCH,
         req_pool_indices,
         seq_lens,
-        ForwardMode.DECODE,
-        cache_metadata=_CacheMetadata({"linear_attention": tables}),
+        forward_mode=ForwardMode.DECODE,
+        for_graph_replay=True,
+        block_tables={"linear_attention": tables},
     )
     inputs["mixed_qkv"].normal_(mean=0.5, std=0.2)
     inputs["a"].normal_(mean=-0.5, std=0.2)
@@ -348,8 +353,9 @@ def test_qwen_replay_commits_all_layers_with_one_kernel_call(monkeypatch):
         )
         if replay and not gdn_replay_commit_supported(torch.bfloat16):
             pytest.skip("GDN ReplaySSM kernel unavailable on this platform")
-        backend = MambaAttnBackend(_config(replay=replay))
+        backend = MambaAttnBackend(*_config(replay=replay))
         backend.set_kv_pool(pool)
+        backend.init_cuda_graph_state(BATCH)
         return backend, pool
 
     replay_backend, replay_pool = make_backend(
@@ -369,9 +375,7 @@ def test_qwen_replay_commits_all_layers_with_one_kernel_call(monkeypatch):
     _prepare_verify(scratch_backend, scratch_pool, inputs[0])
     _forward_verify(scratch_backend, scratch_pool, inputs[1], layer_id=1)
 
-    from tokenspeed.runtime.layers.attention.backends import (
-        hybrid_linear_attn as backend_ops,
-    )
+    from tokenspeed.runtime.layers.attention.backends.state import mamba as backend_ops
 
     original = backend_ops.gdn_replay_commit
     launch_calls = 0
@@ -408,6 +412,133 @@ def test_qwen_replay_commits_all_layers_with_one_kernel_call(monkeypatch):
             atol=1e-6,
             rtol=1e-5,
         )
+
+
+@pytest.mark.parametrize("replay", [False, True])
+def test_rebinding_the_pool_retargets_the_verify_copy_tables(replay):
+    """The copy tables hold the pool's data_ptrs, so a rebind must rebuild them."""
+    backend, _ = _make_backend(*_initial_pools(), replay=replay)
+    backend.preallocate_verify_workspace(BATCH, DRAFT_TOKENS)
+    stale = backend._verify_copy_tables_get()
+
+    replacement = _ContractPool(4, {0: ("linear_attention", *_initial_pools(seed=29))})
+    backend.forward_metadata = object()
+    backend._replay_state_tapes = {1: object()}
+    backend.set_kv_pool(replacement)
+    assert backend._gdn_replay is None
+    assert backend._replay_state_tapes == {}
+    assert backend.forward_metadata is None
+    backend.init_cuda_graph_state(BATCH)
+    assert len(backend.query_start_loc_list) == BATCH
+    backend.preallocate_verify_workspace(BATCH, DRAFT_TOKENS)
+    assert (backend._gdn_replay is not None) == replay
+    tables = backend._verify_copy_tables_get()
+    conv, ssm = backend._state_components(0)
+    assert tables["conv_comp"][0].item() == conv.data_ptr()
+    assert tables["ssm_comp"][0].item() == ssm.data_ptr()
+    assert tables["conv_comp"][0].item() != stale["conv_comp"][0].item()
+
+
+def test_rebinding_a_pool_with_other_state_component_shapes_is_rejected():
+    backend, original = _make_backend(*_initial_pools(), replay=False)
+    conv, _ = _initial_pools(seed=29)
+    recurrent = torch.zeros(
+        8,
+        NUM_V_HEADS * 2,
+        HEAD_V_DIM // 2,
+        HEAD_K_DIM,
+        device=DEVICE,
+        dtype=torch.float32,
+    )
+    with pytest.raises(RuntimeError, match="different state geometry"):
+        backend.set_kv_pool(
+            _ContractPool(4, {0: ("linear_attention", conv, recurrent)})
+        )
+    assert backend.kv_pool is original
+
+
+def test_rebinding_rejects_geometry_change_in_a_nonfirst_state_layer():
+    """Geometry validation must cover every layer, not only min(layer_id)."""
+    conv, recurrent = _initial_pools(seed=37)
+    original = _ContractPool(
+        4,
+        {
+            0: ("linear_attention", conv.clone(), recurrent.clone()),
+            1: ("linear_attention", conv.clone(), recurrent.clone()),
+        },
+    )
+    backend = MambaAttnBackend(*_config(replay=False))
+    backend.set_kv_pool(original)
+
+    changed_recurrent = torch.zeros(
+        recurrent.shape[0],
+        recurrent.shape[1] * 2,
+        recurrent.shape[2] // 2,
+        recurrent.shape[3],
+        device=DEVICE,
+        dtype=recurrent.dtype,
+    )
+    changed = _ContractPool(
+        4,
+        {
+            0: ("linear_attention", conv.clone(), recurrent.clone()),
+            1: ("linear_attention", conv.clone(), changed_recurrent),
+        },
+    )
+
+    with pytest.raises(RuntimeError, match="different state geometry"):
+        backend.set_kv_pool(changed)
+
+    assert backend.kv_pool is original
+
+
+def test_rebinding_a_pool_whose_state_layers_moved_is_rejected():
+    """Equal shapes on shifted layer ids are a different geometry."""
+    conv, recurrent = _initial_pools(seed=41)
+
+    def pool(*layers):
+        return _ContractPool(
+            4,
+            {
+                layer: ("linear_attention", conv.clone(), recurrent.clone())
+                for layer in layers
+            },
+        )
+
+    original = pool(0, 1)
+    backend = MambaAttnBackend(*_config(replay=False))
+    backend.set_kv_pool(original)
+
+    with pytest.raises(RuntimeError, match="different state geometry"):
+        backend.set_kv_pool(pool(1, 2))
+
+    assert backend.kv_pool is original
+
+
+def test_rebinding_a_pool_of_different_state_geometry_is_rejected():
+    backend, original = _make_backend(*_initial_pools(), replay=False)
+    backend.set_cache_pool(original)
+    with pytest.raises(RuntimeError, match="different state geometry"):
+        backend.set_cache_pool(
+            _ContractPool(8, {0: ("linear_attention", *_initial_pools())})
+        )
+
+    assert backend.kv_pool is original
+    assert backend.cache_pool is original
+    assert backend._checkpoint_granularity == 4
+
+
+def test_rebinding_a_state_backend_clears_sparse_metadata():
+    backend, _ = _make_backend(*_initial_pools(), replay=False)
+    share = backend.sparse_topk
+    share.prefill = share.decode = share.qsa_metadata = object()
+
+    backend.set_cache_pool(
+        _ContractPool(4, {0: ("linear_attention", *_initial_pools(seed=31))})
+    )
+    assert share.prefill is None
+    assert share.decode is None
+    assert share.qsa_metadata is None
 
 
 if __name__ == "__main__":

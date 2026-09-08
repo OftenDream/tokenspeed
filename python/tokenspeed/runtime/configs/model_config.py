@@ -45,6 +45,12 @@ from tokenspeed.runtime.utils.hf_transformers_utils import (
     resolve_architecture,
 )
 from tokenspeed.runtime.utils.server_args import ServerArgs
+from tokenspeed.runtime.utils.spec_block_geometry import (
+    BLOCK_SPEC_ALGORITHMS,
+    read_checkpoint_block_size,
+    resolve_block_widths,
+    validate_block_widths,
+)
 
 logger = get_colorful_logger(__name__)
 
@@ -85,6 +91,8 @@ _GLM_DSA_ARCHITECTURES = frozenset(
         # attention family and indexer geometry as GLM-DSA.
         "DeepseekV32ForCausalLM",
         "DeepseekV32ForCausalLMNextN",
+        "Glm53FlashForConditionalGeneration",
+        "Glm53FlashForConditionalGenerationNextN",
     }
 )
 _LONGCAT_DSA_ARCHITECTURES = frozenset({"LongcatCausalLM"})
@@ -160,7 +168,6 @@ class _AttentionFamilySpec:
     architectures: frozenset[str]
     configure: Callable[[object], None]
     default_backend: str | None = None
-    supports_target_verify_forward_mode: bool = False
     default_prefix_granularity: int | None = None
 
 
@@ -216,6 +223,19 @@ def configure_deepseek_v4_attention(model_config) -> None:
         model_config.scaling = model_config.scaling * mscale * mscale
 
 
+def configure_deepseek_v41_attention(model_config) -> None:
+    """V4.1 latent dimensions; YaRN changes RoPE, not the attention scale."""
+    hf = model_config.hf_text_config
+    model_config.head_dim = hf.head_dim
+    model_config.attention_arch = AttentionArch.MLA
+    model_config.kv_lora_rank = hf.head_dim
+    model_config.qk_rope_head_dim = hf.qk_rope_head_dim
+    model_config.qk_nope_head_dim = hf.head_dim - hf.qk_rope_head_dim
+    model_config.v_head_dim = hf.head_dim
+    model_config.index_head_dim = hf.index_head_dim
+    model_config.scaling = hf.head_dim**-0.5
+
+
 def _configure_dsa_geometry(model_config) -> None:
     mla_config = (
         model_config.hf_text_config
@@ -253,6 +273,7 @@ def _configure_dsa_geometry(model_config) -> None:
     model_config.index_topk = mla_config.index_topk
     model_config.index_head_dim = mla_config.index_head_dim
     model_config.index_n_heads = mla_config.index_n_heads
+    model_config.index_kpool = getattr(mla_config, "index_kpool", None)
     model_config.index_topk_pattern = getattr(mla_config, "index_topk_pattern", None)
 
     model_config.scaling = 1 / math.sqrt(
@@ -337,10 +358,18 @@ def configure_minimax_m3_attention(model_config) -> None:
 
 _ATTENTION_FAMILY_SPECS = (
     _AttentionFamilySpec(
+        name="DeepSeek V4.1",
+        architectures=frozenset(
+            {"DeepseekV41ForCausalLM", "DeepseekV41ForCausalLMDSpark"}
+        ),
+        configure=configure_deepseek_v41_attention,
+        default_backend="deepseek_v41",
+        default_prefix_granularity=256,
+    ),
+    _AttentionFamilySpec(
         name="DeepSeek V4",
         architectures=_DEEPSEEK_V4_ARCHITECTURES,
         configure=configure_deepseek_v4_attention,
-        supports_target_verify_forward_mode=True,
         # V4 kernels need P to be a multiple of their fixed page; default to
         # exactly one page rather than restating the number.
         default_prefix_granularity=DEEPSEEK_V4_PAGE_SIZE,
@@ -350,14 +379,12 @@ _ATTENTION_FAMILY_SPECS = (
         architectures=_LONGCAT_DSA_ARCHITECTURES,
         configure=configure_longcat_lsa_attention,
         default_backend="dsa",
-        supports_target_verify_forward_mode=True,
     ),
     _AttentionFamilySpec(
         name="GLM",
         architectures=_GLM_DSA_ARCHITECTURES,
         configure=configure_glm_attention,
         default_backend="dsa",
-        supports_target_verify_forward_mode=True,
     ),
     _AttentionFamilySpec(
         name="MLA",
@@ -393,6 +420,56 @@ def _resolve_attention_family(
         if any(arch in spec.architectures for arch in architectures):
             return spec
     return None
+
+
+def _is_dflash2_mla(
+    hf_config: PretrainedConfig,
+    hf_text_config: PretrainedConfig,
+) -> bool:
+    architectures = _model_architectures(hf_config, hf_text_config)
+    dflash_config = getattr(hf_text_config, "dflash_config", None) or getattr(
+        hf_config, "dflash_config", None
+    )
+    return (
+        "DFlash2DraftModel" in architectures
+        and isinstance(dflash_config, dict)
+        and dflash_config.get("attention_mode") == "mla"
+    )
+
+
+def _apply_block_spec_widths(
+    server_args: ServerArgs,
+    hf_config: PretrainedConfig,
+    hf_text_config: PretrainedConfig,
+) -> int | None:
+    """Reconcile the block-drafter launch widths with the draft checkpoint.
+
+    Args:
+        server_args: Server args whose speculative widths are checked, or set
+            when they were left at their defaults.
+        hf_config: The draft checkpoint's config.
+        hf_text_config: Its text config, searched first.
+
+    Returns:
+        The checkpoint's block size, or None when it declares none.
+    """
+    algorithm = getattr(server_args, "speculative_algorithm", None)
+    if algorithm not in BLOCK_SPEC_ALGORITHMS:
+        return None
+    block_size = read_checkpoint_block_size(hf_text_config, hf_config)
+    if block_size is None:
+        return None
+    if getattr(server_args, "_speculative_widths_explicit", True):
+        validate_block_widths(
+            algorithm,
+            block_size,
+            server_args.speculative_num_steps,
+            server_args.speculative_num_draft_tokens,
+        )
+    num_steps, num_draft_tokens = resolve_block_widths(algorithm, block_size)
+    server_args.speculative_num_steps = num_steps
+    server_args.speculative_num_draft_tokens = num_draft_tokens
+    return block_size
 
 
 def _apply_attention_family_defaults(
@@ -483,17 +560,28 @@ class ModelConfig:
         )
 
         self.hf_text_config = get_hf_text_config(self.hf_config)
+        self.spec_block_size: int | None = None
+        if is_draft_worker:
+            self.spec_block_size = _apply_block_spec_widths(
+                server_args, self.hf_config, self.hf_text_config
+            )
         self.dspark_prefix_replay_tokens: int | None = None
         if (
             is_draft_worker
             and getattr(server_args, "speculative_algorithm", None) == "DSPARK"
-            and resolve_architecture(self.hf_config) == "DeepseekV4ForCausalLMDSpark"
+            and resolve_architecture(self.hf_config)
+            in ("DeepseekV4ForCausalLMDSpark", "DeepseekV41ForCausalLMDSpark")
         ):
             from tokenspeed.runtime.models.deepseek_v4_dspark import (
                 DEFAULT_DSPARK_WINDOW_SIZE,
                 count_dspark_stages,
             )
 
+            if self.spec_block_size is None:
+                raise ValueError(
+                    "DSPARK same-checkpoint decoding requires the checkpoint to "
+                    "declare dspark_block_size."
+                )
             dspark_window_size = int(
                 getattr(
                     self.hf_text_config,
@@ -518,15 +606,6 @@ class ModelConfig:
             self.hf_text_config.dspark_num_stages = dspark_num_stages
             if self.hf_config is not self.hf_text_config:
                 self.hf_config.dspark_num_stages = dspark_num_stages
-            trained_verify_width = int(self.hf_text_config.dspark_block_size) + 1
-            requested_verify_width = int(server_args.speculative_num_draft_tokens)
-            if requested_verify_width != trained_verify_width:
-                raise ValueError(
-                    "DSPARK target verify width must equal checkpoint block_size + 1; "
-                    f"expected {trained_verify_width}, got {requested_verify_width}."
-                )
-            server_args.speculative_num_steps = trained_verify_width - 1
-            server_args.speculative_num_draft_tokens = trained_verify_width
         if (
             is_draft_worker
             and resolve_architecture(self.hf_config)
@@ -660,6 +739,8 @@ class ModelConfig:
         if attention_family is not None:
             _apply_attention_family_defaults(server_args, attention_family)
             attention_family.configure(self)
+        elif _is_dflash2_mla(self.hf_config, self.hf_text_config):
+            configure_mla_attention(self)
         elif "MiniCPM3ForCausalLM" in self.hf_config.architectures:
             self.head_dim = 128
             self.attention_arch = AttentionArch.MLA
@@ -667,13 +748,6 @@ class ModelConfig:
             self.qk_rope_head_dim = self.hf_config.qk_rope_head_dim
         else:
             self.attention_arch = AttentionArch.MHA
-
-        self.use_v4_mtp_paged_metadata = (
-            getattr(server_args, "speculative_algorithm", None) is not None
-            and not is_draft_worker
-            and attention_family is not None
-            and attention_family.supports_target_verify_forward_mode
-        )
 
         self.num_attention_heads = self.hf_text_config.num_attention_heads
         self.num_key_value_heads = getattr(
@@ -945,6 +1019,7 @@ def is_generation_model(model_architectures: list[str]):
 
 def is_multimodal_model(model_architectures: list[str] | None):
     multimodal_architectures = {
+        "DeepseekV41ForCausalLM",
         "Qwen3_5ForConditionalGeneration",
         "Qwen3_5MoeForConditionalGeneration",
         "Qwen4ExpForConditionalGeneration",
@@ -952,6 +1027,7 @@ def is_multimodal_model(model_architectures: list[str] | None):
         "Qwen3ASRForConditionalGeneration",
         "KimiK25ForConditionalGeneration",
         "KimiK3ForConditionalGeneration",
+        "Glm53FlashForConditionalGeneration",
         "InklingForConditionalGeneration",
         "MiniMaxM3SparseForConditionalGeneration",
     }

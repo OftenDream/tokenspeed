@@ -31,7 +31,7 @@ __all__ = [
     "gluon_dsa_prefill_gfx950",
 ]
 
-_REGISTERED_TOPK_WIDTHS = (512, 1024, 2048)
+_REGISTERED_TOPK_WIDTHS = (512, 1024, 2048, 2049, 2050, 2051)
 _FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
 _GFX950_COMPUTE_UNITS = 256
 _GLM52_SINGLE_ROW_DECODE_SPLITS = 16
@@ -155,28 +155,42 @@ def _dsa_dense_mfma_kv_kernel(
     TILE_K: gl.constexpr,
     D_V: gl.constexpr,
     D_ROPE: gl.constexpr,
-    IS_FP8: gl.constexpr,
+    HAS_ROPE: gl.constexpr,
+    FP8_INPUTS: gl.constexpr,
+    NATIVE_FP8: gl.constexpr,
+    NATIVE_E5M2: gl.constexpr,
+    COLUMN_PARALLEL: gl.constexpr,
     TRIM_EMPTY_TILES: gl.constexpr,
     NUM_KV_SPLITS: gl.constexpr,
 ):
-    INSTR_K: gl.constexpr = 32 if IS_FP8 else 16
-    QK_K_WIDTH: gl.constexpr = 16 if IS_FP8 else 8
-    PV_K_WIDTH: gl.constexpr = 8 if IS_FP8 else 4
-    INPUT_VEC: gl.constexpr = 16 if IS_FP8 else 8
-    ROPE_LOAD_VEC: gl.constexpr = 4 if IS_FP8 else 2
-    SHARED_INTERVAL: gl.constexpr = 1024 if IS_FP8 else 512
-    SHARED_PADDING: gl.constexpr = 32 if IS_FP8 else 16
+    # CDNA4 exposes the FP8 MFMA at K=32. Keeping FP8 operands native halves
+    # the score/value instruction count and avoids per-tile BF16 expansion.
+    instr_k: gl.constexpr = 32 if NATIVE_FP8 else 16
+    QK_K_WIDTH: gl.constexpr = 16 if NATIVE_FP8 else 8
+    PV_K_WIDTH: gl.constexpr = 8 if NATIVE_FP8 else 4
+    INPUT_VEC: gl.constexpr = 16 if NATIVE_FP8 else 8
+    ROPE_LOAD_VEC: gl.constexpr = 4 if NATIVE_FP8 else 2
+    SHARED_INTERVAL: gl.constexpr = 1024 if NATIVE_FP8 else 512
+    SHARED_PADDING: gl.constexpr = 32 if NATIVE_FP8 else 16
+    # The BF16 no-RoPE tile owns one MFMA row. Split its columns across the
+    # four waves, then restore the original score layout before softmax.
+    mfma_qk: gl.constexpr = gl.amd.cdna4.AMDMFMALayout(
+        version=4,
+        instr_shape=[16, 16, instr_k],
+        transposed=True,
+        warps_per_cta=([1, 4] if COLUMN_PARALLEL else [4, 1]),
+    )
     mfma_s: gl.constexpr = gl.amd.cdna4.AMDMFMALayout(
         version=4,
-        instr_shape=[16, 16, INSTR_K],
+        instr_shape=[16, 16, instr_k],
         transposed=True,
         warps_per_cta=[4, 1],
     )
     mfma_acc: gl.constexpr = gl.amd.cdna4.AMDMFMALayout(
         version=4,
-        instr_shape=[16, 16, INSTR_K],
+        instr_shape=[16, 16, instr_k],
         transposed=True,
-        warps_per_cta=[4, 1],
+        warps_per_cta=([1, 4] if COLUMN_PARALLEL else [4, 1]),
     )
 
     _qlora_tpw_k: gl.constexpr = min(64, D_V // INPUT_VEC)
@@ -244,22 +258,22 @@ def _dsa_dense_mfma_kv_kernel(
 
     dot_qlora_a: gl.constexpr = gl.DotOperandLayout(
         operand_index=0,
-        parent=mfma_s,
+        parent=mfma_qk,
         k_width=QK_K_WIDTH,
     )
     dot_qrope_a: gl.constexpr = gl.DotOperandLayout(
         operand_index=0,
-        parent=mfma_s,
+        parent=mfma_qk,
         k_width=QK_K_WIDTH,
     )
     dot_klora_b: gl.constexpr = gl.DotOperandLayout(
         operand_index=1,
-        parent=mfma_s,
+        parent=mfma_qk,
         k_width=QK_K_WIDTH,
     )
     dot_krope_b: gl.constexpr = gl.DotOperandLayout(
         operand_index=1,
-        parent=mfma_s,
+        parent=mfma_qk,
         k_width=QK_K_WIDTH,
     )
     dot_p_a: gl.constexpr = gl.DotOperandLayout(
@@ -302,36 +316,56 @@ def _dsa_dense_mfma_kv_kernel(
         layout=gl.SliceLayout(1, blk_qrope),
     )
     offs_r_qrope = gl.arange(0, D_ROPE, layout=gl.SliceLayout(0, blk_qrope))
-    mask_h_qrope = offs_h_qrope < num_heads
+    mask_h_qrope = (offs_h_qrope < num_heads) & HAS_ROPE
     q_offs_rope = (
         q_base
         + offs_h_qrope[:, None].to(tl.int64) * stride_q_h
         + (D_V + offs_r_qrope[None, :]).to(tl.int64)
     )
 
+    smem_dtype: gl.constexpr = (
+        gl.float8e5 if NATIVE_E5M2 else gl.float8e4nv if NATIVE_FP8 else gl.bfloat16
+    )
     smem_qlora = gl.allocate_shared_memory(
-        q.dtype.element_ty,
+        smem_dtype,
         [BLOCK_H, D_V],
         layout=sh_qlora,
     )
-    smem_qrope = gl.allocate_shared_memory(
-        q.dtype.element_ty,
-        [BLOCK_H, D_ROPE],
-        layout=sh_qrope,
-    )
-    gl.amd.cdna4.async_copy.buffer_load_to_shared(
-        dest=smem_qlora,
-        ptr=q,
-        offsets=q_offs_lora.to(tl.int32),
-        mask=mask_h_qlora[:, None],
-    )
-    gl.amd.cdna4.async_copy.buffer_load_to_shared(
-        dest=smem_qrope,
-        ptr=q,
-        offsets=q_offs_rope.to(tl.int32),
-        mask=mask_h_qrope[:, None],
-    )
-    gl.amd.cdna4.async_copy.commit_group()
+    if HAS_ROPE:
+        smem_qrope = gl.allocate_shared_memory(
+            smem_dtype,
+            [BLOCK_H, D_ROPE],
+            layout=sh_qrope,
+        )
+    if FP8_INPUTS:
+        q_lora = gl.load(
+            q + q_offs_lora,
+            mask=mask_h_qlora[:, None],
+            other=0.0,
+        ).to(smem_dtype)
+        smem_qlora.store(q_lora)
+        if HAS_ROPE:
+            q_rope = gl.load(
+                q + q_offs_rope,
+                mask=mask_h_qrope[:, None],
+                other=0.0,
+            ).to(smem_dtype)
+            smem_qrope.store(q_rope)
+    else:
+        gl.amd.cdna4.async_copy.buffer_load_to_shared(
+            dest=smem_qlora,
+            ptr=q,
+            offsets=q_offs_lora.to(tl.int32),
+            mask=mask_h_qlora[:, None],
+        )
+        if HAS_ROPE:
+            gl.amd.cdna4.async_copy.buffer_load_to_shared(
+                dest=smem_qrope,
+                ptr=q,
+                offsets=q_offs_rope.to(tl.int32),
+                mask=mask_h_qrope[:, None],
+            )
+        gl.amd.cdna4.async_copy.commit_group()
 
     NUM_TILES: gl.constexpr = (TOPK + TILE_K - 1) // TILE_K
     if TRIM_EMPTY_TILES:
@@ -389,19 +423,23 @@ def _dsa_dense_mfma_kv_kernel(
         split_has_tiles & (offs_tile_klora < valid_len) & (topk_pos_klora >= 0)
     )
     valid_krope = (
-        split_has_tiles & (offs_tile_krope < valid_len) & (topk_pos_krope >= 0)
+        split_has_tiles
+        & (offs_tile_krope < valid_len)
+        & (topk_pos_krope >= 0)
+        & HAS_ROPE
     )
     valid_mma = split_has_tiles & (offs_tile_mma < valid_len) & (topk_pos_mma >= 0)
     safe_klora = gl.where(valid_klora, topk_pos_klora, 0)
     safe_krope = gl.where(valid_krope, topk_pos_krope, 0)
 
-    smem_krope = gl.allocate_shared_memory(
-        kv.dtype.element_ty,
-        [2, D_ROPE, TILE_K],
-        layout=sh_krope,
-    )
+    if HAS_ROPE:
+        smem_krope = gl.allocate_shared_memory(
+            smem_dtype,
+            [2, D_ROPE, TILE_K],
+            layout=sh_krope,
+        )
     smem_klora = gl.allocate_shared_memory(
-        kv.dtype.element_ty,
+        smem_dtype,
         [2, D_V, TILE_K],
         layout=sh_klora,
     )
@@ -409,26 +447,43 @@ def _dsa_dense_mfma_kv_kernel(
     klora_offs = safe_klora[None, :].to(tl.int64) * stride_kv_t + offs_v_klora[
         :, None
     ].to(tl.int64)
-    gl.amd.cdna4.async_copy.buffer_load_to_shared(
-        dest=smem_klora.index(0),
-        ptr=kv,
-        offsets=klora_offs.to(tl.int32),
-        mask=valid_klora[None, :],
-    )
     krope_offs = safe_krope[None, :].to(tl.int64) * stride_kv_t + (
         D_V + offs_r_krope[:, None]
     ).to(tl.int64)
-    gl.amd.cdna4.async_copy.buffer_load_to_shared(
-        dest=smem_krope.index(0),
-        ptr=kv,
-        offsets=krope_offs.to(tl.int32),
-        mask=valid_krope[None, :],
-    )
-    gl.amd.cdna4.async_copy.commit_group()
-
-    gl.amd.cdna4.async_copy.wait_group(1)
+    if FP8_INPUTS:
+        k_lora = gl.load(
+            kv + klora_offs,
+            mask=valid_klora[None, :],
+            other=0.0,
+        ).to(smem_dtype)
+        smem_klora.index(0).store(k_lora)
+        if HAS_ROPE:
+            k_rope = gl.load(
+                kv + krope_offs,
+                mask=valid_krope[None, :],
+                other=0.0,
+            ).to(smem_dtype)
+            smem_krope.index(0).store(k_rope)
+        gl.barrier()
+    else:
+        gl.amd.cdna4.async_copy.buffer_load_to_shared(
+            dest=smem_klora.index(0),
+            ptr=kv,
+            offsets=klora_offs.to(tl.int32),
+            mask=valid_klora[None, :],
+        )
+        if HAS_ROPE:
+            gl.amd.cdna4.async_copy.buffer_load_to_shared(
+                dest=smem_krope.index(0),
+                ptr=kv,
+                offsets=krope_offs.to(tl.int32),
+                mask=valid_krope[None, :],
+            )
+        gl.amd.cdna4.async_copy.commit_group()
+        gl.amd.cdna4.async_copy.wait_group(1)
     q_lora_dot = smem_qlora.load(dot_qlora_a)
-    q_rope_dot = smem_qrope.load(dot_qrope_a)
+    if HAS_ROPE:
+        q_rope_dot = smem_qrope.load(dot_qrope_a)
 
     m_i = gl.full(
         [BLOCK_H],
@@ -471,7 +526,9 @@ def _dsa_dense_mfma_kv_kernel(
         )
 
         valid_klora_next = (next_offs_klora < valid_len) & (topk_pos_klora_next >= 0)
-        valid_krope_next = (next_offs_krope < valid_len) & (topk_pos_krope_next >= 0)
+        valid_krope_next = (
+            (next_offs_krope < valid_len) & (topk_pos_krope_next >= 0) & HAS_ROPE
+        )
         valid_mma_next = (next_offs_mma < valid_len) & (topk_pos_mma_next >= 0)
         safe_klora_next = gl.where(valid_klora_next, topk_pos_klora_next, 0)
         safe_krope_next = gl.where(valid_krope_next, topk_pos_krope_next, 0)
@@ -480,32 +537,52 @@ def _dsa_dense_mfma_kv_kernel(
         klora_offs_next = safe_klora_next[None, :].to(
             tl.int64
         ) * stride_kv_t + offs_v_klora[:, None].to(tl.int64)
-        gl.amd.cdna4.async_copy.buffer_load_to_shared(
-            dest=smem_klora.index(next_buf),
-            ptr=kv,
-            offsets=klora_offs_next.to(tl.int32),
-            mask=valid_klora_next[None, :],
-        )
         krope_offs_next = safe_krope_next[None, :].to(tl.int64) * stride_kv_t + (
             D_V + offs_r_krope[:, None]
         ).to(tl.int64)
-        gl.amd.cdna4.async_copy.buffer_load_to_shared(
-            dest=smem_krope.index(next_buf),
-            ptr=kv,
-            offsets=krope_offs_next.to(tl.int32),
-            mask=valid_krope_next[None, :],
-        )
-        gl.amd.cdna4.async_copy.commit_group()
-        gl.amd.cdna4.async_copy.wait_group(1)
+        if FP8_INPUTS:
+            k_lora_next = gl.load(
+                kv + klora_offs_next,
+                mask=valid_klora_next[None, :],
+                other=0.0,
+            ).to(smem_dtype)
+            smem_klora.index(next_buf).store(k_lora_next)
+            if HAS_ROPE:
+                k_rope_next = gl.load(
+                    kv + krope_offs_next,
+                    mask=valid_krope_next[None, :],
+                    other=0.0,
+                ).to(smem_dtype)
+                smem_krope.index(next_buf).store(k_rope_next)
+            gl.barrier()
+        else:
+            gl.amd.cdna4.async_copy.buffer_load_to_shared(
+                dest=smem_klora.index(next_buf),
+                ptr=kv,
+                offsets=klora_offs_next.to(tl.int32),
+                mask=valid_klora_next[None, :],
+            )
+            if HAS_ROPE:
+                gl.amd.cdna4.async_copy.buffer_load_to_shared(
+                    dest=smem_krope.index(next_buf),
+                    ptr=kv,
+                    offsets=krope_offs_next.to(tl.int32),
+                    mask=valid_krope_next[None, :],
+                )
+            gl.amd.cdna4.async_copy.commit_group()
+            gl.amd.cdna4.async_copy.wait_group(1)
 
         klora_smem_cur = smem_klora.index(cur_buf)
         k_lora_t_dot = klora_smem_cur.load(dot_klora_b)
         v_lora_dot = klora_smem_cur.permute([1, 0]).load(dot_v_b)
-        k_rope_t_dot = smem_krope.index(cur_buf).load(dot_krope_b)
+        if HAS_ROPE:
+            k_rope_t_dot = smem_krope.index(cur_buf).load(dot_krope_b)
 
-        scores = gl.zeros([BLOCK_H, TILE_K], dtype=gl.float32, layout=mfma_s)
+        scores = gl.zeros([BLOCK_H, TILE_K], dtype=gl.float32, layout=mfma_qk)
         scores = gl.amd.cdna4.mfma(q_lora_dot, k_lora_t_dot, scores)
-        scores = gl.amd.cdna4.mfma(q_rope_dot, k_rope_t_dot, scores)
+        if HAS_ROPE:
+            scores = gl.amd.cdna4.mfma(q_rope_dot, k_rope_t_dot, scores)
+        scores = gl.convert_layout(scores, mfma_s)
         scores = scores * scale
 
         offs_h_mma = hg_offset + gl.arange(
@@ -527,24 +604,30 @@ def _dsa_dense_mfma_kv_kernel(
 
         alpha_acc = gl.convert_layout(alpha, gl.SliceLayout(1, mfma_acc))
         acc = acc * alpha_acc[:, None]
-        probs_dot = gl.convert_layout(probs.to(q.dtype.element_ty), dot_p_a)
+        probs_dot = gl.convert_layout(probs.to(smem_dtype), dot_p_a)
         acc = gl.amd.cdna4.mfma(probs_dot, v_lora_dot, acc)
 
         m_i = m_new
         l_i = l_new
         cur_buf = next_buf
         valid_mma = valid_mma_next
+        if FP8_INPUTS:
+            gl.barrier()
 
-    gl.amd.cdna4.async_copy.wait_group(0)
+    if not FP8_INPUTS:
+        gl.amd.cdna4.async_copy.wait_group(0)
 
     klora_smem_cur = smem_klora.index(cur_buf)
     k_lora_t_dot = klora_smem_cur.load(dot_klora_b)
     v_lora_dot = klora_smem_cur.permute([1, 0]).load(dot_v_b)
-    k_rope_t_dot = smem_krope.index(cur_buf).load(dot_krope_b)
+    if HAS_ROPE:
+        k_rope_t_dot = smem_krope.index(cur_buf).load(dot_krope_b)
 
-    scores = gl.zeros([BLOCK_H, TILE_K], dtype=gl.float32, layout=mfma_s)
+    scores = gl.zeros([BLOCK_H, TILE_K], dtype=gl.float32, layout=mfma_qk)
     scores = gl.amd.cdna4.mfma(q_lora_dot, k_lora_t_dot, scores)
-    scores = gl.amd.cdna4.mfma(q_rope_dot, k_rope_t_dot, scores)
+    if HAS_ROPE:
+        scores = gl.amd.cdna4.mfma(q_rope_dot, k_rope_t_dot, scores)
+    scores = gl.convert_layout(scores, mfma_s)
     scores = scores * scale
 
     offs_h_mma = hg_offset + gl.arange(
@@ -564,7 +647,7 @@ def _dsa_dense_mfma_kv_kernel(
 
     alpha_acc = gl.convert_layout(alpha, gl.SliceLayout(1, mfma_acc))
     acc = acc * alpha_acc[:, None]
-    probs_dot = gl.convert_layout(probs.to(q.dtype.element_ty), dot_p_a)
+    probs_dot = gl.convert_layout(probs.to(smem_dtype), dot_p_a)
     acc = gl.amd.cdna4.mfma(probs_dot, v_lora_dot, acc)
 
     l_i_acc = gl.convert_layout(l_new, gl.SliceLayout(1, mfma_acc))
@@ -898,18 +981,18 @@ def _check_inputs(
         raise TypeError(f"Gluon DSA supports BF16/FP8 q, got {q.dtype}")
     if page_size != 64:
         raise ValueError(f"Gluon DSA supports page_size=64, got {page_size}")
-    if qk_nope_head_dim not in (128, 192):
+    if qk_nope_head_dim not in (128, 192, 256):
         raise ValueError(
-            "Gluon DSA supports qk_nope_head_dim in {128, 192}, got "
+            "Gluon DSA supports qk_nope_head_dim in {128, 192, 256}, got "
             f"{qk_nope_head_dim}"
         )
     if kv_lora_rank not in (128, 512):
         raise ValueError(
             f"Gluon DSA supports kv_lora_rank in {{128, 512}}, got {kv_lora_rank}"
         )
-    if qk_rope_head_dim != 64:
+    if qk_rope_head_dim not in (0, 64):
         raise ValueError(
-            f"Gluon DSA supports qk_rope_head_dim=64, got {qk_rope_head_dim}"
+            f"Gluon DSA supports qk_rope_head_dim in {{0, 64}}, got {qk_rope_head_dim}"
         )
     expected_head_dim = int(kv_lora_rank) + int(qk_rope_head_dim)
     if q.shape[-1] != expected_head_dim:
@@ -944,9 +1027,29 @@ def _select_num_kv_splits(
     topk_width: int,
     max_seqlen_k: int,
     is_fp8: bool,
+    native_fp8: bool = False,
+    qk_rope_head_dim: int = 64,
+    is_prefill: bool = False,
 ) -> int:
     work_tiles = max(1, (min(int(topk_width), int(max_seqlen_k)) + 31) // 32)
-    if not is_fp8 or work_tiles <= 8:
+    if work_tiles <= 8:
+        return 1
+    if not is_fp8:
+        # This tuning comes from GLM-5.3-Flash. Split sufficiently large selected-KV
+        # rows across CTAs so the launch provides enough parallel work to fill the
+        # GPU.
+        # Pooled selection can append up to three tail slots to the configured
+        # 2,048-token budget, so graph captures use widths from 2,048 through 2,051.
+        if (
+            int(qk_rope_head_dim) == 0
+            and int(num_heads) == 16
+            and 2048 <= int(topk_width) <= 2051
+            and work_tiles >= 64
+        ):
+            if int(num_tokens) == 16:
+                return 16
+            if int(num_tokens) == 64:
+                return 4
         return 1
     if (
         int(num_tokens) == 1
@@ -956,6 +1059,22 @@ def _select_num_kv_splits(
     ):
         return _GLM52_SINGLE_ROW_DECODE_SPLITS
     base_ctas = max(1, int(num_tokens) * triton.cdiv(int(num_heads), 16))
+    if native_fp8 and int(num_heads) == 16:
+        # Large prefill grids already fill the two-wave occupancy target. Splitting
+        # them would only multiply the full-rank reduction workspace.
+        if is_prefill and base_ctas >= _GFX950_COMPUTE_UNITS * 2:
+            return 1
+        # Native FP8 DSA CTAs carry enough work that the generic two-wave
+        # occupancy target oversplits medium/large graph batches. These
+        # thresholds are expressed only in kernel shape terms and keep short
+        # selected contexts on the generic schedule.
+        if work_tiles >= 64:
+            if int(num_tokens) >= 64:
+                return 4
+            if int(num_tokens) >= 8:
+                return 8
+        elif work_tiles >= 32 and (int(num_tokens) == 1 or int(num_tokens) >= 8):
+            return 4
     return select_kv_splits(
         base_ctas=base_ctas,
         num_pages=work_tiles,
@@ -989,6 +1108,7 @@ def _run_dense_kv(
     kv_lora_rank: int,
     qk_rope_head_dim: int,
     max_seqlen_k: int,
+    is_prefill: bool,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     if out is None:
@@ -1003,6 +1123,9 @@ def _run_dense_kv(
         topk_width=topk_slots.shape[1],
         max_seqlen_k=max_seqlen_k,
         is_fp8=q.dtype in _FP8_DTYPES,
+        native_fp8=q.dtype == kv_cache.dtype and q.dtype in _FP8_DTYPES,
+        qk_rope_head_dim=qk_rope_head_dim,
+        is_prefill=is_prefill,
     )
     if num_kv_splits == 1:
         stage_out = out
@@ -1052,12 +1175,26 @@ def _run_dense_kv(
         q.shape[1],
         topk_slots.shape[1],
         D_V=kv_lora_rank,
-        D_ROPE=qk_rope_head_dim,
-        IS_FP8=q.dtype in _FP8_DTYPES,
+        # Keep the compile-time matrix shape MFMA-compatible for no-RoPE models;
+        # HAS_ROPE removes its storage, loads, and score term.
+        D_ROPE=max(qk_rope_head_dim, 64),
+        HAS_ROPE=qk_rope_head_dim > 0,
+        FP8_INPUTS=(
+            q.dtype == torch.float8_e4m3fn or kv_cache.dtype == torch.float8_e4m3fn
+        ),
+        NATIVE_FP8=(q.dtype == kv_cache.dtype and q.dtype in _FP8_DTYPES),
+        NATIVE_E5M2=(
+            q.dtype == torch.float8_e5m2 and kv_cache.dtype == torch.float8_e5m2
+        ),
+        COLUMN_PARALLEL=(
+            q.dtype == torch.bfloat16
+            and kv_cache.dtype == torch.bfloat16
+            and qk_rope_head_dim == 0
+        ),
         TRIM_EMPTY_TILES=int(max_seqlen_k) < int(topk_slots.shape[1]),
         NUM_KV_SPLITS=num_kv_splits,
         BLOCK_H=16,
-        TILE_K=32,
+        TILE_K=64 if qk_rope_head_dim == 0 else 32,
         num_warps=4,
     )
     if num_kv_splits > 1:
@@ -1169,6 +1306,7 @@ def _run_dsa(
     k_scale: float,
     out: torch.Tensor | None,
     max_seqlen_k: int,
+    is_prefill: bool,
 ) -> torch.Tensor:
     _check_inputs(
         q,
@@ -1216,9 +1354,10 @@ def _run_dsa(
         )
     elif kv_cache is not None:
         dense_kv = _flatten_dense_kv_cache(kv_cache).contiguous()
+        mfma_dtypes = {torch.bfloat16, *_FP8_DTYPES}
         use_tiled_kernel = (
-            q.dtype == dense_kv.dtype
-            and (q.dtype == torch.bfloat16 or q.dtype in _FP8_DTYPES)
+            q.dtype in mfma_dtypes
+            and dense_kv.dtype in mfma_dtypes
             and int(kv_lora_rank) == 512
         )
         if use_tiled_kernel:
@@ -1231,6 +1370,7 @@ def _run_dsa(
                 kv_lora_rank=kv_lora_rank,
                 qk_rope_head_dim=qk_rope_head_dim,
                 max_seqlen_k=max_seqlen_k,
+                is_prefill=is_prefill,
                 out=out_view,
             )
         else:
@@ -1287,6 +1427,7 @@ def gluon_dsa_decode_gfx950(
         k_scale=k_scale,
         out=out,
         max_seqlen_k=max_seqlen_k,
+        is_prefill=False,
     )
 
 
@@ -1325,4 +1466,5 @@ def gluon_dsa_prefill_gfx950(
         k_scale=k_scale,
         out=out,
         max_seqlen_k=max_seqlen_k,
+        is_prefill=True,
     )
