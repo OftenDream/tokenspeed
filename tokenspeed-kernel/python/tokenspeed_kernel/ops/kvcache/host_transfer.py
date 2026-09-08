@@ -47,11 +47,17 @@ class HostTransferMode:
 
     Attributes:
         backend: Transport used for this buffer binding.
-        layer_ready: Whether H2D publishes per-layer ready flags.
+        layer_ready: Whether H2D publishes per-layer ready flags. Currently
+            unsupported by DMA, which uses completion events instead.
     """
 
     backend: Literal["triton", "dma"]
     layer_ready: bool
+
+    def __post_init__(self) -> None:
+        # DMA currently publishes completion events, not layer-ready flags.
+        if self.backend == "dma" and self.layer_ready:
+            raise ValueError("DMA does not currently support layer_ready=True")
 
     @property
     def uses_device_tables(self) -> bool:
