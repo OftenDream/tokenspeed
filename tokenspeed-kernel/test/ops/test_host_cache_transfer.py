@@ -774,6 +774,7 @@ def test_block_transfer_skips_empty_layer_before_mapping(
 def test_public_transfer_arguments_are_explicit():
     module = _load_host_transfer_contract_module()
     for function in (
+        module.HostTransferMode,
         module.HostTransferGeometry.bind,
         module.HostTransferWorkspace.prepare_backend,
         module.HostTransferWorkspace.commit_block_transfers,

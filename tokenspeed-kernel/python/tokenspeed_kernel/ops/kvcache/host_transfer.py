@@ -43,10 +43,15 @@ from tokenspeed_kernel.platform import current_platform
 
 @dataclass(frozen=True, slots=True)
 class HostTransferMode:
-    """Resolved transport and completion protocol for one buffer binding."""
+    """Resolved transport and explicitly selected completion protocol.
+
+    Attributes:
+        backend: Transport used for this buffer binding.
+        layer_ready: Whether H2D publishes per-layer ready flags.
+    """
 
     backend: Literal["triton", "dma"]
-    layer_ready: bool = False
+    layer_ready: bool
 
     @property
     def uses_device_tables(self) -> bool:
@@ -338,7 +343,7 @@ class HostTransferWorkspace:
         if backend == "dma" or device.type == "npu":
             if backend == "triton":
                 raise RuntimeError("mapped Host Triton transfer is unavailable on NPU")
-            return HostTransferMode("dma")
+            return HostTransferMode("dma", layer_ready=False)
         key = (
             device,
             tuple(buffer.data_ptr() for buffer in device_buffers),
@@ -353,7 +358,7 @@ class HostTransferWorkspace:
             except _MappedHostUnavailable:
                 if backend == "triton":
                     raise
-                self._mode = HostTransferMode("dma")
+                self._mode = HostTransferMode("dma", layer_ready=False)
                 warnings.warn(
                     "Mapped Host access is unavailable; falling back to DMA",
                     RuntimeWarning,
@@ -361,7 +366,8 @@ class HostTransferWorkspace:
                 )
             else:
                 self._mode = HostTransferMode(
-                    "triton", device.type == "cuda" and layer_ready_ptx_supported()
+                    "triton",
+                    layer_ready=device.type == "cuda" and layer_ready_ptx_supported(),
                 )
         if backend == "triton" and not self._mode.uses_device_tables:
             raise _MappedHostUnavailable("mapped Host access is not available")
