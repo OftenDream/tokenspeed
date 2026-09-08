@@ -1021,6 +1021,7 @@ class SeperateFLASHLocal(nn.Module):
             self.o_norm.variance_epsilon,
             hn,
             hd,
+            enable_pdl=_pdl_enabled(),
         )
         output, _ = self.o_proj(core_out)
         return output

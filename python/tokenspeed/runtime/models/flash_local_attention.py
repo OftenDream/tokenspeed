@@ -27,7 +27,7 @@ from typing import Any, Literal
 
 import torch
 from tokenspeed_kernel.ops.attention.mla import mla_normalize_project_query
-from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.platform import current_platform, pdl_enabled
 from torch import nn
 from torch.nn import functional as F
 
@@ -322,6 +322,7 @@ class PackedFLASHLocalKDA(nn.Module):
                 self.config.rms_norm_eps,
                 self.local_num_heads,
                 self.head_dim,
+                enable_pdl=pdl_enabled(),
             )
         else:
             core_fp32 = core_output.float()
@@ -463,7 +464,7 @@ class SeparateProjectionKimiLinearMLAAttention(KimiLinearMLAAttention):
                 dim=-1,
             )
         kv_a = latent_cache[..., : self.kv_lora_rank]
-        projection = mla_normalize_project_query(
+        query, _ = mla_normalize_project_query(
             q_a,
             kv_a,
             self.q_a_layernorm.weight,
@@ -474,7 +475,7 @@ class SeparateProjectionKimiLinearMLAAttention(KimiLinearMLAAttention):
             qk_nope_head_dim=self.qk_nope_head_dim,
             qk_rope_head_dim=self.qk_rope_head_dim,
         )
-        return projection.query, latent_cache, gate, None
+        return query, latent_cache, gate, None
 
     def forward(
         self,

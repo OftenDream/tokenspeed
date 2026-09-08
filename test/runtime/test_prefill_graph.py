@@ -444,6 +444,8 @@ class DummyGroupTablesTest(unittest.TestCase):
         pg.drafter = None
         buf = lambda n, dt: torch.zeros(n, dtype=dt)  # noqa: E731
         pg.input_buffers = SimpleNamespace(
+            input_lengths_buf=buf(16, torch.int32),
+            prepare_request_token_history_inputs=lambda **kwargs: None,
             dummy_kv_slot=0,
             input_ids_buf=buf(4096, torch.int32),
             out_cache_loc_buf=buf(4096, torch.int32),
@@ -643,7 +645,6 @@ class DummyGroupTablesTest(unittest.TestCase):
                 token_to_kv_pool=_fake_pool(),
                 input_buffers=object(),
                 config=config,
-                page_table=object(),
             )
 
         self.assertTrue(graph.disable)

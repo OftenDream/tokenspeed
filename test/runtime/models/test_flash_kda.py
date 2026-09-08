@@ -340,9 +340,7 @@ def test_flash_lite_cache_allows_its_wider_recurrent_state() -> None:
         recipe = object.__new__(KimiK3Recipe)
         recipe.draft_attn_config = None
         recipe.model_config = SimpleNamespace(
-            hf_config=SimpleNamespace(
-                text_config=SimpleNamespace(model_type=model_type)
-            )
+            hf_text_config=SimpleNamespace(model_type=model_type)
         )
         return recipe.max_padding_fraction
 

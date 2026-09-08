@@ -119,6 +119,7 @@ def _lite_recipe(
         ),
         model_config=SimpleNamespace(
             hf_config=text_config,
+            hf_text_config=text_config,
             oe_state_provider="cache-checkpointed-tail",
         ),
         attn_config=attn_config,
@@ -258,12 +259,15 @@ def test_replicated_mla_service_keeps_full_component_geometry() -> None:
 
     config = MLAConfig.generate(server_args, model_config, is_draft=False)
 
-    assert config.attn_tp_size == 1
-    assert config.num_attention_heads == text_config.num_attention_heads
+    assert config.component(MLAConfig).attn_tp_size == 1
+    assert (
+        config.component(MLAConfig).num_attention_heads
+        == text_config.num_attention_heads
+    )
 
     text_config.architectures = ["OtherForCausalLM"]
     config = MLAConfig.generate(server_args, model_config, is_draft=False)
-    assert config.attn_tp_size == 1
+    assert config.component(MLAConfig).attn_tp_size == 1
 
 
 @pytest.mark.parametrize(

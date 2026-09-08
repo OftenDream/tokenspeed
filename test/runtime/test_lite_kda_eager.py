@@ -339,6 +339,50 @@ def _lite_output_epilogue_oracle(core, gate, weight, eps, heads, dim):
     )
 
 
+@pytest.mark.parametrize("enable_pdl", [False, True])
+def test_separate_lite_kda_passes_output_epilogue_pdl_policy(enable_pdl):
+    from tokenspeed.runtime.models import flash_kda
+
+    hidden = torch.zeros(2, 4)
+    core = torch.ones(2, 1, 4)
+    projection = SimpleNamespace(weight=torch.ones(4, 4))
+    layer = SimpleNamespace(
+        local_num_heads=1,
+        head_dim=4,
+        _project_qkv=lambda x: torch.cat((x, x, x), dim=-1),
+        is_fgbkda=False,
+        g_proj=lambda x: x,
+        b_proj=lambda x: (x[:, :1], None),
+        f_proj=SimpleNamespace(fc1=lambda x: (x, None), fc2=projection),
+        conv_weights=torch.ones(12, 4),
+        proj=4,
+        mapping=SimpleNamespace(linear_attn=SimpleNamespace(tp_size=1)),
+        A_log=torch.zeros(1),
+        dt_bias=torch.zeros(4),
+        gate_lower_bound=-5.0,
+        layer_id=0,
+        o_norm=SimpleNamespace(weight=torch.ones(4), variance_epsilon=1e-6),
+        o_proj=lambda x: (x, None),
+    )
+    ctx = SimpleNamespace(
+        attn_backend=SimpleNamespace(forward=lambda **kwargs: core),
+        token_to_kv_pool=None,
+        forward_mode=None,
+        bs=2,
+    )
+    with (
+        mock.patch.object(flash_kda, "_pdl_enabled", return_value=enable_pdl),
+        mock.patch.object(
+            flash_kda,
+            "rmsnorm_gated_sigmoid",
+            autospec=True,
+            return_value=core.flatten(1),
+        ) as epilogue,
+    ):
+        flash_kda.SeperateFLASHLocal.forward(layer, None, hidden, ctx, None)
+    assert epilogue.call_args.kwargs["enable_pdl"] is enable_pdl
+
+
 @pytest.mark.parametrize("tokens", [1, 2, 8, 32, 256, 1024])
 @pytest.mark.skipif(not _npu_available(), reason="requires an Ascend NPU")
 def test_ascend_lite_output_epilogue_matches_single_rounding_oracle(tokens):
@@ -354,7 +398,9 @@ def test_ascend_lite_output_epilogue_matches_single_rounding_oracle(tokens):
     gate = packed_gate[:, 64 : 64 + width]
     weight = (torch.randn(dim, device="npu") * 0.2 + 1).to(torch.bfloat16)
 
-    actual = rmsnorm_gated_sigmoid(core, gate, weight, eps, heads, dim)
+    actual = rmsnorm_gated_sigmoid(
+        core, gate, weight, eps, heads, dim, enable_pdl=False
+    )
     expected = _lite_output_epilogue_oracle(core, gate, weight, eps, heads, dim)
     torch.npu.synchronize()
 
@@ -441,12 +487,14 @@ def test_ascend_lite_output_epilogue_graph_replays_updated_values(batch):
     )
     gate = packed_gate[:, 64 : 64 + width]
     weight = (torch.randn(dim, device="npu") * 0.2 + 1).to(torch.bfloat16)
-    rmsnorm_gated_sigmoid(core, gate, weight, eps, heads, dim)
+    rmsnorm_gated_sigmoid(core, gate, weight, eps, heads, dim, enable_pdl=False)
     torch.npu.synchronize()
 
     graph = torch.npu.NPUGraph()
     with torch.npu.graph(graph, stream=torch.npu.Stream(), auto_dispatch_capture=True):
-        graph_output = rmsnorm_gated_sigmoid(core, gate, weight, eps, heads, dim)
+        graph_output = rmsnorm_gated_sigmoid(
+            core, gate, weight, eps, heads, dim, enable_pdl=False
+        )
     graph.replay()
     torch.npu.synchronize()
     expected = _lite_output_epilogue_oracle(core, gate, weight, eps, heads, dim)
