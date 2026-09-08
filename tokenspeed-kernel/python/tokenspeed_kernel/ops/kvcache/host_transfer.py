@@ -87,7 +87,11 @@ def _pinned_host_int64(shape: tuple[int, ...]) -> torch.Tensor:
 
 @dataclass(frozen=True, slots=True)
 class HostTransferGeometry:
-    """Immutable field geometry for one executor lifetime."""
+    """Immutable field geometry for one executor lifetime.
+
+    Device row and layer-slice tables must both be absent or both reside on
+    the same device. Binding publishes the two tables together.
+    """
 
     host_rows: torch.Tensor
     device_rows: torch.Tensor | None
@@ -97,7 +101,17 @@ class HostTransferGeometry:
     num_host_lcm_blocks: int
     num_device_lcm_blocks: int
     row_work: tuple[tuple[int, int], ...]
-    device_layer_slices: torch.Tensor | None = None
+    device_layer_slices: torch.Tensor | None
+
+    def __post_init__(self) -> None:
+        if (self.device_rows is None) != (self.device_layer_slices is None):
+            raise ValueError("geometry device tables must be bound together")
+        if (
+            self.device_rows is not None
+            and self.device_layer_slices is not None
+            and self.device_rows.device != self.device_layer_slices.device
+        ):
+            raise ValueError("geometry device tables must reside on the same device")
 
     @property
     def num_groups(self) -> int:
@@ -288,6 +302,7 @@ def build_host_transfer_geometry(
     return HostTransferGeometry(
         host_rows=host_rows,
         device_rows=None,
+        device_layer_slices=None,
         layer_slices=tuple(layer_slices),
         group_packing=tuple(group_packing),
         host_lcm_block_bytes=int(host_lcm_block_bytes),
