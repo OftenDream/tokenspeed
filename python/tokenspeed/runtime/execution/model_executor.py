@@ -495,6 +495,8 @@ class ModelExecutor:
         )
 
         self.device_module = torch.get_device_module(self.device)
+        # Name the existing preparation stream; no additional stream is created.
+        self.submission_stream = self.device_module.current_stream(self.device)
         self.execution_stream = self.device_module.Stream()
         # The data plane: every CUDA-touching operation after startup is
         # submitted here and runs in FIFO order on one thread. The event loop
@@ -1080,15 +1082,6 @@ class ModelExecutor:
                     spec_step_idx=step_idx,
                 )
 
-    def order_cache_operations(self) -> None:
-        """Order caller-stream cache work after previously submitted forwards.
-
-        Called on the forward thread before D2H or page reuse. This inserts
-        a GPU dependency, not a host synchronization; the forward prologue's
-        wait is too late to protect cache operations submitted before it.
-        """
-        self.device_module.current_stream().wait_stream(self.execution_stream)
-
     def zero_cache_pages(self, pages):
         """Clear newly owned pages and return a CUDA completion event when needed."""
         if not pages:
@@ -1233,8 +1226,8 @@ class ModelExecutor:
             # Wait for previous iteration's runtime state updates
             # (future_input_map, valid_cache_lengths) on execution_stream to
             # complete before reading them.
-            self.device_module.current_stream().wait_stream(self.execution_stream)
-            self.execution_stream.wait_stream(self.device_module.current_stream())
+            self.submission_stream.wait_stream(self.execution_stream)
+            self.execution_stream.wait_stream(self.submission_stream)
         with self.device_module.stream(self.execution_stream):
             bs = len(forward_op.request_ids)
             # Outside the graph: in-graph sites only OR into the flag buffer.

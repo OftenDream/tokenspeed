@@ -80,6 +80,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
+from tokenspeed_scheduler import Cache
 from torch.utils._python_dispatch import TorchDispatchMode
 
 from tokenspeed.runtime.execution.types import (
@@ -270,15 +271,11 @@ class DeviceHandle:
 
         The whole plan on the FIFO -- one thread, explicitly ordered streams -- in an order
         that IS the correctness argument for same-round page reuse:
-        write-backs first (a stream-ordered one -- a retraction's snapshot,
-        whose sources this plan may re-grant -- fences the caller's stream
-        on its completion so it reads the reused pages' old bytes; a pinned
-        one -- an ordinary publication, whose sources the scheduler holds
-        until the ACK -- rides the write stream and fences nothing), then
-        page zeroing (the new owner's sanitization), then load-backs (they
-        target zeroed pages), the transfer peer's remote streams, and finally
-        the ``ForwardBatch``. The loop hands the round over and does not
-        branch on it.
+        retraction write-backs first (they must read the reused pages' old
+        bytes), then page zeroing (the new owner's sanitization), then
+        load-backs (they target zeroed pages), the transfer peer's remote
+        streams, and finally the ``ForwardBatch``. The loop hands the round
+        over and does not branch on it.
 
         Args:
             execution_plan: The round's plan, a per-round value copy out of
@@ -307,21 +304,27 @@ class DeviceHandle:
 
         executor = self._executor
         l2 = self._l2 if execution_plan.cache else None
-        if l2 is not None:
-            # Ahead of the zeroing: a stream-ordered store's sources may be
-            # this very plan's pages_to_zero, and its fence lands on the
-            # caller's stream here, before the zeroing is enqueued.
+        pages = execution_plan.pages_to_zero
+        has_write_backs = l2 is not None and any(
+            isinstance(operation, Cache.WriteBackOp)
+            for operation in execution_plan.cache
+        )
+        if has_write_backs:
+
             def _write_backs():
-                executor.order_cache_operations()
+                executor.submission_stream.wait_stream(executor.execution_stream)
                 l2.submit_write_backs(execution_plan)
 
             self._l2_submissions.append(self._thread.submit(_write_backs))
-        pages = execution_plan.pages_to_zero
 
         def _zero_pages():
-            if l2 is None:
-                executor.order_cache_operations()
-            return executor.zero_cache_pages(pages)
+            stream = executor.submission_stream
+            # A preceding writeback task already placed this dependency and
+            # any unpinned-copy completion wait ahead of zeroing on this stream.
+            if not has_write_backs:
+                stream.wait_stream(executor.execution_stream)
+            with executor.device_module.stream(stream):
+                return executor.zero_cache_pages(pages)
 
         zero_future = self._thread.submit(_zero_pages) if pages else None
         if l2 is not None:
@@ -458,10 +461,10 @@ class DeviceHandle:
         pages, so it must follow them and the zeroing fence (Mooncake and
         GPUDirect writes are not ordered by the zeroing stream, so the
         destination pages must be published from sanitized memory). The same
-        fence covers a retraction's stream-ordered write-back reading pages
-        this admission was granted: the zero event is recorded on the forward
-        thread's stream AFTER that stream waited on the write-back's
-        completion, so waiting on it waits on the copy too. One ordered
+        fence covers a retraction write-back reading pages this admission was
+        granted: the zero event is recorded on the forward thread's stream
+        AFTER the write-back copies, so waiting on it waits on them too. One
+        ordered
         unit, so one submission — asynchronous like every other: completion
         arrives through the transfer events, and a submission failure
         surfaces from the settle at the next round's execute.
@@ -759,6 +762,7 @@ def build_device_side(
 
         l2_cache_executor = L2CacheExecutor(
             token_to_kv_pool,
+            submission_stream=executor.submission_stream,
             draft_pool=draft_token_to_kv_pool,
             host_ratio=server_args.kvstore_ratio,
             host_size_gb=server_args.kvstore_size,

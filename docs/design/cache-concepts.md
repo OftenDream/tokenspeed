@@ -224,9 +224,20 @@ blocks, the transfer boundary validates the loaded block count and returns
 before mapping Host pointers or touching the accelerator runtime. Flagged
 loads still publish readiness for empty consumers.
 
-Writeback runs on the executor's write stream, ordered after the caller's
-stream (which the caller has already ordered behind the forwards that wrote
-the pages). Each op says how the scheduler guards its Device sources
+The model executor retains its preparation stream as `submission_stream`
+and passes it explicitly to the L2 executor at construction. Writeback and
+zeroing remain separate FIFO tasks with separate futures. The writeback task
+orders this stream after `execution_stream`; the zeroing task places that
+dependency only when no writeback task precedes it. Load-only plans add no
+such fence. Zeroing runs
+in its stream context; load start events explicitly record on it, without
+a caller-side context around load submission. The forward prologue waits
+on this named stream before model execution.
+
+Writeback runs on the executor's write stream, ordered after
+`submission_stream`. Metadata uploads, their retirement events and payload
+copies all execute in the write-stream context, so their order does not
+depend on the caller's current stream. Each op says how the scheduler guards its Device sources
 (`source_pinned`, see `scheduler.md` §2). A pinned op's sources stay cached
 and unevictable until the ACK, so its copy overlaps whatever the round does
 next and nobody waits on it. An unpinned op's sources may be re-granted in the

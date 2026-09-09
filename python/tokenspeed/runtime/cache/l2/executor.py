@@ -112,12 +112,19 @@ def _num_host_lcm_blocks(
 
 
 class L2CacheExecutor:
-    """Execute group-aware D2H/H2D operations against one compact Host pool."""
+    """Execute group-aware D2H/H2D operations against one compact Host pool.
+
+    ``submission_stream`` is the model executor's preparation stream. It
+    carries zeroing and waits for unpinned writebacks; it is also the explicit
+    prerequisite for loads and writes. Transfers themselves run on the owned
+    ``load_stream`` and ``write_stream``, not the caller's current stream.
+    """
 
     def __init__(
         self,
         device_pool,
         *,
+        submission_stream,
         draft_pool=None,
         host_ratio: float,
         host_size_gb: float,
@@ -127,6 +134,7 @@ class L2CacheExecutor:
         if io_backend not in ("direct", "kernel"):
             raise ValueError(f"unsupported KVStore IO backend {io_backend!r}")
         self.attn_tp_rank = attn_tp_rank
+        self.submission_stream = submission_stream
         self.transfer_backend = "dma" if io_backend == "direct" else "auto"
         target_layout = device_pool.cache_transfer_layout()
         draft_layout = (
@@ -287,13 +295,13 @@ class L2CacheExecutor:
     def submit_write_backs(self, plan) -> None:
         """Enqueue the plan's D2H copies on the write stream.
 
-        Must run BEFORE the plan's page zeroing, on the caller's stream
+        Must run BEFORE the plan's page zeroing, with ``submission_stream``
         already ordered behind the forwards that wrote the pages. The
         scheduler marks each op ``source_pinned``: a pinned op's sources stay
         cached and unevictable until the ACK, so its copy rides the write
         stream and nobody waits on it; an unpinned op's sources may already
         be granted to another request in this very plan, so it goes first and
-        the caller's stream waits on its completion -- the plan's zeroing,
+        ``submission_stream`` waits on its completion -- the plan's zeroing,
         load-backs and forwards are ordered behind that wait.
         """
         ordered_op_ids: list[int] = []
@@ -313,7 +321,7 @@ class L2CacheExecutor:
             ordered_op_ids, ordered_transfers, lane=self._ordered_write_lane
         )
         if fence is not None:
-            device_module.current_stream().wait_event(fence)
+            self.submission_stream.wait_event(fence)
         self._start_writing(
             pinned_op_ids, pinned_transfers, lane=self._pinned_write_lane
         )
@@ -423,7 +431,7 @@ class L2CacheExecutor:
         # wrote the source pages; inheriting it here is what lets the copy
         # read the final bytes.
         stream = self.write_stream
-        stream.wait_stream(device_module.current_stream())
+        stream.wait_stream(self.submission_stream)
         # CPU writes are not ordered by stream FIFO. Retire the previous
         # metadata upload before refilling its pinned source, not at submit.
         if lane.metadata_done is not None:
@@ -432,39 +440,40 @@ class L2CacheExecutor:
         num_blocks, _ = lane.workspace.load_block_transfers(
             transfers, geometry=self._transfer_geometry
         )
-        mode = lane.workspace.prepare_backend(
-            self.layout.buffers,
-            self.host_storage.host_buffer,
-            backend=self.transfer_backend,
-        )
-        if mode.uses_device_tables:
-            if lane.metadata_done is None:
-                lane.metadata_done = device_module.Event()
-            try:
-                lane.workspace.commit_block_transfers(
-                    num_blocks, self.layout.buffers[0].device, non_blocking=True
-                )
-            finally:
-                # Also protect a partially submitted upload if staging fails.
-                # This event excludes the payload transfer; Device table reuse
-                # remains ordered by the write stream's FIFO.
-                lane.metadata_done.record(stream)
-        transfer_cache_blocks(
-            "d2h",
-            self.layout.buffers,
-            self.host_storage.host_buffer,
-            self._transfer_geometry,
-            lane.workspace,
-            stream,
-            num_blocks=num_blocks,
-            geometry_offset=0,
-            num_geometry_rows=self._transfer_geometry.num_field_rows,
-            backend=self.transfer_backend,
-            grid_cap=None,
-            layer_ready_flags=None,
-        )
-        finish = device_module.Event()
-        finish.record(stream)
+        with device_module.stream(stream):
+            mode = lane.workspace.prepare_backend(
+                self.layout.buffers,
+                self.host_storage.host_buffer,
+                backend=self.transfer_backend,
+            )
+            if mode.uses_device_tables:
+                if lane.metadata_done is None:
+                    lane.metadata_done = device_module.Event()
+                try:
+                    lane.workspace.commit_block_transfers(
+                        num_blocks, self.layout.buffers[0].device, non_blocking=True
+                    )
+                finally:
+                    # Also protect a partially submitted upload if staging fails.
+                    # This event excludes the payload transfer; Device table reuse
+                    # remains ordered by the write stream's FIFO.
+                    lane.metadata_done.record(stream)
+            transfer_cache_blocks(
+                "d2h",
+                self.layout.buffers,
+                self.host_storage.host_buffer,
+                self._transfer_geometry,
+                lane.workspace,
+                stream,
+                num_blocks=num_blocks,
+                geometry_offset=0,
+                num_geometry_rows=self._transfer_geometry.num_field_rows,
+                backend=self.transfer_backend,
+                grid_cap=None,
+                layer_ready_flags=None,
+            )
+            finish = device_module.Event()
+            finish.record(stream)
         with self._ack_lock:
             self._write_acks.append(_Ack(finish, op_ids))
         return finish
@@ -514,7 +523,7 @@ class L2CacheExecutor:
                     load_index = current_load_index
                 elif current_load_index != load_index:
                     raise RuntimeError("target and draft Host-load trackers diverged")
-                load_events.start_event.record()
+                load_events.start_event.record(self.submission_stream)
                 load_events.start_event.wait(self.load_stream)
             if load_index is None:
                 raise RuntimeError("cache transfer layout has no layer consumers")
@@ -672,7 +681,7 @@ class L2CacheExecutor:
     def shutdown(self) -> None:
         # The caller's stream carries the fences the transfers were ordered
         # behind; the write and load streams carry the transfers themselves.
-        torch.cuda.current_stream().synchronize()
+        self.submission_stream.synchronize()
         self.write_stream.synchronize()
         self.load_stream.synchronize()
 

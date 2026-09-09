@@ -182,6 +182,7 @@ class GroupAwareWireTest(unittest.TestCase):
         executor._load_acks = []
         executor._load_poisoned = False
         executor.load_stream = object() if load_stream is None else load_stream
+        executor.submission_stream = object()
         executor.transfer_backend = backend
         device = SimpleNamespace(type="cuda")
         executor.layout = SimpleNamespace(
@@ -333,6 +334,7 @@ class GroupAwareWireTest(unittest.TestCase):
         executor.transfer_backend = "auto"
         executor._write_acks = []
         executor.write_stream = Mock(name="write_stream")
+        executor.submission_stream = Mock(name="submission_stream")
         for lane_name in ("_ordered_write_lane", "_pinned_write_lane"):
             lane = SimpleNamespace(workspace=Mock(), metadata_done=None)
             lane.workspace.load_block_transfers.return_value = (1, (0, 1))
@@ -351,15 +353,15 @@ class GroupAwareWireTest(unittest.TestCase):
         executor_module = self._executor_module()
         executor, device = self._make_write_executor(executor_module)
         lane = executor._pinned_write_lane
-        caller_stream = object()
+        caller_stream = executor.submission_stream
         finish = Mock()
         metadata_done = Mock()
 
         with (
             patch.object(
                 executor_module.device_module,
-                "current_stream",
-                return_value=caller_stream,
+                "stream",
+                return_value=nullcontext(),
             ),
             patch.object(
                 executor_module.device_module,
@@ -414,8 +416,8 @@ class GroupAwareWireTest(unittest.TestCase):
                 with (
                     patch.object(
                         executor_module.device_module,
-                        "current_stream",
-                        return_value=caller_stream,
+                        "stream",
+                        return_value=nullcontext(),
                     ),
                     patch.object(
                         executor_module.device_module, "Event", return_value=finish
@@ -435,7 +437,7 @@ class GroupAwareWireTest(unittest.TestCase):
     def test_submit_write_backs_fences_only_stream_ordered_ops(self):
         executor_module = self._executor_module()
         executor, _ = self._make_write_executor(executor_module)
-        caller_stream = Mock(name="caller_stream")
+        caller_stream = executor.submission_stream
         ordered_finish = Mock(name="ordered_finish")
         pinned_finish = Mock(name="pinned_finish")
         events = iter(
@@ -461,8 +463,8 @@ class GroupAwareWireTest(unittest.TestCase):
             ),
             patch.object(
                 executor_module.device_module,
-                "current_stream",
-                return_value=caller_stream,
+                "stream",
+                return_value=nullcontext(),
             ),
             patch.object(
                 executor_module.device_module,
@@ -497,7 +499,7 @@ class GroupAwareWireTest(unittest.TestCase):
     def test_submit_write_backs_without_stream_ordered_ops_fences_nothing(self):
         executor_module = self._executor_module()
         executor, _ = self._make_write_executor(executor_module)
-        caller_stream = Mock(name="caller_stream")
+        caller_stream = executor.submission_stream
 
         class WriteBackOp:
             def __init__(self):
@@ -513,8 +515,8 @@ class GroupAwareWireTest(unittest.TestCase):
             ),
             patch.object(
                 executor_module.device_module,
-                "current_stream",
-                return_value=caller_stream,
+                "stream",
+                return_value=nullcontext(),
             ),
             patch.object(executor_module.device_module, "Event", side_effect=Mock),
             patch.object(executor_module, "transfer_cache_blocks"),
@@ -721,6 +723,7 @@ class GroupAwareWireTest(unittest.TestCase):
         ):
             executor = L2CacheExecutor(
                 target_pool,
+                submission_stream=object(),
                 draft_pool=draft_pool,
                 host_ratio=1.0,
                 host_size_gb=0,
@@ -809,6 +812,7 @@ class GroupAwareWireTest(unittest.TestCase):
                     pool.cache_transfer_layout.return_value = layout
                     executor = L2CacheExecutor(
                         pool,
+                        submission_stream=object(),
                         host_ratio=1.0,
                         host_size_gb=0,
                         io_backend=io_backend,
@@ -1065,6 +1069,7 @@ class CompactLayoutRoundTripTest(unittest.TestCase):
         with patch.object(self.executor_module, "_HOST_MEM_HEADROOM_BYTES", 0):
             executor = self.executor_module.L2CacheExecutor(
                 pool,
+                submission_stream=torch.cuda.current_stream(),
                 draft_pool=draft_pool,
                 host_ratio=1.0,
                 host_size_gb=0,

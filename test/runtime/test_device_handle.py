@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import ast
 from concurrent.futures import Future
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -131,7 +132,11 @@ def _handle(trace, **kwargs):
         SimpleNamespace(
             forward_thread=_ForwardThread(trace),
             execute_forward_op=lambda *a, **k: trace.append("forward"),
-            order_cache_operations=lambda: trace.append("order"),
+            submission_stream=SimpleNamespace(
+                wait_stream=lambda stream: trace.append("order")
+            ),
+            execution_stream=object(),
+            device_module=SimpleNamespace(stream=lambda stream: nullcontext()),
             write_remote_spec_candidate_ids=lambda idx, ids: trace.append(
                 ("candidates", idx, list(ids))
             ),
@@ -239,12 +244,15 @@ def test_an_aborted_request_still_lands_its_candidates_but_is_not_armed():
 # ----------------------------------------------------------------------
 
 
-def test_one_plan_orders_write_backs_zeroing_then_load_backs():
+def test_one_plan_orders_write_backs_zeroing_then_load_backs(monkeypatch):
     """The FIFO carries the correctness order for same-round page reuse: the
     write-backs are submitted behind the forward fence and ahead of the new
     owner's zeroing (a stream-ordered snapshot copy lands its fence there),
     and the load-backs target zeroed pages."""
     trace: list = []
+    monkeypatch.setattr(
+        "tokenspeed.runtime.execution.device.Cache", SimpleNamespace(WriteBackOp=str)
+    )
     plan = _plan(pages_to_zero=[3, 4], cache=["op"])
     handle = _handle(
         trace,
@@ -304,10 +312,13 @@ def test_a_plan_with_no_device_work_submits_nothing():
     assert trace == []
 
 
-def test_a_failed_cache_submission_surfaces_at_the_next_poll():
+def test_a_failed_cache_submission_surfaces_at_the_next_poll(monkeypatch):
     """A submission that raised produces no completion acks; swallowing it
     would leave its ops counted in flight forever."""
     trace: list = []
+    monkeypatch.setattr(
+        "tokenspeed.runtime.execution.device.Cache", SimpleNamespace(WriteBackOp=str)
+    )
 
     def exploding(plan):
         raise ValueError("bad cache op")
