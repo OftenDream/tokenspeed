@@ -220,12 +220,18 @@ def mla_decode_with_kvcache(
     live_lengths = (
         [1] * batch if torch.npu.is_current_stream_capturing() else cache_seqlens
     )
+    # Capture layout copies as ordinary graph nodes, outside FIA task-update.
+    # Replay must refresh them after the packed cache is written.
+    q_nope = q_nope.reshape(batch, 1, heads * kv_lora_rank).contiguous()
+    q_aux = q_aux.reshape(batch, 1, heads * qk_rope_head_dim).contiguous()
+    k_nope = k_nope.flatten(2).contiguous()
+    k_aux = k_aux.flatten(2).contiguous()
     output, lse = torch_npu.npu_fused_infer_attention_score(
-        q_nope.reshape(batch, 1, heads * kv_lora_rank),
-        k_nope.flatten(2),
-        k_nope.flatten(2),
-        query_rope=q_aux.reshape(batch, 1, heads * qk_rope_head_dim),
-        key_rope=k_aux.flatten(2),
+        q_nope,
+        k_nope,
+        k_nope,
+        query_rope=q_aux,
+        key_rope=k_aux,
         actual_seq_lengths_kv=live_lengths,
         block_table=page_table,
         num_heads=heads,

@@ -21,6 +21,18 @@ records every Python package mutation needed by this Ascend path, including the
 TokenSpeed applications should continue to import operators from
 `tokenspeed-kernel`; it owns registration and dispatch to this package.
 
+MLA Decode retains FIA with native NPUGraph. Its split Q/cache inputs are
+made contiguous before FIA dispatch, so layout copies execute on graph replay
+rather than inside FIA task-update. K and V share the same dense latent copy;
+the persistent cache remains packed. This copies the full allocated cache,
+not just live pages, so cache-capacity costs must be included in benchmarks.
+
+The changed-input, cache, page-table and sequence-length replay check is:
+
+```bash
+pytest -q test/runtime/test_lite_mla_eager.py -k decode_graph_updates_live_lengths
+```
+
 Lite KDA can additionally build the pinned public AscendC operator subset:
 
 ```bash

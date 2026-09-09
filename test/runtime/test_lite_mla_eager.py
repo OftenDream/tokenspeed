@@ -465,13 +465,17 @@ def test_ascend_lite_mla_decode_graph_updates_live_lengths():
     torch.npu.synchronize()
 
     previous = None
-    for lengths in ([3, 4], [5, 7]):
+    for lengths, pages in (([3, 4], [1, 2]), ([5, 7], [3, 1])):
+        q.copy_(torch.randn_like(q))
+        cache.copy_(torch.randn_like(cache))
+        table[:, 0].copy_(torch.tensor(pages, dtype=table.dtype, device="npu"))
+        torch.npu.synchronize()
         graph.update(cpu_update_input=[{"actual_seq_lengths_kv": lengths}])
         graph.replay()
         torch.npu.synchronize()
         expected = []
         for row, length in enumerate(lengths):
-            key = cache[row + 1, :length, 0]
+            key = cache[pages[row], :length, 0]
             logits = q[row, 0].float() @ key.float().transpose(0, 1) * 192**-0.5
             expected.append(
                 (torch.softmax(logits, dim=-1) @ key[:, :512].float()).to(q.dtype)
