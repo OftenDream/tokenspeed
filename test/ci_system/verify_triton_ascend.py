@@ -79,6 +79,16 @@ def main() -> None:
     if backing[128:1128].count_nonzero() or backing[2048:2560].count_nonzero():
         raise AssertionError("TokenSpeed Triton KV-cache kernel produced bad output")
 
+    range_size = 2 * 1024 * 1024
+    backing = torch.ones(32 * range_size, device="npu", dtype=torch.uint8)
+    zero_byte_ranges(
+        backing,
+        [(index * range_size, range_size) for index in range(32)],
+    )
+    torch.npu.synchronize()
+    if backing.count_nonzero():
+        raise AssertionError("large KV-cache zeroing produced bad output")
+
     print(
         "Triton-Ascend verification passed:",
         {

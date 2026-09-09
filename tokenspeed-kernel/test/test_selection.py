@@ -45,6 +45,7 @@ from tokenspeed_kernel.selection import (
     explain_selection,
     kernel_override,
     register_oracle,
+    resolve_kernel_override,
     select_kernel,
     set_selection_policy,
     spec_matches_shape_traits,
@@ -81,6 +82,21 @@ class TestSelectionObjective:
         assert SelectionObjective.PORTABILITY.value == "portability"
         assert SelectionObjective.DETERMINISM.value == "determinism"
         assert SelectionObjective.DEBUG.value == "debug"
+
+
+def test_resolve_kernel_override_preserves_precedence_and_scope(monkeypatch):
+    key = "TOKENSPEED_KERNEL_OVERRIDE_ATTENTION_KDA_CAUSAL_CONV1D"
+    monkeypatch.delenv(key, raising=False)
+    args = ("attention", "kda_causal_conv1d")
+    assert resolve_kernel_override(*args) is None
+    assert resolve_kernel_override(*args, "argument") == "argument"
+    with kernel_override(*args, "context"):
+        assert resolve_kernel_override(*args, "argument") == "context"
+        monkeypatch.setenv(key, "environment")
+        assert resolve_kernel_override(*args, "argument") == "environment"
+        monkeypatch.delenv(key)
+        assert resolve_kernel_override(*args) == "context"
+    assert resolve_kernel_override(*args) is None
 
 
 class TestScoreBreakdown:

@@ -8,6 +8,7 @@ sys.path.insert(0, os.path.dirname(_TEST_DIR))
 
 from test.runtime.conftest import TP8_PAGE_SET_BYTES, kimi_tp8_layout
 
+import pytest
 import torch
 
 
@@ -15,7 +16,12 @@ def _plan(num_lcm_blocks: int, *, tp_size: int = 8):
     return kimi_tp8_layout(tp_size=tp_size)[2].bind(num_lcm_blocks)
 
 
-def test_lcm_reference_geometry_is_exact() -> None:
+@pytest.mark.parametrize("state_layout", ["channel_major", "width_major"])
+def test_lcm_reference_geometry_is_exact(monkeypatch, state_layout) -> None:
+    monkeypatch.setattr(
+        "tokenspeed_kernel.ops.attention.kda.kda_causal_conv_state_layout",
+        lambda: state_layout,
+    )
     plan = _plan(7)
 
     assert plan.prefix_granularity == 128
@@ -55,11 +61,21 @@ def test_lcm_reference_geometry_is_exact() -> None:
     conv = next(
         field for field in plan.fields if field.field_id.endswith(".conv_state")
     )
-    assert conv.shape[0] == 3 * 96 * 128 // 8
+    channels = 3 * 96 * 128 // 8
+    assert conv.shape == (
+        (channels, 3) if state_layout == "channel_major" else (3, channels)
+    )
 
 
-def test_lcm_geometry_shrinks_with_the_kda_state_at_tp16() -> None:
+@pytest.mark.parametrize("state_layout", ["channel_major", "width_major"])
+def test_lcm_geometry_shrinks_with_the_kda_state_at_tp16(
+    monkeypatch, state_layout
+) -> None:
     """KDA state halves at TP16; the plane and the parent halve with it."""
+    monkeypatch.setattr(
+        "tokenspeed_kernel.ops.attention.kda.kda_causal_conv_state_layout",
+        lambda: state_layout,
+    )
     plan = _plan(7, tp_size=16)
 
     assert {
@@ -76,7 +92,10 @@ def test_lcm_geometry_shrinks_with_the_kda_state_at_tp16() -> None:
     conv = next(
         field for field in plan.fields if field.field_id.endswith(".conv_state")
     )
-    assert conv.shape[0] == 3 * 96 * 128 // 16
+    channels = 3 * 96 * 128 // 16
+    assert conv.shape == (
+        (channels, 3) if state_layout == "channel_major" else (3, channels)
+    )
 
 
 def test_attention_dp_layouts_grow_the_mla_packing() -> None:
@@ -160,9 +179,15 @@ def test_speculative_verify_workspace_is_reserved_outside_the_arena(
     assert setup.spec.memory_plan.num_lcm_blocks == expected_parents
 
 
+@pytest.mark.parametrize("state_layout", ["channel_major", "width_major"])
 def test_replay_verify_workspace_reserves_conv_rows_and_payloads(
     monkeypatch,
+    state_layout,
 ) -> None:
+    monkeypatch.setattr(
+        "tokenspeed_kernel.ops.attention.kda.kda_causal_conv_state_layout",
+        lambda: state_layout,
+    )
     monkeypatch.setattr(
         "tokenspeed_kernel.ops.attention.kda.kda_replay_commit_supported",
         lambda dtype, **kwargs: True,

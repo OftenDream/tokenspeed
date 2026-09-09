@@ -55,6 +55,7 @@ def _lite_recipe(
     max_bs: int = 8,
     token_limit: int = 4096,
     overlap_schedule_depth: int = 0,
+    linear_num_heads: int = 32,
 ) -> Any:
     try:
         from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
@@ -70,7 +71,7 @@ def _lite_recipe(
             pytest.skip("full attention config dependencies are not installed")
         raise
 
-    text_config = FLASHLocalConfig()
+    text_config = FLASHLocalConfig(linear_num_heads=linear_num_heads)
     text_config.architectures = [_ARCHITECTURE]
     mla = MLAConfig(
         backend_name="mla",
@@ -147,7 +148,13 @@ def _layout(tp_size: int, **recipe_kwargs):
     return recipe, groups, layout
 
 
-def _pool(device: str = "cpu", *, num_lcm_blocks: int = 8):
+def _pool(
+    device: str = "cpu",
+    *,
+    num_lcm_blocks: int = 8,
+    tp_size: int = 8,
+    linear_num_heads: int = 32,
+):
     try:
         from tokenspeed.runtime.layers.attention.kv_cache.arena import CacheArena
         from tokenspeed.runtime.layers.attention.kv_cache.hybrid_kda import (
@@ -158,7 +165,9 @@ def _pool(device: str = "cpu", *, num_lcm_blocks: int = 8):
             pytest.skip("cache arena runtime requires an accelerator platform")
         raise
 
-    recipe, groups, layout = _layout(8, device=device)
+    recipe, groups, layout = _layout(
+        tp_size, device=device, linear_num_heads=linear_num_heads
+    )
     plan = layout.bind(num_lcm_blocks)
     arena = CacheArena(
         plan,
@@ -273,6 +282,7 @@ def test_replicated_mla_service_keeps_full_component_geometry() -> None:
 @pytest.mark.parametrize(
     (
         "tp_size",
+        "state_layout",
         "conv_shape",
         "recurrent_shape",
         "packing",
@@ -280,18 +290,50 @@ def test_replicated_mla_service_keeps_full_component_geometry() -> None:
         "parent_bytes",
     ),
     (
-        (8, (1536, 3), (4, 128, 128), (2, 1), 294_912, 2_064_384),
-        (1, (12288, 3), (32, 128, 128), (15, 1), 2_211_840, 15_482_880),
+        (
+            8,
+            "channel_major",
+            (1536, 3),
+            (4, 128, 128),
+            (2, 1),
+            294_912,
+            2_064_384,
+        ),
+        (
+            8,
+            "width_major",
+            (3, 1536),
+            (4, 128, 128),
+            (2, 1),
+            294_912,
+            2_064_384,
+        ),
+        (
+            1,
+            "channel_major",
+            (12288, 3),
+            (32, 128, 128),
+            (15, 1),
+            2_211_840,
+            15_482_880,
+        ),
     ),
 )
 def test_lite_layout_is_byte_exact_at_tp8_and_tp1(
+    monkeypatch,
     tp_size,
+    state_layout,
     conv_shape,
     recurrent_shape,
     packing,
     plane_bytes,
     parent_bytes,
 ) -> None:
+    import tokenspeed_kernel.ops.attention.kda as attention_ops
+
+    monkeypatch.setattr(
+        attention_ops, "kda_causal_conv_state_layout", lambda: state_layout
+    )
     recipe, groups, layout = _layout(tp_size)
     specs = {spec.group_id: spec for spec, _ in groups}
     fields = {field.field_id: field for field in layout.fields}
@@ -325,6 +367,21 @@ def test_lite_layout_is_byte_exact_at_tp8_and_tp1(
     assert len(layout.plane_bytes) == 7
     assert {size for _, size in layout.plane_bytes} == {plane_bytes}
     assert layout.lcm_block_bytes == parent_bytes
+
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.transfer import (
+        build_cache_transfer_schema,
+    )
+
+    model_config = SimpleNamespace(
+        num_attention_layers=28,
+        hf_config=recipe.model_config.hf_config,
+        hf_text_config=recipe.model_config.hf_config,
+    )
+    schema = build_cache_transfer_schema(layout.bind(2), model_config=model_config)
+    partition = schema.partition_for("layer.0.conv_state")
+    assert partition is not None
+    assert partition.axis == (1 if state_layout == "width_major" else 0)
+    assert partition.global_parts == (4096, 4096, 4096)
 
 
 def test_lite_oe_does_not_move_existing_kimi_fields() -> None:
@@ -545,12 +602,113 @@ def test_lite_pool_binds_one_arena_and_distinct_layer_views() -> None:
     assert pool.requires_page_zeroing
     assert pool.arena.buffer.numel() == pool.arena.plan.arena_bytes
     assert groups == {group_id: 7 for group_id in _STATE_GROUPS}
-    assert conv0.shape == (9, 1536, 3)
+    assert conv0.shape == (9, *pool.arena.plan.field("layer.0.conv_state").shape)
     assert recurrent0.shape == (9, 4, 128, 128)
     assert conv0.untyped_storage().data_ptr() == pool.arena.buffer.data_ptr()
     assert conv0.data_ptr() != conv1.data_ptr()
     assert recurrent0.data_ptr() != recurrent1.data_ptr()
     assert not torch.count_nonzero(pool.arena.buffer)
+
+
+@pytest.mark.parametrize("linear_num_heads", [32, 64], ids=["lite-3b", "lite-large"])
+@pytest.mark.parametrize("tp_size", [1, 2, 4, 8])
+@pytest.mark.parametrize("decode", [False, True], ids=["prefill", "decode-graph"])
+def test_npu_causal_conv_real_arena(linear_num_heads, tp_size, decode) -> None:
+    if not hasattr(torch, "npu") or not torch.npu.is_available():
+        pytest.skip("requires an Ascend NPU and the updated causal-conv package")
+    from tokenspeed_kernel.ops.attention.kda import kda_causal_conv1d
+
+    torch.npu.set_device(0)
+    _, pool = _pool(
+        "npu", num_lcm_blocks=4, tp_size=tp_size, linear_num_heads=linear_num_heads
+    )
+    state, _ = pool.get_state_buffers(0)
+    channels = 3 * linear_num_heads * 128 // tp_size
+    assert state.shape[1:] == (3, channels)
+    assert state.stride(0) > 3 * channels
+    assert state.stride()[1:] == (channels, 1)
+    # Check the entire byte arena, including other layers/recurrent state and
+    # padding. A dense slot offset would corrupt these unrelated fields.
+    pool.arena.buffer.fill_(7)
+    torch.manual_seed(43)
+    state.copy_((torch.randn(state.shape, device="npu") * 0.02).to(state.dtype))
+    reference_state = state.clone()
+    expected_arena = pool.arena.buffer.cpu()
+    expected_view = expected_arena.view(state.dtype).as_strided(
+        state.shape, state.stride(), state.storage_offset()
+    )
+    # Decode padding is one token per request; empty sequences are Prefill-only.
+    lengths = [1] * 16 if decode else [2, 1025, 0, 3] + [0] * 12
+    boundaries_cpu = torch.tensor(
+        [0, *torch.tensor(lengths).cumsum(0).tolist()], dtype=torch.int64
+    )
+    boundaries = boundaries_cpu.to(device="npu", dtype=torch.int32)
+    reads = torch.tensor([1, 2] + [-1] * 14, device="npu", dtype=torch.int32)
+    writes = torch.tensor([3, 4] + [-1] * 14, device="npu", dtype=torch.int32)
+    initial = (
+        None if decode else torch.tensor([True, False] + [True] * 14, device="npu")
+    )
+    projected = (torch.randn(sum(lengths), channels, device="npu") * 0.05).to(
+        state.dtype
+    )
+    weight = (torch.randn(channels, 4, device="npu") * 0.03).to(state.dtype)
+    kwargs = dict(
+        decode=decode, cu_seqlens_cpu=boundaries_cpu, has_initial_state=initial
+    )
+    solution = "public_kda"
+    if decode:
+        graph = torch.npu.NPUGraph()
+        with torch.npu.graph(
+            graph, stream=torch.npu.Stream(), auto_dispatch_capture=True
+        ):
+            output = kda_causal_conv1d(
+                projected,
+                weight,
+                state,
+                reads,
+                writes,
+                boundaries,
+                solution=solution,
+                **kwargs,
+            )
+        state.copy_(reference_state)
+    for replay in range(2):
+        if replay:
+            projected.copy_(
+                (torch.randn_like(projected.float()) * 0.05).to(state.dtype)
+            )
+            reads.copy_(writes)  # Replay uses the newly written pages, in place.
+            if initial is not None:
+                initial.fill_(True)
+        expected = kda_causal_conv1d(
+            projected,
+            weight,
+            reference_state,
+            reads,
+            writes,
+            boundaries,
+            solution="ref",
+            **kwargs,
+        )
+        if decode:
+            graph.replay()
+        else:
+            output = kda_causal_conv1d(
+                projected,
+                weight,
+                state,
+                reads,
+                writes,
+                boundaries,
+                solution=solution,
+                **kwargs,
+            )
+        torch.npu.synchronize()
+        torch.testing.assert_close(
+            output.float(), expected.float(), atol=1e-4, rtol=0.03
+        )
+        expected_view.copy_(reference_state.cpu())
+        assert torch.equal(pool.arena.buffer.cpu(), expected_arena)
 
 
 def test_lite_graph_state_indices_refresh_without_reallocation() -> None:

@@ -60,6 +60,33 @@ def test_cache_field_layer_id_parses_layer_owned_field():
     assert cache_field_layer_id("layer.12.k") == 12
 
 
+@pytest.mark.parametrize("history_len", [1, 2, 3, 7])
+@pytest.mark.parametrize("channel_axis", [0, 1])
+def test_kda_partition_uses_configured_history_axis(history_len, channel_axis):
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.transfer import (
+        _partition_for_field,
+    )
+
+    text_config = SimpleNamespace(
+        linear_attn_config={
+            "num_heads": 32,
+            "head_dim": 128,
+            "short_conv_kernel_size": history_len + 1,
+        }
+    )
+    shape = (1536, history_len) if channel_axis == 0 else (history_len, 1536)
+    partition = _partition_for_field(
+        SimpleNamespace(field_id="layer.0.conv_state", shape=shape),
+        model_config=SimpleNamespace(
+            num_attention_layers=1, hf_text_config=text_config
+        ),
+        draft_model_config=None,
+        inkling_layers=frozenset(),
+    )
+    assert partition.axis == channel_axis
+    assert partition.global_parts == (4096, 4096, 4096)
+
+
 @pytest.mark.parametrize(
     "field_id",
     ("attention.k", "layer.bad.k", "layer.-1.k", "layer.0"),

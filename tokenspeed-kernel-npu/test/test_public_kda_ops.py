@@ -147,7 +147,7 @@ def test_artifact_symlink_cannot_escape_package_root(tmp_path, monkeypatch):
 def test_loader_reports_schemas_independently_and_is_idempotent(tmp_path, monkeypatch):
     root, _ = _artifact(tmp_path)
     calls = []
-    namespace = SimpleNamespace(causal_conv1d=object(), recurrent_kda=object())
+    namespace = SimpleNamespace(recurrent_kda=object())
     fake_ops = SimpleNamespace(
         load_library=lambda path: calls.append(("binding", path)),
         tokenspeed_npu_public_kda=namespace,
@@ -164,7 +164,7 @@ def test_loader_reports_schemas_independently_and_is_idempotent(tmp_path, monkey
     first = public_kda_ops.load_public_kda_ops()
     second = public_kda_ops.load_public_kda_ops()
     assert first is second
-    assert first.available == {"causal_conv1d", "recurrent_kda"}
+    assert first.available == {"recurrent_kda"}
     assert "chunk_kda_fwd" in first.reason
     assert [call[0] for call in calls] == ["tiling", "binding"]
     assert calls[0][2] == public_kda_ops.ctypes.RTLD_GLOBAL

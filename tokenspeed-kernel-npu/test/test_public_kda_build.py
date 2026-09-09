@@ -23,6 +23,7 @@ import importlib.util
 import json
 import zipfile
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from tokenspeed_kernel_npu.public_kda_ops import load_lock, resolve_ops
@@ -74,6 +75,21 @@ def test_manifest_is_relative_and_reproducible(tmp_path):
     assert not any(str(tmp_path) in str(value) for value in manifest.values())
     assert len(manifest["sha256"]["binding"]) == 64
     assert len(manifest["sha256"]["vendor_op_tiling"]) == 64
+
+
+def test_vendor_api_rejects_partial_package(tmp_path, monkeypatch):
+    library = tmp_path / "libcust_opapi.so"
+    library.touch()
+    monkeypatch.setattr(
+        build.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            stdout="000 T aclnnRecurrentKda\n"
+            "000 T aclnnRecurrentKdaGetWorkspaceSize\n"
+        ),
+    )
+    with pytest.raises(RuntimeError, match="aclnnChunkKdaFwd"):
+        build.validate_vendor_api(library, ("recurrent_kda", "chunk_kda_fwd"))
 
 
 def test_publish_replaces_only_after_staging_is_complete(tmp_path):

@@ -212,7 +212,12 @@ class KimiK3Recipe(CacheRecipe):
         linear_attn = self.attn_config.component(LinearAttnConfig)
         if linear_attn is None:
             raise ValueError("Kimi-K3 cache requires a linear-attention component")
-        return (linear_attn.conv_state_shape, linear_attn.temporal_state_shape)
+        conv_shape = linear_attn.conv_state_shape
+        from tokenspeed_kernel.ops.attention.kda import kda_causal_conv_state_layout
+
+        if kda_causal_conv_state_layout() == "width_major":
+            conv_shape = (conv_shape[1], conv_shape[0])
+        return conv_shape, linear_attn.temporal_state_shape
 
     @override
     def fields_for_layer(
@@ -329,8 +334,10 @@ class KimiK3Recipe(CacheRecipe):
         if self.server_args.speculative_algorithm is None:
             return 0
         if self.replay_kda:
-            conv_shape, recurrent_shape = self._kda_shapes
+            _, recurrent_shape = self._kda_shapes
             heads, head_dim, _ = recurrent_shape
+            # Packed Q/K/V channels, independent of the convolution history axis.
+            conv_channels = 3 * heads * head_dim
             # Replay starts from the committed convolution checkpoint and
             # reconstructs the accepted recurrent state.
             from tokenspeed_kernel.ops.attention.kda import (
@@ -365,7 +372,7 @@ class KimiK3Recipe(CacheRecipe):
                 for field in fields
             )
             payload_bytes_per_row = (
-                conv_shape[0] + head_dim + heads
+                conv_channels + head_dim + heads
             ) * torch.bfloat16.itemsize
             # Fused raw-g capture stores BF16; other replay paths need FP32 scratch.
             gate_itemsize = (

@@ -40,7 +40,7 @@ def _load_reference():
         Path(__file__).parents[2]
         / "tokenspeed-kernel/python/tokenspeed_kernel/ops/attention/kda_reference.py"
     )
-    result_module = ModuleType("tokenspeed_kernel.ops.attention.kda_utils")
+    result_module = ModuleType("tokenspeed_kernel.ops.attention.kda")
     result_module.KdaPrefillResult = namedtuple(
         "KdaPrefillResult", ("out", "final_state")
     )
@@ -48,7 +48,7 @@ def _load_reference():
     module = importlib.util.module_from_spec(spec)
     with mock.patch.dict(
         sys.modules,
-        {"tokenspeed_kernel.ops.attention.kda_utils": result_module},
+        {"tokenspeed_kernel.ops.attention.kda": result_module},
     ):
         spec.loader.exec_module(module)
     return module
@@ -125,7 +125,8 @@ def _kda_inputs(tokens=4, heads=2, dim=4, dtype=torch.float32, device="cpu"):
     }
 
 
-def test_packed_causal_conv_publishes_independent_output_slots():
+@pytest.mark.parametrize("width_major", [False, True])
+def test_packed_causal_conv_publishes_independent_output_slots(width_major):
     torch.manual_seed(7)
     projected = torch.randn(4, 3)
     weight = torch.randn(3, 3)
@@ -138,6 +139,8 @@ def test_packed_causal_conv_publishes_independent_output_slots():
     )
 
     actual_state = state.clone()
+    if width_major:
+        actual_state = actual_state.transpose(1, 2).contiguous()
     actual_output = REFERENCE.torch_kda_causal_conv1d(
         projected,
         weight,
@@ -148,7 +151,10 @@ def test_packed_causal_conv_publishes_independent_output_slots():
     )
 
     torch.testing.assert_close(actual_output, expected_output)
-    torch.testing.assert_close(actual_state, expected_state)
+    torch.testing.assert_close(
+        actual_state,
+        expected_state.transpose(1, 2) if width_major else expected_state,
+    )
 
 
 @pytest.mark.parametrize("featurewise", [False, True])

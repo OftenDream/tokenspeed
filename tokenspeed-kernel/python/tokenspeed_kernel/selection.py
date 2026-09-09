@@ -46,6 +46,7 @@ __all__ = [
     "set_selection_policy",
     "register_oracle",
     "kernel_override",
+    "resolve_kernel_override",
     "explain_selection",
     "spec_matches_traits",
     "ref_compatible_with_spec",
@@ -465,6 +466,18 @@ def _log_selection(
         )
 
 
+def resolve_kernel_override(
+    family: str, mode: str, override: str | None = None
+) -> str | None:
+    """Resolve an override name: environment > scoped context > call argument.
+
+    Returns None when selection is automatic. Operator wrappers use the same
+    result to preserve forced-selection errors instead of silently falling back.
+    """
+    env_key = f"TOKENSPEED_KERNEL_OVERRIDE_{family.upper()}_{mode.upper()}"
+    return os.environ.get(env_key) or _global_overrides.get((family, mode)) or override
+
+
 def select_kernel(
     family: str,
     mode: str,
@@ -502,16 +515,7 @@ def select_kernel(
     """
     platform = platform or current_platform()
 
-    # Context-manager global overrides
-    global_override = _global_overrides.get((family, mode))
-    if global_override:
-        override = global_override
-
-    # Environment variables take precedence over context-manager overrides.
-    env_key = f"TOKENSPEED_KERNEL_OVERRIDE_{family.upper()}_{mode.upper()}"
-    env_override = os.environ.get(env_key)
-    if env_override:
-        override = env_override
+    override = resolve_kernel_override(family, mode, override)
     registry = KernelRegistry.get()
 
     # Fast path: check cache (skipped when override is active)

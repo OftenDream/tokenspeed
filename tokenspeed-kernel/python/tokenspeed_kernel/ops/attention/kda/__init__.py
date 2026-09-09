@@ -28,6 +28,7 @@ from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.registry import KernelRegistry
 from tokenspeed_kernel.selection import (
     NoKernelFoundError,
+    resolve_kernel_override,
     select_kernel,
     spec_matches_traits,
 )
@@ -135,6 +136,11 @@ def kda_recurrent_layout() -> str:
     return "v_major" if v_major else "k_major"
 
 
+def kda_causal_conv_state_layout() -> str:
+    """Return the physical state layout preferred by causal-conv kernels."""
+    return "width_major" if current_platform().is_npu else "channel_major"
+
+
 def _kda_beta_mode(q: torch.Tensor, beta_logits: torch.Tensor) -> str:
     if beta_logits.shape == q.shape[:-1]:
         return "scalar"
@@ -168,7 +174,10 @@ def kda_causal_conv1d(
     channels, width = weight.shape
     if width != 4 or projected.shape[1] != channels:
         raise ValueError("KDA causal-conv requires matching width-4 channels")
-    if conv_state.shape[1:] != (channels, width - 1):
+    if conv_state.shape[1:] not in (
+        (channels, width - 1),
+        (width - 1, channels),
+    ):
         raise ValueError("KDA causal-conv state shape does not match its weight")
     if bias is not None and bias.shape != (channels,):
         raise ValueError("KDA causal-conv bias must match the channel count")
@@ -197,6 +206,7 @@ def kda_causal_conv1d(
     if any(tensor.device != projected.device for tensor in device_tensors):
         raise ValueError("KDA causal-conv device tensors must share one device")
 
+    override = resolve_kernel_override("attention", "kda_causal_conv1d", override)
     traits = {
         "forward_mode": "decode" if decode else "prefill",
         "batch_class": "large" if read_indices.numel() >= 16 else "small",
@@ -311,6 +321,7 @@ def kda_paged_prefill(
         )
     if solution == "fla":
         solution = "triton"
+    override = resolve_kernel_override("attention", "kda_paged_prefill", override)
     kernel = select_kernel(
         "attention",
         "kda_paged_prefill",
@@ -975,6 +986,7 @@ __all__ = [
     "KdaPrefillResult",
     "KdaFusedDecodeResult",
     "kda_causal_conv1d",
+    "kda_causal_conv_state_layout",
     "kda_recurrent_layout",
     "kda_paged_prefill",
     "kda_paged_decode",

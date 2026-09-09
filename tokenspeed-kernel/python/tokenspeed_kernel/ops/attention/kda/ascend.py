@@ -36,7 +36,7 @@ if current_platform().is_npu:
         public_kda_paged_prefill as _public_kda_paged_prefill,
     )
     from tokenspeed_kernel_npu.ops.kda import (
-        torch_kda_causal_conv1d as _torch_kda_causal_conv1d,
+        ref_kda_causal_conv1d as _ref_kda_causal_conv1d,
     )
     from tokenspeed_kernel_npu.ops.kda import (
         torch_kda_paged_decode as _torch_kda_paged_decode,
@@ -101,8 +101,8 @@ if current_platform().is_npu:
     @register_kernel(
         "attention",
         "kda_causal_conv1d",
-        name="torch_ascend_kda_causal_conv1d",
-        solution="torch",
+        name="ref_ascend_kda_causal_conv1d",
+        solution="ref",
         capability=_CAPABILITY,
         signatures=format_signatures(("projected", "weight"), "dense", _DTYPES),
         priority=Priority.PORTABLE,
@@ -115,7 +115,7 @@ if current_platform().is_npu:
         tags={"ascend", "portability"},
     )
     def kda_causal_conv1d(**kwargs):
-        return _torch_kda_causal_conv1d(**kwargs)
+        return _ref_kda_causal_conv1d(**kwargs)
 
     @register_kernel(
         "attention",
@@ -127,13 +127,32 @@ if current_platform().is_npu:
         priority=Priority.SPECIALIZED,
         traits={
             "forward_mode": frozenset({"prefill"}),
-            "batch_class": frozenset({"large"}),
+            "batch_class": frozenset({"small", "large"}),
             "activation": frozenset({"none", "silu"}),
             "width": frozenset({4}),
         },
         tags={"ascend", "throughput"},
     )
     def public_kda_causal_conv1d(**kwargs):
+        return _public_kda_causal_conv1d(**kwargs)
+
+    @register_kernel(
+        "attention",
+        "kda_causal_conv1d",
+        name="public_ascend_kda_causal_conv1d_decode",
+        solution="public_kda",
+        capability=_CAPABILITY,
+        signatures=format_signatures(("projected", "weight"), "dense", _DTYPES),
+        priority=Priority.SPECIALIZED,
+        traits={
+            "forward_mode": frozenset({"decode"}),
+            "batch_class": frozenset({"small", "large"}),
+            "activation": frozenset({"none", "silu"}),
+            "width": frozenset({4}),
+        },
+        tags={"ascend", "latency"},
+    )
+    def public_kda_causal_conv1d_decode(**kwargs):
         return _public_kda_causal_conv1d(**kwargs)
 
 

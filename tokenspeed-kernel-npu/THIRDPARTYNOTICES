@@ -12,9 +12,9 @@ Optional public KDA operator build
 ----------------------------------
 The optional public KDA build uses operator sources from vLLM-Ascend at the
 revision recorded in public_kda_ops.lock.json and CATLASS at its recorded
-revision. The causal-conv and CATLASS sources use the CANN Open Software License
-Agreement Version 2.0. RecurrentKda uses Apache-2.0. KdaGateCumsum and
-ChunkKdaFwd use BSD-3-Clause. The upstream source checkout and generated OPP
-installer contain the corresponding full license texts and copyright notices.
-The pinned build inputs additionally use nlohmann JSON under MIT, Abseil under
-Apache-2.0, and Protocol Buffers under BSD-3-Clause.
+revision. CATLASS uses the CANN Open Software License Agreement Version 2.0.
+RecurrentKda uses Apache-2.0. KdaGateCumsum and ChunkKdaFwd use BSD-3-Clause.
+The upstream source checkout and generated OPP installer contain the
+corresponding full license texts and copyright notices. The pinned build inputs
+additionally use nlohmann JSON under MIT, Abseil under Apache-2.0, and Protocol
+Buffers under BSD-3-Clause.

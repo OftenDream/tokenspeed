@@ -98,7 +98,11 @@ def torch_kda_causal_conv1d(
     channels, width = weight.shape
     if width < 1 or projected.shape[1] != channels:
         raise ValueError("KDA causal-conv input and weight shapes do not match")
-    if conv_state.shape[1:] != (channels, width - 1):
+    if conv_state.shape[1:] == (width - 1, channels):
+        # A stride-aware Torch view, not a physical relayout. The final copy_
+        # writes through this view into the caller's original state pool.
+        conv_state = conv_state.transpose(1, 2)
+    elif conv_state.shape[1:] != (channels, width - 1):
         raise ValueError("KDA causal-conv state shape does not match its weight")
     if bias is not None and bias.shape != (channels,):
         raise ValueError("KDA causal-conv bias must match the channel count")

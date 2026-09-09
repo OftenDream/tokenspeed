@@ -135,7 +135,9 @@ from tokenspeed_kernel.ops.moe.triton import mxfp4 as _moe_triton_mxfp4
 from tokenspeed_kernel.platform import ArchVersion, Platform, PlatformInfo
 from tokenspeed_kernel.registry import KernelRegistry, Priority
 from tokenspeed_kernel.selection import (
+    NoKernelFoundError,
     SelectedKernel,
+    kernel_override,
     select_kernel,
     spec_matches_traits,
 )
@@ -152,6 +154,67 @@ _ATTENTION_GLUON_MODULES = [
 _attention_gluon_kpool = sys.modules.get("tokenspeed_kernel.ops.attention.kpool.gluon")
 if _attention_gluon_kpool is not None:
     _ATTENTION_GLUON_MODULES.append(_attention_gluon_kpool)
+
+
+@pytest.mark.parametrize(
+    "source", ["auto", "argument", "solution", "context", "environment"]
+)
+def test_causal_conv_forced_selection_reaches_leaf(monkeypatch, source):
+    from contextlib import nullcontext
+
+    selected = {}
+
+    def select(*args, **kwargs):
+        selected.update(kwargs)
+        return SelectedKernel("public_test", lambda **kw: kw["require_public"])
+
+    monkeypatch.setattr(_attention_kda_pkg, "select_kernel", select)
+    env_key = "TOKENSPEED_KERNEL_OVERRIDE_ATTENTION_KDA_CAUSAL_CONV1D"
+    monkeypatch.delenv(env_key, raising=False)
+    if source == "environment":
+        monkeypatch.setenv(env_key, "public_test")
+    scope = (
+        kernel_override("attention", "kda_causal_conv1d", "public_test")
+        if source == "context"
+        else nullcontext()
+    )
+    with scope:
+        forced = _attention_kda_pkg.kda_causal_conv1d(
+            torch.zeros(1, 16, dtype=torch.bfloat16),
+            torch.zeros(16, 4, dtype=torch.bfloat16),
+            torch.zeros(2, 3, 16, dtype=torch.bfloat16),
+            torch.tensor([0]),
+            torch.tensor([1]),
+            torch.tensor([0, 1]),
+            decode=True,
+            override="public_test" if source == "argument" else None,
+            solution="public_kda" if source == "solution" else None,
+        )
+    assert forced == (source != "auto")
+    assert selected["override"] == (
+        "public_test" if source in ("argument", "context", "environment") else None
+    )
+
+
+def test_missing_environment_override_does_not_fall_back(monkeypatch):
+    monkeypatch.setenv(
+        "TOKENSPEED_KERNEL_OVERRIDE_ATTENTION_KDA_CAUSAL_CONV1D", "missing"
+    )
+
+    def missing(*args, **kwargs):
+        raise NoKernelFoundError("missing requested kernel")
+
+    monkeypatch.setattr(_attention_kda_pkg, "select_kernel", missing)
+    with pytest.raises(NoKernelFoundError, match="missing requested kernel"):
+        _attention_kda_pkg.kda_causal_conv1d(
+            torch.zeros(1, 16, dtype=torch.bfloat16),
+            torch.zeros(16, 4, dtype=torch.bfloat16),
+            torch.zeros(2, 3, 16, dtype=torch.bfloat16),
+            torch.tensor([0]),
+            torch.tensor([1]),
+            torch.tensor([0, 1]),
+            decode=True,
+        )
 
 _RELOAD_MODULES = [
     # Attention registration modules.

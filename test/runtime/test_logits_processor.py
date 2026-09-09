@@ -542,6 +542,11 @@ def test_capture_takes_the_plain_gather_and_leaves_the_gate_for_later(monkeypatc
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
     monkeypatch.setattr(
         logits_processor_module,
+        "current_platform",
+        lambda: SimpleNamespace(is_nvidia=True),
+    )
+    monkeypatch.setattr(
+        logits_processor_module,
         "all_gather_single",
         lambda out, inp, group: None,
     )
@@ -553,6 +558,41 @@ def test_capture_takes_the_plain_gather_and_leaves_the_gate_for_later(monkeypatc
 
     assert out.shape == (4, 8)
     assert proc._all_gather_state is LogitsProcessor._LOGITS_AG_STATE_UNINITIALIZED
+
+
+@pytest.mark.parametrize("do_argmax", [False, True])
+def test_non_nvidia_tp_logits_do_not_query_cuda_capture(monkeypatch, do_argmax):
+    monkeypatch.setattr(
+        logits_processor_module,
+        "current_platform",
+        lambda: SimpleNamespace(is_nvidia=False),
+    )
+    monkeypatch.setattr(
+        torch.cuda,
+        "is_current_stream_capturing",
+        lambda: pytest.fail("non-NVIDIA logits must not query CUDA capture"),
+    )
+    proc = LogitsProcessor(
+        config=SimpleNamespace(
+            model_type="test", vocab_size=8, final_logit_softcapping=None
+        ),
+        tp_rank=0,
+        tp_size=2,
+        tp_group=(0, 1),
+        do_argmax=do_argmax,
+    )
+    monkeypatch.setattr(
+        logits_processor_module,
+        "all_gather_into_tensor",
+        lambda out, inp, group: out.copy_(inp.repeat(2, 1)),
+    )
+    hidden = torch.randn(4, 2)
+    lm_head = SimpleNamespace(weight=torch.randn(4, 2))
+    out = proc._get_logits(
+        hidden, lm_head, LogitsMetadata(forward_mode=ForwardMode.DECODE)
+    )
+    torch.testing.assert_close(out, (hidden @ lm_head.weight.T).repeat(1, 2))
+    assert proc._all_gather_state is None
 
 
 def test_get_logits_softcap_disables_fused_argmax(monkeypatch):

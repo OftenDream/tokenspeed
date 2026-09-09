@@ -32,6 +32,10 @@ generated artifact below this package. It does not install vLLM-Ascend as a
 Python dependency. Set `TOKENSPEED_PUBLIC_KDA_SOURCE_DIR` to an exact prepared
 public checkout when the build host has no network access.
 
+The optimized Lite causal-conv path is supplied separately by the `flash_ops`
+run package and wheel built from `flash-npu-kernel`. If that package or its
+schemas are unavailable, TokenSpeed keeps the existing Torch fallback.
+
 Run the operator correctness suite on a visible NPU with:
 
 ```bash

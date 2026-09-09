@@ -113,7 +113,28 @@ def build_opp(source: Path, staging: Path, lock: dict, ops: tuple[str, ...]) -> 
     )
     if not all(path.is_file() for path in required):
         raise RuntimeError(f"custom OPP install is incomplete: {vendor}")
+    validate_vendor_api(required[0], ops)
     return vendor
+
+
+def validate_vendor_api(library: Path, ops: tuple[str, ...]) -> None:
+    """Reject partial OPP packages before their manifest is published."""
+
+    output = subprocess.run(
+        ["nm", "-D", "--defined-only", str(library)],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    symbols = {line.split()[-1] for line in output.splitlines() if line.split()}
+    expected = {
+        f"aclnn{''.join(part.capitalize() for part in op.split('_'))}{suffix}"
+        for op in ops
+        for suffix in ("", "GetWorkspaceSize")
+    }
+    missing = sorted(expected - symbols)
+    if missing:
+        raise RuntimeError(f"custom OPP API is missing symbols: {missing}")
 
 
 def build_binding(staging: Path) -> Path:

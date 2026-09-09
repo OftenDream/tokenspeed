@@ -35,7 +35,6 @@ from typing import Any
 import torch
 
 OP_NAMES = (
-    "causal_conv1d",
     "recurrent_kda",
     "kda_gate_cumsum",
     "chunk_kda_fwd",

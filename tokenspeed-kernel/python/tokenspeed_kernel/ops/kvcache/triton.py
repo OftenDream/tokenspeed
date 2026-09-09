@@ -432,16 +432,28 @@ def zero_byte_ranges(backing: torch.Tensor, ranges: list[tuple[int, int]]) -> No
     # state field. Bound the rectangle and let each CTA stride its own range.
     # Few large ranges still need enough CTAs to occupy the device.
     tiles_per_range = max(32, triton.cdiv(1024, len(ranges)))
-    grid = (
-        len(ranges),
-        min(tiles_per_range, triton.cdiv(max_size, block_size)),
-    )
-    _zero_byte_ranges_kernel[grid](
-        backing,
-        range_table,
-        BLOCK_SIZE=block_size,
-        num_warps=4,
-    )
+    tile_count = min(tiles_per_range, triton.cdiv(max_size, block_size))
+    if not current_platform().is_npu:
+        _zero_byte_ranges_kernel[(len(ranges), tile_count)](
+            backing,
+            range_table,
+            BLOCK_SIZE=block_size,
+            num_warps=4,
+        )
+        return
+
+    # Bound each NPU launch's total grid. Each CTA still strides through its
+    # assigned range, preserving the upstream bounded-rectangle behavior.
+    max_programs = 65535
+    ranges_per_launch = max(1, max_programs // tile_count)
+    for range_offset in range(0, len(ranges), ranges_per_launch):
+        range_count = min(ranges_per_launch, len(ranges) - range_offset)
+        _zero_byte_ranges_kernel[(range_count, tile_count)](
+            backing,
+            range_table[range_offset:],
+            BLOCK_SIZE=block_size,
+            num_warps=4,
+        )
 
 
 # -----------------------------------------------------------------------------

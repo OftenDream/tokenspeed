@@ -1,9 +1,13 @@
 # Lite NPU 阶段 4B：Causal-Conv 验证记录
 
+此文件是 `0bbab6d5` 的历史实验记录，不代表当前选核策略或性能。
+小算子拼接模式统一称为 ref；当前策略见
+[设计文档 10.7 节](lite-npu-phase-04b-causal-conv.md#107-布局与选核的调用合同)。
+
 ## 1. 验证对象
 
 本记录验证阶段 4B 实现提交 `0bbab6d5`。范围限定为 Lite width-4 packed QKV causal-conv：统一
-kernel API、Ascend selection、Decode graph-safe Torch 路径、Prefill depthwise-conv/公开融合路径、
+kernel API、Ascend selection、Decode graph-safe ref 路径、Prefill depthwise-conv/公开融合路径、
 双 page state 发布、可选 artifact 回退和 Lite conv weight post-load packing。
 
 本阶段不验证 recurrent/chunk KDA、output epilogue、完整模型服务、CP8/KVP8 或 PD one-copy；这些
@@ -39,17 +43,17 @@ zero-init 后重新编译，避免 varlen 跳过区域向后续算子暴露未�
 
 | 模式 | batch class | 默认 kernel |
 | --- | --- | --- |
-| Decode | small/large | `torch_ascend_kda_causal_conv1d` |
-| Prefill | small，B<16 | `torch_ascend_kda_causal_conv1d` |
+| Decode | small/large | ref（历史拼接路径） |
+| Prefill | small，B<16 | ref（历史拼接路径） |
 | Prefill | large，B>=16 | `public_ascend_kda_causal_conv1d` |
 
-无 artifact 时，large Prefill 自动执行同一 Torch 实现；显式指定 `public_kda` 时则直接报错，未出现
+无 artifact 时，large Prefill 自动执行同一 ref 实现；显式指定 `public_kda` 时则直接报错，未出现
 静默降级。统一 API 同时拒绝错误 width、channel、dtype、index/mask shape 和跨设备 tensor。
 
 ### 3.2 Prefill
 
 生产 TP8 rank-local shape 固定为 `C=1536,W=4`。NPU focused 覆盖 B1、B4、B16、变长、empty、
-fresh/resume、`read!=write`、page 0 与未选邻页。B16 默认公开路径和显式 Torch 路径满足
+fresh/resume、`read!=write`、page 0 与未选邻页。B16 默认公开路径和显式 ref 路径满足
 `atol=3e-2,rtol=3e-2`；两条路径写出的最后三个 raw projection state bitwise 一致，page 0 与邻页
 bitwise 不变，output/state 均 finite。
 
@@ -61,7 +65,7 @@ dict 均未改变。
 
 Decode 使用 tensor-only gather/window/FP32 reduce/scatter，没有 `.item()`、D2H 或 token Python 循环。
 BS2 NPUGraph 完成 capture 和两次 replay：第二次 replay 前同时更新 projection、read page 和 write
-page，graph output 与 eager Torch bitwise 一致，目标 state pool bitwise 一致，page 0 与邻页不变。
+page，graph output 与 eager ref bitwise 一致，目标 state pool bitwise 一致，page 0 与邻页不变。
 
 NPU Graph capture 只记录、不执行首轮计算；测试在 capture 后先 replay，再比较结果。该行为是测试
 协议修正，不是 kernel fallback，也没有在生产路径加入同步。
@@ -86,9 +90,9 @@ output 最大绝对差为 `7.63e-6`；recurrent state 最大绝对差为 `3.83e-
 
 最终 exact-source 代码使用同步后的 steady-state 平均值，单位为微秒：
 
-| 场景 | Torch | 公开融合 | 默认选择 |
+| 场景 | ref | 公开融合 | 默认选择 |
 | --- | ---: | ---: | --- |
-| Prefill B8/T500 | 1611.6 | 1364.7 | Torch |
+| Prefill B8/T500 | 1611.6 | 1364.7 | ref |
 | Prefill B16/T1000 | 3278.4 | 1357.2 | 公开融合 |
 
 同一最终代码的 Decode BS2 NPUGraph replay 为 `80.48 us`。它与阶段 4B 设计阶段测得的约
@@ -113,8 +117,8 @@ shape、NaN/Inf 回归、Decode graph replay、page sentinel、neighbor isolatio
 ## 6. 结论与回退
 
 阶段 4B 准入通过。Lite featurewise-beta KDA 已从逐 token causal-conv reference 切换到统一 kernel
-边界：Decode 固定使用 graph-safe Torch，small-Prefill 使用标准 depthwise conv，large-Prefill 使用
+边界：Decode 固定使用 graph-safe ref，small-Prefill 使用标准 depthwise conv，large-Prefill 使用
 公开融合 op；可选 artifact 缺失不影响正确性 baseline。
 
 若后续服务验证发现公开 large-Prefill 路径不稳定，只需删除其 performant registration；runtime、
-cache、Lite model 和 Torch fallback 均无需修改。下一阶段按既定顺序准入公开 recurrent Decode。
+cache、Lite model 和 ref fallback 均无需修改。下一阶段按既定顺序准入公开 recurrent Decode。

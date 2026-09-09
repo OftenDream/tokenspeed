@@ -14,6 +14,7 @@ from tokenspeed_kernel.ops.attention.kda import (
     KdaPrefillResult,
     _attention_format_signature,
     kda_causal_conv1d,
+    kda_causal_conv_state_layout,
     kda_paged_decode,
     kda_paged_prefill,
     kda_recurrent_layout,
@@ -37,11 +38,32 @@ NORM_EPS = 1e-6
 
 
 @pytest.mark.parametrize(
-    ("decode", "batch_size", "batch_class"),
-    [(True, 2, "small"), (False, 15, "small"), (False, 16, "large")],
+    ("is_npu", "expected"),
+    [(False, "channel_major"), (True, "width_major")],
+)
+def test_kda_causal_conv_state_layout_is_owned_by_operator(
+    monkeypatch, is_npu, expected
+) -> None:
+    monkeypatch.setattr(
+        attention_ops,
+        "current_platform",
+        lambda: SimpleNamespace(is_npu=is_npu),
+    )
+
+    assert kda_causal_conv_state_layout() == expected
+
+
+@pytest.mark.parametrize(
+    ("decode", "batch_size", "batch_class", "native_state"),
+    [
+        (True, 2, "small", False),
+        (True, 2, "small", True),
+        (False, 15, "small", False),
+        (False, 16, "large", False),
+    ],
 )
 def test_kda_causal_conv_routes_by_mode_and_request_count(
-    monkeypatch, decode, batch_size, batch_class
+    monkeypatch, decode, batch_size, batch_class, native_state
 ) -> None:
     captured = {}
 
@@ -53,10 +75,11 @@ def test_kda_causal_conv_routes_by_mode_and_request_count(
     tokens = batch_size if decode else batch_size * 2
     projected = torch.zeros(tokens, 4, dtype=torch.bfloat16)
     boundaries = torch.arange(0, tokens + 1, 1 if decode else 2, dtype=torch.int64)
+    state_shape = (batch_size + 1, 3, 4) if native_state else (batch_size + 1, 4, 3)
     output = kda_causal_conv1d(
         projected,
         torch.zeros(4, 4, dtype=torch.bfloat16),
-        torch.zeros(batch_size + 1, 4, 3, dtype=torch.bfloat16),
+        torch.zeros(state_shape, dtype=torch.bfloat16),
         torch.arange(batch_size, dtype=torch.int32),
         torch.arange(1, batch_size + 1, dtype=torch.int32),
         boundaries,
@@ -71,6 +94,41 @@ def test_kda_causal_conv_routes_by_mode_and_request_count(
         "activation": "silu",
         "width": 4,
     }
+
+
+def test_kda_causal_conv_portable_fallback_accepts_native_state(monkeypatch) -> None:
+    def no_kernel(*_args, **_kwargs):
+        raise NoKernelFoundError("test")
+
+    monkeypatch.setattr(attention_ops, "select_kernel", no_kernel)
+    projected = torch.randn(2, 4, dtype=torch.bfloat16)
+    weight = torch.randn(4, 4, dtype=torch.bfloat16)
+    channel_major = torch.randn(3, 4, 3, dtype=torch.bfloat16)
+    native = channel_major.transpose(1, 2).contiguous()
+    indices = torch.tensor([1, 2], dtype=torch.int32)
+    boundaries = torch.arange(3, dtype=torch.int64)
+
+    expected = kda_causal_conv1d(
+        projected,
+        weight,
+        channel_major,
+        indices,
+        indices,
+        boundaries,
+        decode=True,
+    )
+    actual = kda_causal_conv1d(
+        projected,
+        weight,
+        native,
+        indices,
+        indices,
+        boundaries,
+        decode=True,
+    )
+
+    torch.testing.assert_close(actual, expected)
+    torch.testing.assert_close(native, channel_major.transpose(1, 2))
 
 
 @pytest.mark.parametrize(
@@ -91,9 +149,12 @@ def test_kda_prefill_relayouts_only_for_declaring_kernels(
         return KdaPrefillResult(torch.empty(0), kwargs["initial_state"])
 
     selected = SelectedKernel("fake_kda_prefill", fake_kernel)
-    monkeypatch.setattr(
-        attention_ops, "select_kernel", lambda *_args, **_kwargs: selected
-    )
+
+    def select(family, mode, signature, **kwargs):
+        assert (family, mode) == ("attention", "kda_paged_prefill")
+        return selected
+
+    monkeypatch.setattr(attention_ops, "select_kernel", select)
     traits = (
         {} if supported_layouts is None else {"recurrent_layout": supported_layouts}
     )

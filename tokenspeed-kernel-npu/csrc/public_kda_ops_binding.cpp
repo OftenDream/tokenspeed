@@ -78,50 +78,6 @@ void GetPublicKdaApiFunc(
 
 namespace tokenspeed_npu_public_kda {
 
-at::Tensor causal_conv1d(
-    const at::Tensor& x,
-    const at::Tensor& weight,
-    at::Tensor& conv_state,
-    const c10::optional<at::Tensor>& bias,
-    const c10::optional<at::Tensor>& query_start_loc,
-    const c10::optional<at::Tensor>& cache_indices,
-    const c10::optional<at::Tensor>& initial_state_mode,
-    const c10::optional<at::Tensor>& num_accepted_tokens,
-    int64_t activation_mode,
-    int64_t pad_slot_id,
-    int64_t run_mode) {
-  TORCH_CHECK(x.dim() == 2 || x.dim() == 3, "causal_conv1d: x must be rank 2 or 3");
-  TORCH_CHECK(weight.dim() == 2, "causal_conv1d: weight must be [width, channels]");
-  TORCH_CHECK(
-      conv_state.dim() == 3,
-      "causal_conv1d: state must be [slots, state_len, channels]");
-  TORCH_CHECK(
-      weight.size(1) == x.size(-1) && conv_state.size(2) == x.size(-1),
-      "causal_conv1d: channel dimensions do not match");
-  TORCH_CHECK(
-      weight.size(0) >= 2 && weight.size(0) <= 4,
-      "causal_conv1d: width must be in [2, 4]");
-  TORCH_CHECK(
-      conv_state.size(1) >= weight.size(0) - 1,
-      "causal_conv1d: state_len must be at least width - 1");
-  at::Tensor output = at::zeros_like(x);
-  EXEC_NPU_CMD(
-      aclnnCausalConv1d,
-      x,
-      weight,
-      bias,
-      conv_state,
-      query_start_loc,
-      cache_indices,
-      initial_state_mode,
-      num_accepted_tokens,
-      activation_mode,
-      pad_slot_id,
-      run_mode,
-      output);
-  return output;
-}
-
 at::Tensor recurrent_kda(
     const at::Tensor& query,
     const at::Tensor& key,
@@ -452,21 +408,6 @@ std::tuple<at::Tensor, at::Tensor> chunk_kda_fwd(
   return {output, final_state};
 }
 
-at::Tensor causal_conv1d_meta(
-    const at::Tensor& x,
-    const at::Tensor&,
-    at::Tensor&,
-    const c10::optional<at::Tensor>&,
-    const c10::optional<at::Tensor>&,
-    const c10::optional<at::Tensor>&,
-    const c10::optional<at::Tensor>&,
-    const c10::optional<at::Tensor>&,
-    int64_t,
-    int64_t,
-    int64_t) {
-  return at::empty_like(x);
-}
-
 at::Tensor recurrent_kda_meta(
     const at::Tensor&,
     const at::Tensor&,
@@ -528,11 +469,6 @@ std::tuple<at::Tensor, at::Tensor> chunk_kda_fwd_meta(
 
 TORCH_LIBRARY(tokenspeed_npu_public_kda, ops) {
   ops.def(
-      "causal_conv1d(Tensor x, Tensor weight, Tensor(a!) conv_state, *, Tensor? bias=None, "
-      "Tensor? query_start_loc=None, Tensor? cache_indices=None, Tensor? initial_state_mode=None, "
-      "Tensor? num_accepted_tokens=None, int activation_mode=1, int pad_slot_id=-1, "
-      "int run_mode=0) -> Tensor");
-  ops.def(
       "recurrent_kda(Tensor query, Tensor key, Tensor value, Tensor gate, Tensor beta, "
       "Tensor(a!) initial_state, Tensor cu_seqlens, Tensor state_indices, Tensor a_log, "
       "Tensor dt_bias, *, Tensor? num_accepted_tokens=None, "
@@ -551,14 +487,12 @@ TORCH_LIBRARY(tokenspeed_npu_public_kda, ops) {
 }
 
 TORCH_LIBRARY_IMPL(tokenspeed_npu_public_kda, PrivateUse1, ops) {
-  ops.impl("causal_conv1d", &tokenspeed_npu_public_kda::causal_conv1d);
   ops.impl("recurrent_kda", &tokenspeed_npu_public_kda::recurrent_kda);
   ops.impl("kda_gate_cumsum", &tokenspeed_npu_public_kda::kda_gate_cumsum);
   ops.impl("chunk_kda_fwd", &tokenspeed_npu_public_kda::chunk_kda_fwd);
 }
 
 TORCH_LIBRARY_IMPL(tokenspeed_npu_public_kda, Meta, ops) {
-  ops.impl("causal_conv1d", &tokenspeed_npu_public_kda::causal_conv1d_meta);
   ops.impl("recurrent_kda", &tokenspeed_npu_public_kda::recurrent_kda_meta);
   ops.impl("kda_gate_cumsum", &tokenspeed_npu_public_kda::kda_gate_cumsum_meta);
   ops.impl("chunk_kda_fwd", &tokenspeed_npu_public_kda::chunk_kda_fwd_meta);

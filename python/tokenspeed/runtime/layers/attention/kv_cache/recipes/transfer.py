@@ -192,8 +192,21 @@ def _partition_for_field(
         num_heads = int(linear_config["num_heads"])
         head_dim = int(linear_config["head_dim"])
         if suffix == "conv_state":
-            width = num_heads * head_dim
-            return CacheFieldPartition(0, 3 * width, (width, width, width))
+            head_channels = num_heads * head_dim
+            history_len = int(linear_config["short_conv_kernel_size"]) - 1
+            # A field is one checkpoint, without its outer slot axis:
+            # [QKV channels, history] or [history, QKV channels]. Partition
+            # channels across TP ranks; every rank retains the full history.
+            if len(field.shape) != 2:
+                raise ValueError("KDA conv_state must have channel and history axes")
+            if field.shape[1] == history_len:
+                axis = 0
+            elif field.shape[0] == history_len:
+                axis = 1
+            else:
+                raise ValueError("KDA conv_state has no matching history axis")
+            qkv_parts = (head_channels, head_channels, head_channels)
+            return CacheFieldPartition(axis, sum(qkv_parts), qkv_parts)
         return CacheFieldPartition(0, num_heads)
 
     return None

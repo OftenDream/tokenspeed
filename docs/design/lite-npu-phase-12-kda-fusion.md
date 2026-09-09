@@ -1,5 +1,8 @@
 # Lite NPU Phase 12: KDA fusion plan
 
+> The 2026-09-02 Decode follow-up in Phase 04B supersedes this plan's old
+> `[page,C,3]` Lite NPU conv-state assumption; the Phase 12 fusion boundaries are unchanged.
+
 ## 1. Scope
 
 Phase 12 optimizes the Lite KDA path after the functional NPU, graph, overlap, cache, and service

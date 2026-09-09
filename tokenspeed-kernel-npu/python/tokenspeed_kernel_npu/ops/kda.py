@@ -23,6 +23,7 @@
 from __future__ import annotations
 
 import math
+from functools import cache
 from typing import TYPE_CHECKING
 
 import torch
@@ -39,10 +40,29 @@ _LITE_KDA_HEADS = 4
 _LITE_KDA_DIM = 128
 _DECODE_VALUE_BLOCK = 32
 
+
+@cache
+def _load_flash_causal_conv_ops():
+    try:
+        import flash_ops
+    except ModuleNotFoundError as error:
+        if error.name != "flash_ops":
+            raise
+        return None
+    # Older packages expose the same schema but assume dense slots and cannot
+    # write Prefill results to independent destination pages.
+    if not getattr(flash_ops, "CAUSAL_CONV1D_STATE_SLOT_STRIDE", False):
+        return None
+    return torch.ops.custom
+
+
 # CANN discovers custom OPP metadata when the device is first initialized.  The
 # NPU registry imports this module before model tensors are allocated, so load
-# the optional artifact here instead of waiting for the first kernel call.
+# the optional artifacts here instead of waiting for the first kernel call.
+# Keep this order: loading flash_ops first corrupts CANN teardown when both
+# vendor registries are present.
 load_public_kda_ops()
+_load_flash_causal_conv_ops()
 
 
 @triton.jit
@@ -234,6 +254,19 @@ def _safe_indices(
     )
 
 
+def _channel_major_conv_state_view(
+    conv_state: torch.Tensor, channels: int
+) -> torch.Tensor:
+    """Share storage as [slots, channels, history] for stride-aware Torch ops.
+
+    This is not a physical relayout for the packaged kernel. Keeping a view
+    ensures index_copy_ publishes updates to the original cache allocation.
+    """
+    if conv_state.shape[1] == channels:
+        return conv_state
+    return conv_state.transpose(1, 2)
+
+
 def _decode(
     projected: torch.Tensor,
     weight: torch.Tensor,
@@ -243,6 +276,7 @@ def _decode(
     bias: torch.Tensor | None,
     activation: str | None,
 ) -> torch.Tensor:
+    conv_state = _channel_major_conv_state_view(conv_state, weight.shape[0])
     active, safe_reads, safe_writes = _safe_indices(read_indices, write_indices)
     history = conv_state.index_select(0, safe_reads)
     window = torch.cat((history, projected.unsqueeze(-1)), dim=-1)
@@ -268,6 +302,7 @@ def _prefill(
     has_initial_state: torch.Tensor | None,
     activation: str | None,
 ) -> torch.Tensor:
+    conv_state = _channel_major_conv_state_view(conv_state, weight.shape[0])
     boundaries = [int(value) for value in cu_seqlens_cpu.tolist()]
     if (
         not boundaries
@@ -479,7 +514,7 @@ def torch_kda_paged_decode(
     return output.unsqueeze(0).to(v.dtype)
 
 
-def torch_kda_causal_conv1d(
+def ref_kda_causal_conv1d(
     *,
     projected: torch.Tensor,
     weight: torch.Tensor,
@@ -494,7 +529,7 @@ def torch_kda_causal_conv1d(
     decode: bool,
     require_public: bool = False,
 ) -> torch.Tensor:
-    """Graph-safe Decode or per-request depthwise-conv Prefill."""
+    """Ref composition: graph-safe Decode or per-request depthwise-conv Prefill."""
     del cu_seqlens, require_public
     if decode:
         return _decode(
@@ -535,12 +570,28 @@ def public_kda_causal_conv1d(
     decode: bool,
     require_public: bool = False,
 ) -> torch.Tensor:
-    """Adapt TokenSpeed's state layout to the optional public Prefill op."""
-    if not is_available("causal_conv1d"):
+    """Use the packaged op on width-major state, including strided arena slots."""
+    channels, width = weight.shape
+    if conv_state.ndim != 3 or conv_state.shape[1:] != (width - 1, channels):
+        raise ValueError(
+            "public causal-conv requires state [slots, width - 1, channels]"
+        )
+    if (
+        conv_state.stride(2) != 1
+        or conv_state.stride(1) != channels
+        or conv_state.stride(0) < (width - 1) * channels
+    ):
+        raise ValueError("public causal-conv requires state strides [S, channels, 1]")
+    op_name = "npu_causal_conv1d"
+    flash_ops = _load_flash_causal_conv_ops()
+    op = getattr(flash_ops, op_name, None) if flash_ops is not None else None
+    if op is None:
         if require_public:
-            status = load_public_kda_ops()
-            raise RuntimeError(status.reason or "public causal_conv1d is unavailable")
-        return torch_kda_causal_conv1d(
+            raise RuntimeError(
+                f"flash_ops schema custom::{op_name} with strided-state support is unavailable; "
+                "install the matching updated wheel and custom OPP"
+            )
+        return ref_kda_causal_conv1d(
             projected=projected,
             weight=weight,
             conv_state=conv_state,
@@ -554,30 +605,33 @@ def public_kda_causal_conv1d(
             decode=decode,
         )
     if decode:
-        raise ValueError("public causal_conv1d is only registered for Prefill")
+        return op(
+            projected,
+            weight.transpose(0, 1).contiguous(),
+            conv_state,
+            bias=bias,
+            cache_indices=read_indices,
+            write_indices=write_indices,
+            activation_mode=0 if activation is None else 1,
+            pad_slot_id=-1,
+            run_mode=1,
+        )
 
-    active, safe_reads, safe_writes = _safe_indices(read_indices, write_indices)
-    compact = conv_state.index_select(0, safe_reads).transpose(1, 2).contiguous()
-    local_indices = torch.arange(
-        read_indices.numel(), dtype=torch.int32, device=projected.device
-    )
-    local_indices = torch.where(active, local_indices, -1)
-    output = torch.ops.tokenspeed_npu_public_kda.causal_conv1d(
+    # Keep the original arena view: the op reads its slot stride and writes
+    # directly to independent destination slots, without a compact pool.
+    return op(
         projected,
         weight.transpose(0, 1).contiguous(),
-        compact,
+        conv_state,
         bias=bias,
         query_start_loc=cu_seqlens,
-        cache_indices=local_indices,
+        cache_indices=read_indices,
+        write_indices=write_indices,
         initial_state_mode=has_initial_state,
         activation_mode=0 if activation is None else 1,
         pad_slot_id=-1,
         run_mode=0,
     )
-    destination = conv_state.index_select(0, safe_writes)
-    updated = torch.where(active[:, None, None], compact.transpose(1, 2), destination)
-    conv_state.index_copy_(0, safe_writes, updated)
-    return output
 
 
 def _prefill_chunk_plan(
@@ -765,6 +819,6 @@ def public_kda_paged_prefill(
 __all__ = [
     "public_kda_causal_conv1d",
     "public_kda_paged_prefill",
-    "torch_kda_causal_conv1d",
+    "ref_kda_causal_conv1d",
     "torch_kda_paged_decode",
 ]
