@@ -28,7 +28,6 @@ from typing import TYPE_CHECKING
 
 import torch
 import torch.nn.functional as F
-from tokenspeed_kernel_npu._triton import tl, triton
 from tokenspeed_kernel_npu.public_kda_ops import is_available, load_public_kda_ops
 
 if TYPE_CHECKING:
@@ -36,9 +35,6 @@ if TYPE_CHECKING:
 
 _PREFILL_CHUNK_SIZE = 64
 _PREFILL_MIN_PUBLIC_TOKENS = 32
-_LITE_KDA_HEADS = 4
-_LITE_KDA_DIM = 128
-_DECODE_VALUE_BLOCK = 32
 
 
 @cache
@@ -56,6 +52,19 @@ def _load_flash_causal_conv_ops():
     return torch.ops.custom
 
 
+@cache
+def _load_flash_recurrent_kda():
+    try:
+        import flash_ops
+    except ModuleNotFoundError as error:
+        if error.name != "flash_ops":
+            raise
+        return None
+    # Select by public entry point; tiling is owned by the installed package.
+    recurrent = getattr(flash_ops, "npu_recurrent_kda", None)
+    return recurrent if callable(recurrent) else None
+
+
 # CANN discovers custom OPP metadata when the device is first initialized.  The
 # NPU registry imports this module before model tensors are allocated, so load
 # the optional artifacts here instead of waiting for the first kernel call.
@@ -63,176 +72,7 @@ def _load_flash_causal_conv_ops():
 # vendor registries are present.
 load_public_kda_ops()
 _load_flash_causal_conv_ops()
-
-
-@triton.jit
-def _featurewise_decode_kernel(
-    q,
-    k,
-    v,
-    g,
-    beta,
-    a_log,
-    dt_bias,
-    output,
-    state_pool,
-    read_indices,
-    write_indices,
-    cu_seqlens,
-    stride_q_batch: tl.constexpr,
-    stride_q_head: tl.constexpr,
-    stride_k_batch: tl.constexpr,
-    stride_k_head: tl.constexpr,
-    stride_v_batch: tl.constexpr,
-    stride_v_head: tl.constexpr,
-    stride_g_batch: tl.constexpr,
-    stride_g_head: tl.constexpr,
-    stride_beta_batch: tl.constexpr,
-    stride_beta_head: tl.constexpr,
-    stride_state_page: tl.constexpr,
-    stride_state_head: tl.constexpr,
-    stride_state_key: tl.constexpr,
-    stride_state_value: tl.constexpr,
-    lower_bound: tl.constexpr,
-    H: tl.constexpr,
-    K: tl.constexpr,
-    V: tl.constexpr,
-    BV: tl.constexpr,
-):
-    pid = tl.program_id(0)
-    value_tiles = tl.cdiv(V, BV)
-    value_tile = pid % value_tiles
-    row = pid // value_tiles
-    batch = row // H
-    head = row % H
-
-    key_offsets = tl.arange(0, K)
-    value_offsets = value_tile * BV + tl.arange(0, BV)
-    value_mask = value_offsets < V
-    begin = tl.load(cu_seqlens + batch).to(tl.int64)
-    end = tl.load(cu_seqlens + batch + 1).to(tl.int64)
-    read_page = tl.load(read_indices + batch).to(tl.int64)
-    write_page = tl.load(write_indices + batch).to(tl.int64)
-    active = (end > begin) & (read_page >= 0) & (write_page >= 0)
-    safe_read = tl.where(active, read_page, 0)
-    safe_write = tl.where(active, write_page, 0)
-
-    q_row = tl.load(q + batch * stride_q_batch + head * stride_q_head + key_offsets).to(
-        tl.float32
-    )
-    k_row = tl.load(k + batch * stride_k_batch + head * stride_k_head + key_offsets).to(
-        tl.float32
-    )
-    g_row = tl.load(g + batch * stride_g_batch + head * stride_g_head + key_offsets).to(
-        tl.float32
-    )
-    beta_key = tl.load(
-        beta + batch * stride_beta_batch + head * stride_beta_head + key_offsets
-    ).to(tl.float32)
-    value = tl.load(
-        v + batch * stride_v_batch + head * stride_v_head + value_offsets,
-        mask=value_mask,
-        other=0.0,
-    ).to(tl.float32)
-    beta_value = tl.load(
-        beta + batch * stride_beta_batch + head * stride_beta_head + value_offsets,
-        mask=value_mask,
-        other=0.0,
-    ).to(tl.float32)
-
-    q_norm = tl.maximum(tl.sqrt(tl.sum(q_row * q_row, axis=0)), 1.0e-12)
-    k_norm = tl.maximum(tl.sqrt(tl.sum(k_row * k_row, axis=0)), 1.0e-12)
-    q_row = q_row / q_norm
-    key = (k_row / k_norm) * tl.sqrt(tl.sigmoid(beta_key) + 1.0e-10)
-    value = value * tl.sqrt(tl.sigmoid(beta_value) + 1.0e-10)
-    a = tl.load(a_log + head).to(tl.float32)
-    bias = tl.load(dt_bias + head * K + key_offsets).to(tl.float32)
-    gate = lower_bound * tl.sigmoid(tl.exp(a) * (g_row + bias))
-
-    state_offsets = (
-        safe_read * stride_state_page
-        + head * stride_state_head
-        + key_offsets[:, None] * stride_state_key
-        + value_offsets[None, :] * stride_state_value
-    )
-    state = tl.load(
-        state_pool + state_offsets,
-        mask=active & value_mask[None, :],
-        other=0.0,
-    ).to(tl.float32)
-    state = state * tl.exp(gate)[:, None]
-    delta = value - tl.sum(state * key[:, None], axis=0)
-    next_state = state + key[:, None] * delta[None, :]
-    result = tl.sum(next_state * q_row[:, None], axis=0) * (K**-0.5)
-
-    output_offsets = row * V + value_offsets
-    tl.store(output + output_offsets, result, mask=active & value_mask)
-    tl.store(output + output_offsets, 0.0, mask=(~active) & value_mask)
-    write_offsets = (
-        safe_write * stride_state_page
-        + head * stride_state_head
-        + key_offsets[:, None] * stride_state_key
-        + value_offsets[None, :] * stride_state_value
-    )
-    tl.store(
-        state_pool + write_offsets,
-        next_state,
-        mask=active & value_mask[None, :],
-    )
-
-
-def _triton_kda_paged_decode(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    g_raw: torch.Tensor,
-    beta_logits: torch.Tensor,
-    A_log: torch.Tensor,
-    dt_bias: torch.Tensor,
-    *,
-    state_pool: torch.Tensor,
-    read_indices: torch.Tensor,
-    write_indices: torch.Tensor,
-    cu_seqlens: torch.Tensor,
-    lower_bound: float,
-) -> torch.Tensor:
-    output = torch.empty(v.shape, dtype=v.dtype, device=v.device)
-    batch = q.shape[1]
-    grid = (batch * _LITE_KDA_HEADS * triton.cdiv(_LITE_KDA_DIM, _DECODE_VALUE_BLOCK),)
-    _featurewise_decode_kernel[grid](
-        q,
-        k,
-        v,
-        g_raw,
-        beta_logits,
-        A_log,
-        dt_bias,
-        output,
-        state_pool,
-        read_indices,
-        write_indices,
-        cu_seqlens,
-        stride_q_batch=q.stride(1),
-        stride_q_head=q.stride(2),
-        stride_k_batch=k.stride(1),
-        stride_k_head=k.stride(2),
-        stride_v_batch=v.stride(1),
-        stride_v_head=v.stride(2),
-        stride_g_batch=g_raw.stride(1),
-        stride_g_head=g_raw.stride(2),
-        stride_beta_batch=beta_logits.stride(1),
-        stride_beta_head=beta_logits.stride(2),
-        stride_state_page=state_pool.stride(0),
-        stride_state_head=state_pool.stride(1),
-        stride_state_key=state_pool.stride(2),
-        stride_state_value=state_pool.stride(3),
-        lower_bound=lower_bound,
-        H=_LITE_KDA_HEADS,
-        K=_LITE_KDA_DIM,
-        V=_LITE_KDA_DIM,
-        BV=_DECODE_VALUE_BLOCK,
-    )
-    return output
+_load_flash_recurrent_kda()
 
 
 def _activate(value: torch.Tensor, activation: str | None) -> torch.Tensor:
@@ -447,35 +287,37 @@ def torch_kda_paged_decode(
     _validate_decode_metadata_cpu(
         cu_seqlens, read_indices, write_indices, state_pool.shape[0]
     )
-    if (
-        q.device.type == "npu"
-        and beta_logits.shape == q.shape
-        and (heads, key_dim, value_dim)
-        == (_LITE_KDA_HEADS, _LITE_KDA_DIM, _LITE_KDA_DIM)
-        and all(
-            tensor.stride(-1) == 1
-            for tensor in (q, k, v, g_raw, beta_logits, state_pool)
-        )
-        and A_log.is_contiguous()
-        and dt_bias.is_contiguous()
-        and read_indices.is_contiguous()
-        and write_indices.is_contiguous()
-        and cu_seqlens.is_contiguous()
+    if q.device.type == "npu" and _supports_flash_recurrent_kda(
+        q,
+        k,
+        v,
+        g_raw,
+        beta_logits,
+        A_log,
+        dt_bias,
+        state_pool,
+        read_indices,
+        write_indices,
+        cu_seqlens,
+        lower_bound,
     ):
-        return _triton_kda_paged_decode(
-            q,
-            k,
-            v,
-            g_raw,
-            beta_logits,
-            A_log,
-            dt_bias,
-            state_pool=state_pool,
-            read_indices=read_indices,
-            write_indices=write_indices,
-            cu_seqlens=cu_seqlens,
-            lower_bound=lower_bound,
-        )
+        flash_recurrent = _load_flash_recurrent_kda()
+        if flash_recurrent is not None:
+            return flash_recurrent(
+                q,
+                k,
+                v,
+                g_raw,
+                beta_logits,
+                A_log,
+                dt_bias.reshape(heads, key_dim),
+                state_pool,
+                read_indices,
+                write_indices,
+                cu_seqlens,
+                state_v_major=False,
+                lower_bound=lower_bound,
+            )
 
     segment_active = cu_seqlens[1:] > cu_seqlens[:-1]
     active, safe_reads, safe_writes = _safe_indices(
@@ -512,6 +354,55 @@ def torch_kda_paged_decode(
     state_pool.index_copy_(0, safe_writes, published)
     output = torch.where(active[:, None, None], output, torch.zeros_like(output))
     return output.unsqueeze(0).to(v.dtype)
+
+
+def _supports_flash_recurrent_kda(
+    q,
+    k,
+    v,
+    g_raw,
+    beta_logits,
+    A_log,
+    dt_bias,
+    state_pool,
+    read_indices,
+    write_indices,
+    cu_seqlens,
+    lower_bound,
+) -> bool:
+    """Metadata-only admission after Decode validation; never pack inputs/state."""
+    batch, heads, dim = q.shape[1:]
+    activations = (q, k, v, g_raw, beta_logits)
+    return (
+        1 <= batch <= 256
+        and heads in (4, 8, 16, 32, 64)
+        and dim == 128
+        and lower_bound == -5.0
+        and all(
+            t.shape == q.shape
+            and t.dtype == torch.bfloat16
+            and t.stride(-1) == 1
+            and t.stride(2) >= 128
+            and (batch == 1 or t.stride(1) >= (heads - 1) * t.stride(2) + 128)
+            for t in activations
+        )
+        and A_log.dtype == dt_bias.dtype == torch.float32
+        and all(
+            t.is_contiguous()
+            for t in (
+                A_log,
+                dt_bias,
+                read_indices,
+                write_indices,
+                cu_seqlens,
+            )
+        )
+        and state_pool.stride(3) == 1
+        and state_pool.stride(2) == 128
+        and state_pool.stride(1) >= 128 * 128
+        and state_pool.stride(0) >= (heads - 1) * state_pool.stride(1) + 128 * 128
+        and not any(t.requires_grad for t in (*activations, A_log, dt_bias, state_pool))
+    )
 
 
 def ref_kda_causal_conv1d(

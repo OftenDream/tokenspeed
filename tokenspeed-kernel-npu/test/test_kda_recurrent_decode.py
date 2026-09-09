@@ -20,12 +20,99 @@
 
 from __future__ import annotations
 
+import builtins
 import importlib.util
+import sys
+from types import SimpleNamespace
 
 import pytest
 import torch
 import torch.nn.functional as F
+from tokenspeed_kernel_npu.ops import kda as kda_ops
 from tokenspeed_kernel_npu.ops.kda import torch_kda_paged_decode
+
+
+@pytest.mark.parametrize("marker", [None, False, True])
+def test_flash_recurrent_loads_callable_without_capability_gate(monkeypatch, marker):
+    def op():
+        raise RuntimeError("kernel failure")
+
+    module = SimpleNamespace(npu_recurrent_kda=op)
+    if marker is not None:
+        module.RECURRENT_KDA_KSPLIT64 = marker
+    monkeypatch.setitem(sys.modules, "flash_ops", module)
+    loaded = kda_ops._load_flash_recurrent_kda.__wrapped__()
+    assert loaded is op
+    with pytest.raises(RuntimeError, match="kernel failure"):
+        loaded()
+
+
+@pytest.mark.parametrize(
+    "module",
+    [
+        SimpleNamespace(),
+        SimpleNamespace(npu_recurrent_kda=None),
+        SimpleNamespace(npu_recurrent_kda=object()),
+    ],
+)
+def test_flash_recurrent_missing_callable_retains_fallback(monkeypatch, module):
+    monkeypatch.setitem(sys.modules, "flash_ops", module)
+    assert kda_ops._load_flash_recurrent_kda.__wrapped__() is None
+
+
+@pytest.mark.parametrize("missing", ["flash_ops", "flash_ops_dependency"])
+def test_flash_recurrent_only_swallows_missing_optional_package(monkeypatch, missing):
+    original_import = builtins.__import__
+
+    def import_module(name, *args, **kwargs):
+        if name == "flash_ops":
+            raise ModuleNotFoundError(f"No module named {missing!r}", name=missing)
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", import_module)
+    if missing == "flash_ops":
+        assert kda_ops._load_flash_recurrent_kda.__wrapped__() is None
+    else:
+        with pytest.raises(ModuleNotFoundError, match=missing):
+            kda_ops._load_flash_recurrent_kda.__wrapped__()
+
+
+@pytest.mark.parametrize("heads", [4, 8, 16, 32, 64])
+@pytest.mark.parametrize("batch", [1, 32, 256])
+def test_flash_recurrent_admits_strided_lite_tp_geometry(heads, batch):
+    packed = torch.empty(1, batch, heads, 5, 128, device="meta", dtype=torch.bfloat16)
+    values = list(packed.unbind(-2))
+    a = torch.empty(heads, device="meta")
+    dt = torch.empty(heads * 128, device="meta")
+    state = torch.empty_strided(
+        (4, heads, 128, 128),
+        (heads * 16960, 16384, 128, 1),
+        device="meta",
+    )
+    pages = torch.empty(batch, device="meta", dtype=torch.int32)
+    cu = torch.empty(batch + 1, device="meta", dtype=torch.int64)
+
+    def admitted():
+        return kda_ops._supports_flash_recurrent_kda(
+            *values,
+            a,
+            dt,
+            state,
+            pages,
+            pages,
+            cu,
+            -5.0,
+        )
+
+    assert admitted()
+    values[4] = values[4][..., 0]  # Scalar beta must retain the reference path.
+    assert not admitted()
+    values[4] = packed.unbind(-2)[4]
+    values[0] = values[0].float()
+    assert not admitted()
+    values[0] = packed.unbind(-2)[0]
+    state = state.transpose(-1, -2)
+    assert not admitted()
 
 
 def _npu_available() -> bool:
@@ -280,7 +367,9 @@ def test_npu_decode_selection_and_graph_replay_updated_values():
 
 
 @pytest.mark.skipif(not _npu_available(), reason="requires an Ascend NPU")
-def test_npu_lite_decode_triton_handles_strided_graph_inputs_and_padding():
+def test_npu_lite_decode_flash_handles_strided_graph_inputs_and_padding():
+    if kda_ops._load_flash_recurrent_kda() is None:
+        pytest.skip("requires flash_ops.npu_recurrent_kda")
     torch.npu.set_device(0)
     args = _lite_inputs(71)
     reads = torch.tensor([1, -1], dtype=torch.int32, device="npu:0")
@@ -361,7 +450,9 @@ def test_npu_lite_decode_triton_handles_strided_graph_inputs_and_padding():
 
 @pytest.mark.skipif(not _npu_available(), reason="requires an Ascend NPU")
 @pytest.mark.parametrize("seed", [81, 82, 83, 84])
-def test_npu_lite_decode_triton_128_step_trajectory(seed: int):
+def test_npu_lite_decode_flash_128_step_trajectory(seed: int):
+    if kda_ops._load_flash_recurrent_kda() is None:
+        pytest.skip("requires flash_ops.npu_recurrent_kda")
     torch.npu.set_device(0)
     args = _lite_inputs(seed)
     initial = args[-1].clone()
