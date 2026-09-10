@@ -26,6 +26,7 @@ import pytest
 import torch
 
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+from tokenspeed.runtime.layers.layernorm import FusedRMSNorm, RMSNorm
 from tokenspeed.runtime.models.flash_local_attention import (
     SeparateProjectionKimiLinearMLAAttention,
 )
@@ -54,6 +55,12 @@ class _Pool:
     def __init__(self, events):
         self.events = events
         self.rows = None
+        self.quant_method = None
+        self.arena = SimpleNamespace(kv_page_size=16)
+        self.cache = None
+
+    def get_key_buffer(self, _layer_id):
+        return self.cache
 
     def set_mla_kv_buffer(
         self,
@@ -117,12 +124,19 @@ class _Context:
     input_num_tokens: int
 
 
-def _layer():
+def _layer(attn_tp_size=1):
     torch.manual_seed(5501)
     component = SimpleNamespace(tp_size=1, tp_rank=0, tp_group=(0,))
     layer = SeparateProjectionKimiLinearMLAAttention(
         _config(),
-        SimpleNamespace(attn=component, mla_weight=component),
+        SimpleNamespace(
+            attn=SimpleNamespace(
+                tp_size=attn_tp_size,
+                tp_rank=0,
+                tp_group=tuple(range(attn_tp_size)),
+            ),
+            mla_weight=component,
+        ),
         layer_id=3,
     ).to(torch.bfloat16)
     for parameter in layer.parameters():
@@ -259,6 +273,52 @@ def test_ascend_lite_mla_model_path_uses_registered_projection(mode):
     assert output.shape == hidden.shape
     assert events == ["write", "attention"]
     assert torch.isfinite(output).all()
+
+
+@pytest.mark.skipif(not _NPU_AVAILABLE, reason="Ascend NPU is unavailable")
+def test_ascend_fused_rmsnorm_has_portable_fallback():
+    q = torch.randn(2, 8, dtype=torch.bfloat16, device="npu")
+    kv = torch.randn(2, 4, dtype=torch.bfloat16, device="npu")
+    q_norm = RMSNorm(8).to(device="npu", dtype=torch.bfloat16)
+    kv_norm = RMSNorm(4).to(device="npu", dtype=torch.bfloat16)
+    q_out = torch.empty_like(q)
+    kv_out = torch.empty_like(kv)
+
+    FusedRMSNorm(q_norm, kv_norm)(q, kv, q_out, kv_out)
+
+    torch.testing.assert_close(q_out, q_norm(q))
+    torch.testing.assert_close(kv_out, kv_norm(kv))
+
+
+@pytest.mark.skipif(not _NPU_AVAILABLE, reason="Ascend NPU is unavailable")
+def test_ascend_mla_prolog_accepts_attention_tp8_with_replicated_weights(monkeypatch):
+    monkeypatch.setattr(
+        "tokenspeed.runtime.models.flash_local_attention.mla_prolog_available",
+        lambda: True,
+    )
+    layer = _layer(attn_tp_size=8).to("npu")
+    layer.hidden_size = 3072
+    layer.num_heads = 32
+    layer.q_lora_rank = 1536
+    layer.kv_lora_rank = 512
+    layer.qk_nope_head_dim = 128
+    layer.qk_rope_head_dim = 64
+    layer.v_head_dim = 128
+    layer.attention_backend = "mla"
+    layer.w_kc = torch.empty(1, device="npu")
+    layer.q_a_proj._weight_nz_transposed = True
+    layer.kv_a_proj_with_mqa._weight_nz_transposed = True
+    layer.q_b_proj._weight_nz_transposed = True
+    hidden = torch.empty(1, 3072, dtype=torch.bfloat16, device="npu")
+    ctx = _ctx(ForwardMode.DECODE, torch.empty(1, 32, 512, device="npu"), [])
+    ctx.token_to_kv_pool.cache = torch.empty(
+        1, 16, 1, 576, dtype=torch.bfloat16, device="npu"
+    )
+    ctx.attn_backend.locations = torch.zeros(1, dtype=torch.int64, device="npu")
+
+    prolog_inputs = layer._mla_prolog_inputs(hidden, ctx, None, None, None)
+
+    assert prolog_inputs is not None
 
 
 @pytest.mark.skipif(not _NPU_AVAILABLE, reason="Ascend NPU is unavailable")

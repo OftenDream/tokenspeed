@@ -83,7 +83,7 @@ def test_lite_weight_nz_whitelist_is_exact():
             expected.update(
                 {
                     f"{prefix}.self_attn.q_a_proj": "transposed",
-                    f"{prefix}.self_attn.q_b_proj": "standard",
+                    f"{prefix}.self_attn.q_b_proj": "transposed",
                     f"{prefix}.self_attn.kv_a_proj_with_mqa": "transposed",
                     f"{prefix}.self_attn.o_proj": "standard",
                 }

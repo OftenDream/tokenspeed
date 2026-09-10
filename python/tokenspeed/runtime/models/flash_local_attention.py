@@ -26,7 +26,12 @@ import math
 from typing import Any, Literal
 
 import torch
-from tokenspeed_kernel.ops.attention.mla import mla_normalize_project_query
+from tokenspeed_kernel.ops.activation import sigmoid_mul
+from tokenspeed_kernel.ops.attention.mla import (
+    mla_normalize_project_query,
+    mla_prolog,
+    mla_prolog_available,
+)
 from tokenspeed_kernel.platform import current_platform, pdl_enabled
 from torch import nn
 from torch.nn import functional as F
@@ -401,7 +406,9 @@ class SeparateProjectionKimiLinearMLAAttention(KimiLinearMLAAttention):
         self.q_b_proj = WeightNZReplicatedLinear(
             config.q_lora_rank,
             config.num_attention_heads * qk_dim,
-            weight_nz="standard",
+            # The prolog consumes logical [in, out] NZ weights. Preparation
+            # happens once on load under the existing Decode Weight-NZ switch.
+            weight_nz="transposed",
             prefix=add_prefix("q_b_proj", prefix),
         )
         self.kv_b_proj = ReplicatedLinear(
@@ -464,6 +471,15 @@ class SeparateProjectionKimiLinearMLAAttention(KimiLinearMLAAttention):
                 dim=-1,
             )
         kv_a = latent_cache[..., : self.kv_lora_rank]
+        if self.q_b_proj._weight_nz_transposed:
+            # Primitive fallback for the same [in, out] weight orientation;
+            # this is not the fused prolog (which bypasses this method).
+            q_norm = torch.empty_like(q_a)
+            if q_a.size(0) > 0:
+                self.fused_qk_layernorm(
+                    input_q_a=q_a, input_kv_a=kv_a, output_q_a=q_norm
+                )
+            return self.q_b_proj(q_norm)[0], latent_cache, gate, None
         query, _ = mla_normalize_project_query(
             q_a,
             kv_a,
@@ -477,6 +493,87 @@ class SeparateProjectionKimiLinearMLAAttention(KimiLinearMLAAttention):
         )
         return query, latent_cache, gate, None
 
+    def _mla_prolog_inputs(
+        self,
+        hidden_states: torch.Tensor,
+        ctx: Any,
+        comm_manager: Any,
+        block_scale: torch.Tensor | None,
+        attnres_partial_args: tuple | None,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        if (
+            block_scale is not None
+            or attnres_partial_args is not None
+            or hidden_states.ndim != 2
+            or not ctx.forward_mode.is_decode()
+            or ctx.bs == 0
+            or ctx.num_extends != 0
+            or ctx.input_num_tokens != ctx.bs
+            or hidden_states.shape[0] != ctx.bs
+            or (ctx.attn_backend.spec_num_tokens or 1) != 1
+            or self.component_mapping.tp_size != 1
+            or self.attention_backend not in self._MLA_KERNEL_BACKENDS
+            or self.w_kc is None
+            or not self.q_a_proj._weight_nz_transposed
+            or not self.kv_a_proj_with_mqa._weight_nz_transposed
+            or not self.q_b_proj._weight_nz_transposed
+        ):
+            return None
+        # Fusing projection with cache writes cannot bypass a token all-gather.
+        # Keep the existing projection/communication path when rows are scattered.
+        if (
+            comm_manager is not None
+            and comm_manager.layer_id != 0
+            and comm_manager.attn_mapping.has_tp
+            and not comm_manager.use_all_reduce(comm_manager.prev_is_moe)
+        ):
+            return None
+        pool = ctx.token_to_kv_pool
+        if getattr(pool, "quant_method", None) == "per_token_head":
+            return None
+        cache = pool.get_key_buffer(self.attn_mqa.layer_id)
+        page_size = pool.arena.kv_page_size
+        cache_width = self.kv_lora_rank + self.qk_rope_head_dim
+        # Only construct a view of backend-owned storage here. Hardware shape,
+        # dtype and NZ-format eligibility belong to the kernel adapter.
+        if (
+            not isinstance(cache, torch.Tensor)
+            or not cache.is_contiguous()
+            or page_size <= 0
+            or cache.numel() % (page_size * cache_width) != 0
+            or not mla_prolog_available()
+        ):
+            return None
+        selected = ctx.attn_backend.write_locations(self.attn_mqa, ctx.forward_mode)
+        if selected.numel() != ctx.bs:
+            return None
+        return cache.view(-1, page_size, 1, cache_width), selected
+
+    def _project_q_with_mla_prolog(
+        self,
+        hidden_states: torch.Tensor,
+        cache: torch.Tensor,
+        cache_index: torch.Tensor,
+    ) -> torch.Tensor | None:
+        """Project the absorbed query and write KV cache, or decline before writes."""
+        result = mla_prolog(
+            hidden_states,
+            self.q_a_proj.weight,
+            self.q_b_proj.weight,
+            self.w_kc,
+            self.kv_a_proj_with_mqa.weight,
+            self.q_a_layernorm.weight,
+            self.kv_a_layernorm.weight,
+            cache,
+            cache_index,
+            rmsnorm_epsilon_cq=self.q_a_layernorm.variance_epsilon,
+            rmsnorm_epsilon_ckv=self.kv_a_layernorm.variance_epsilon,
+        )
+        if result is None:
+            return None
+        query_nope, query_rope = result
+        return torch.cat((query_nope, query_rope), dim=-1)
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -486,6 +583,30 @@ class SeparateProjectionKimiLinearMLAAttention(KimiLinearMLAAttention):
         block_scale: torch.Tensor | None = None,
         attnres_partial_args: tuple | None = None,
     ) -> torch.Tensor:
+        prolog_inputs = self._mla_prolog_inputs(
+            hidden_states, ctx, comm_manager, block_scale, attnres_partial_args
+        )
+        if prolog_inputs is not None:
+            query = self._project_q_with_mla_prolog(hidden_states, *prolog_inputs)
+            if query is not None:
+                # Prolog has written KV; attention and output projection remain
+                # explicit model stages, outside the projection helper.
+                _, cache_index = prolog_inputs
+                gate = self.g_proj(hidden_states)[0]
+                fuse_value_gate = ctx.attn_backend.supports_mla_projected_value_decode
+                attn_output = torch.empty_like(gate)
+                self.forward_absorb_attn_v_proj(
+                    query,
+                    None,
+                    ctx,
+                    cache_index,
+                    attn_output,
+                    record_kv_cache=None,
+                    output_gate=gate if fuse_value_gate else None,
+                )
+                if not fuse_value_gate:
+                    attn_output = sigmoid_mul(attn_output, gate)
+                return self.o_proj(attn_output)[0]
         return super().forward(
             positions,
             hidden_states,

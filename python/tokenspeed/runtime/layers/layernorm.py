@@ -430,7 +430,7 @@ class FusedRMSNorm(nn.Module):
                 output2=output_kv_a if output_kv_a is not None else input_kv_a,
                 eps=self.q_a_norm.variance_epsilon,
             )
-        else:
+        elif _platform.is_nvidia:
             rmsnorm_fused_parallel(
                 input1=input_q_a,
                 weight1=self.weight_q_a,
@@ -439,6 +439,16 @@ class FusedRMSNorm(nn.Module):
                 weight2=self.weight_kv_a,
                 output2=output_kv_a if output_kv_a is not None else input_kv_a,
                 eps=self.q_a_norm.variance_epsilon,
+            )
+        else:
+            # Portable primitive fallback, not a fused MLA prolog invocation.
+            self.q_a_norm(
+                input_q_a,
+                out=output_q_a if output_q_a is not None else input_q_a,
+            )
+            self.kv_a_norm(
+                input_kv_a,
+                out=output_kv_a if output_kv_a is not None else input_kv_a,
             )
         return input_q_a, input_kv_a
 
