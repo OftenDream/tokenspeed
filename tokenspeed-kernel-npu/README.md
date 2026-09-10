@@ -21,7 +21,28 @@ records every Python package mutation needed by this Ascend path, including the
 TokenSpeed applications should continue to import operators from
 `tokenspeed-kernel`; it owns registration and dispatch to this package.
 
-MLA Decode retains FIA with native NPUGraph. Its split Q/cache inputs are
+MLA Decode can use the optional `custom.npu_mla_fia_packed.out` operator to
+read the persistent packed cache directly, without a full-cache layout copy.
+The fast path requires BF16, a single query token, latent/auxiliary widths
+512/64, 1–64 query heads, batch 1–1024, contiguous packed pages of 64 or 128
+tokens, an int32 contiguous page table, and a context bound at most 1M.
+The installed operator must expose Host `int[]` lengths and the active
+`torch_npu` must provide the NPUGraph handler registration interface. Missing
+optional capabilities or unsupported geometry retain native FIA; broken
+installed-package imports and execution errors are not silently swallowed.
+Use a matching extension and custom OPP bundle: registering a Python schema
+alone does not install its ACLNN implementation. Keep the Lite-capable MLA
+prolog and causal-conv implementations available when adding the packed reader.
+
+The packed handler participates in the existing `graph.update()` flow:
+Q layout conversion and output allocation happen outside task-update, and
+each replay updates Host lengths while reusing the captured output addresses.
+Cache writes, page-table refresh, Prefill, and MLA prolog are unchanged.
+Set `TOKENSPEED_NPU_PACKED_FIA=0` before starting the process to force native
+FIA for A/B; the default is enabled when all capabilities match. Do not change
+the selection after graphs have been captured.
+
+The native fallback retains FIA with native NPUGraph. Its split Q/cache inputs are
 made contiguous before FIA dispatch, so layout copies execute on graph replay
 rather than inside FIA task-update. K and V share the same dense latent copy;
 the persistent cache remains packed. This copies the full allocated cache,
@@ -31,6 +52,7 @@ The changed-input, cache, page-table and sequence-length replay check is:
 
 ```bash
 pytest -q test/runtime/test_lite_mla_eager.py -k decode_graph_updates_live_lengths
+pytest -q tokenspeed-kernel-npu/test/test_mla_packed.py
 ```
 
 Lite KDA can additionally build the pinned public AscendC operator subset:
