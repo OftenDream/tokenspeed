@@ -26,6 +26,7 @@ import math
 
 import torch
 import torch_npu
+from tokenspeed_kernel_npu.ops.mla_packed import packed_mla_decode_op
 
 _CAUSAL_MASKS: dict[torch.device, torch.Tensor] = {}
 
@@ -209,14 +210,18 @@ def mla_decode_with_kvcache(
     out: torch.Tensor | None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Run graph-capturable absorbed MLA Decode."""
-    del max_seqlen_k, qk_nope_head_dim
+    del qk_nope_head_dim
     if logit_cap:
         raise NotImplementedError("Ascend MLA does not support logit caps")
     batch, q_len, heads, _ = q.shape
     if q_len != 1:
         raise NotImplementedError("Ascend MLA Decode supports one query per request")
     q_nope, q_aux = q.split((kv_lora_rank, qk_rope_head_dim), dim=-1)
-    k_nope, k_aux = kv_cache.split((kv_lora_rank, qk_rope_head_dim), dim=-1)
+    packed_op = (
+        packed_mla_decode_op(q, kv_cache, page_table, max_seqlen_k)
+        if (kv_lora_rank, qk_rope_head_dim) == (512, 64)
+        else None
+    )
     live_lengths = (
         [1] * batch if torch.npu.is_current_stream_capturing() else cache_seqlens
     )
@@ -224,6 +229,39 @@ def mla_decode_with_kvcache(
     # Replay must refresh them after the packed cache is written.
     q_nope = q_nope.reshape(batch, 1, heads * kv_lora_rank).contiguous()
     q_aux = q_aux.reshape(batch, 1, heads * qk_rope_head_dim).contiguous()
+    if packed_op is not None:
+        # Allocate outputs outside the task-update group. The registered .out
+        # handler reuses these addresses and updates only the Host lengths.
+        packed_out = torch.empty_like(q_nope)
+        packed_lse = torch.empty(
+            (batch, heads, 1) if return_lse else (0,),
+            dtype=torch.float32,
+            device=q.device,
+        )
+        lengths = (
+            live_lengths.to("cpu").tolist()
+            if isinstance(live_lengths, torch.Tensor)
+            else live_lengths
+        )
+        output, lse = packed_op(
+            q_nope,
+            q_aux,
+            kv_cache.view(kv_cache.shape[0], kv_cache.shape[1], 576),
+            page_table,
+            lengths,
+            num_heads=heads,
+            scale=softmax_scale,
+            return_lse=return_lse,
+            out=packed_out,
+            lse=packed_lse,
+        )
+        return _result(
+            output.reshape(batch, q_len, heads, kv_lora_rank),
+            _lse(lse, batch, heads) if return_lse else lse,
+            return_lse=return_lse,
+            out=out,
+        )
+    k_nope, k_aux = kv_cache.split((kv_lora_rank, qk_rope_head_dim), dim=-1)
     k_nope = k_nope.flatten(2).contiguous()
     k_aux = k_aux.flatten(2).contiguous()
     output, lse = torch_npu.npu_fused_infer_attention_score(
