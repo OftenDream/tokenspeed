@@ -28,7 +28,10 @@ from tokenspeed.runtime.utils.server_args import ServerArgs
 
 _CAPABILITIES = {
     "cuda": {"device": "runtime-full-history"},
-    "npu": {"host": "cache-checkpointed-tail"},
+    "npu": {
+        "device": "runtime-full-history",
+        "host": "runtime-full-history",
+    },
 }
 
 
@@ -37,8 +40,9 @@ _CAPABILITIES = {
     [
         ("cuda", "auto", ("device", "runtime-full-history")),
         ("cuda", "device", ("device", "runtime-full-history")),
-        ("npu", "auto", ("host", "cache-checkpointed-tail")),
-        ("npu", "host", ("host", "cache-checkpointed-tail")),
+        ("npu", "auto", ("host", "runtime-full-history")),
+        ("npu", "host", ("host", "runtime-full-history")),
+        ("npu", "device", ("device", "runtime-full-history")),
     ],
 )
 def test_oe_runtime_plan_resolves_declared_pairs(
@@ -57,7 +61,7 @@ def test_oe_runtime_plan_resolves_declared_pairs(
     )
 
 
-@pytest.mark.parametrize(("device", "requested"), [("cuda", "host"), ("npu", "device")])
+@pytest.mark.parametrize(("device", "requested"), [("cuda", "host")])
 def test_oe_runtime_plan_never_falls_back_explicit_placement(
     device: str,
     requested: str,
@@ -131,5 +135,5 @@ def test_model_loader_resolves_and_passes_class_declared_plan(monkeypatch) -> No
     model = loader._initialize_model(model_config, SimpleNamespace())
 
     assert model_config.oe_table_placement == "host"
-    assert model_config.oe_state_provider == "cache-checkpointed-tail"
+    assert model_config.oe_state_provider == "runtime-full-history"
     assert model.kwargs["oe_table_placement"] == "host"

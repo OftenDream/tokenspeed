@@ -130,7 +130,8 @@ def resolve_oe_runtime_plan(
     model/backend pairs declared in ``capabilities`` are safe to construct. A
     single early resolution keeps the model leaf, cache recipe, request-history
     allocation, and graph admission on the same validated pair. ``auto`` prefers
-    Device storage; explicit unsupported choices fail instead of falling back.
+    Host storage on NPU (where OE tables are commonly larger than HBM) and Device
+    storage elsewhere; explicit unsupported choices fail instead of falling back.
     """
     if requested_placement not in {"auto", "host", "device"}:
         raise ValueError(
@@ -144,12 +145,9 @@ def resolve_oe_runtime_plan(
 
     device_capabilities = capabilities.get(device, {})
     if requested_placement == "auto":
+        preference = ("host", "device") if device == "npu" else ("device", "host")
         placement = next(
-            (
-                candidate
-                for candidate in ("device", "host")
-                if candidate in device_capabilities
-            ),
+            (candidate for candidate in preference if candidate in device_capabilities),
             None,
         )
     else:

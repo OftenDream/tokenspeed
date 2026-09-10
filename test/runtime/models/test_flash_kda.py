@@ -325,23 +325,40 @@ def test_flash_kda_identity_zero_expert_is_partitioned_across_moe_ranks() -> Non
     assert topk_output.topk_weights.tolist() == [[0.0, 0.25], [0.75, 0.0]]
 
 
-def test_flash_local_decoder_selects_packed_moe_by_capability(monkeypatch) -> None:
+def test_flash_local_decoder_selects_group_aware_moe_by_strategy() -> None:
     from test.runtime.test_lite_model_loader import lite_config_dict
 
     from tokenspeed.runtime.configs.flash_kda_config import FLASHLocalConfig
     from tokenspeed.runtime.distributed.mapping import Mapping
     from tokenspeed.runtime.models import flash_kda
-    from tokenspeed.runtime.models.flash_local_moe import PackedFLASHLocalMoE
+    from tokenspeed.runtime.models.flash_local_moe import GroupAwareFlashLocalMoE
 
-    monkeypatch.setattr(flash_kda, "flash_local_prefers_packed_moe", lambda: True)
     config = FLASHLocalConfig.from_dict(lite_config_dict())
     mapping = Mapping(rank=0, world_size=1)
 
     with torch.device("meta"):
         layer = flash_kda.FLASHLocalDecoderLayer(config, 0, mapping)
 
-    assert isinstance(layer.moe, PackedFLASHLocalMoE)
+    assert isinstance(layer.moe, GroupAwareFlashLocalMoE)
     assert layer.moe.local_expert_ids == tuple(range(32))
+
+
+def test_flash_local_decoder_selects_global_expert_ids_by_strategy() -> None:
+    from test.runtime.test_lite_model_loader import lite_config_dict
+
+    from tokenspeed.runtime.configs.flash_kda_config import FLASHLocalConfig
+    from tokenspeed.runtime.distributed.mapping import Mapping
+    from tokenspeed.runtime.models import flash_kda
+
+    config = FLASHLocalConfig.from_dict(
+        lite_config_dict(gmoe_strategy="global_expert_id")
+    )
+    mapping = Mapping(rank=0, world_size=1)
+
+    with torch.device("meta"):
+        layer = flash_kda.FLASHLocalDecoderLayer(config, 0, mapping)
+
+    assert isinstance(layer.moe, flash_kda.FLASHLocalMoE)
 
 
 def test_flash_kda_maps_fgbkda_projection_weights_to_checkpoint_structure() -> None:
@@ -430,14 +447,20 @@ def test_flash_lite_cache_allows_its_wider_recurrent_state() -> None:
 
 
 @pytest.mark.parametrize("exclude_special_tokens", [False, True])
+@pytest.mark.parametrize("table_placement", ["device", "host"])
 def test_flash_lite_oe_keeps_its_special_token_policy(
     exclude_special_tokens: bool,
+    table_placement: str,
 ) -> None:
     from tokenspeed.runtime.models.flash_kda import FLASHLocalModel
 
     model = object.__new__(FLASHLocalModel)
     model.mapping = SimpleNamespace(
-        attn=SimpleNamespace(tp_rank=0, tp_size=4, tp_group=(0, 1, 2, 3))
+        linear_attn=SimpleNamespace(
+            tp_rank=0,
+            tp_size=4,
+            tp_group=(0, 1, 2, 3),
+        )
     )
     config = SimpleNamespace(
         use_over_embedding=True,
@@ -456,12 +479,13 @@ def test_flash_lite_oe_keeps_its_special_token_policy(
         "tokenspeed.runtime.models.flash_kda.LongCatOverEmbedding"
     ) as over_embedding:
         model._build_embed_tokens(
-            config, quant_config=None, oe_table_placement="device"
+            config, quant_config=None, oe_table_placement=table_placement
         )
 
     kwargs = over_embedding.call_args.kwargs
     assert kwargs["ignored_token_ids"] == ((2, 3) if exclude_special_tokens else ())
     assert kwargs["segment_ignored_tokens"] is exclude_special_tokens
+    assert kwargs["table_placement"] == table_placement
 
 
 class _CaptureFinalNorm:

@@ -14,7 +14,7 @@ The single model entry does not make the backends physically identical:
 - CUDA keeps separate KDA projections, its existing MLA/MoE kernels, and
   Device OE with runtime full history;
 - Ascend keeps packed KDA, packed EP-local Grouped MoE, Weight-NZ leaves,
-  Host OE with checkpointed-tail state, and its P/D collective schedule;
+  Host OE with NPU full-history hashing, and its P/D collective schedule;
 - mapping, kernel and cache capability selection remains construction-time or
   backend-registry policy. Decoder/model forward contains no device branch.
 
@@ -50,12 +50,13 @@ For strict streams the loader rejects unexpected, duplicate, wrong-shape,
 wrong-dtype and missing source tensors. It does not prescribe Device versus
 Host OE storage or separate versus packed KDA targets.
 
-## Cache protocol
+## OE state protocol
 
-The checkpointed-tail recipe is renamed to `CheckpointedTailOERecipe`. Its
-wire IDs remain exactly `lite_oe` and `layer.0.lite.oe.context`; PD manifests
-and existing cache data therefore remain compatible. Recipe selection continues
-to depend only on the resolved state provider.
+Ascend OE now defaults to the same runtime full-token history as the GPU path.
+The former `CheckpointedTailOERecipe`, `lite_oe` cache group and
+`layer.0.lite.oe.context` field have been removed from production; verification
+alone publishes the committed pointer on the full-history path. The retired CPU
+implementation survives only as an independent precision oracle under tests.
 
 ## Deletion boundary
 

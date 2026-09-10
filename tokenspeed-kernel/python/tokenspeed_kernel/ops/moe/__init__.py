@@ -24,10 +24,12 @@ from typing import Any
 import tokenspeed_kernel.ops.moe.ascend  # noqa: F401
 
 # Backend registration (side-effect imports)
+import tokenspeed_kernel.ops.moe.composed  # noqa: F401
 import tokenspeed_kernel.ops.moe.cuda  # noqa: F401
 import tokenspeed_kernel.ops.moe.deep_gemm  # noqa: F401
 import tokenspeed_kernel.ops.moe.flashinfer  # noqa: F401
 import tokenspeed_kernel.ops.moe.gluon  # noqa: F401
+import tokenspeed_kernel.ops.moe.gmoe_ascend  # noqa: F401
 import tokenspeed_kernel.ops.moe.marlin  # noqa: F401
 import tokenspeed_kernel.ops.moe.triton  # noqa: F401
 import torch
@@ -486,7 +488,7 @@ def _uses_all_to_all_ep(a2a_backend: str | None) -> bool:
 
 
 def _validate_a2a_backend(a2a_backend: str | None) -> None:
-    if a2a_backend in {None, "none", "deepep"}:
+    if a2a_backend in {None, "none", "deepep", "ascend"}:
         return
     raise NotImplementedError(f"MoE all-to-all backend is unsupported: {a2a_backend}")
 
@@ -610,6 +612,11 @@ def moe_plan(
     deepep_group: object | None = None,
     deepep_mode: str | None = None,
     deepep_low_latency_max_num_tokens_per_gpu: int | None = None,
+    ep_group: object | None = None,
+    num_zero_experts: int = 0,
+    num_copy_experts: int = 0,
+    num_expert_groups: int = 1,
+    num_experts_per_group: int | None = None,
     solution: str | None = None,
 ) -> dict:
     """Create a MoE execution plan.
@@ -625,7 +632,8 @@ def moe_plan(
             weights (for models whose routing function the fused kernels
             cannot reproduce); "kernel_routing" requires in-kernel routing
             from logits. None (default) leaves routing mode unconstrained.
-        a2a_backend: Optional all-to-all backend. deepep selects the DeepEP
+        a2a_backend: Optional all-to-all backend. ``deepep`` selects the DeepEP
+            solution and ``ascend`` selects the Ascend MC2 dispatch/combine
             solution when solution is not set.
         ep_size: Optional expert-parallel size. Values > 1 require EP support.
             The exact value is also passed as a selection trait when a kernel
@@ -645,6 +653,19 @@ def moe_plan(
         deepep_low_latency_max_num_tokens_per_gpu: Per-GPU token capacity the
             DeepEP low-latency buffer is sized for. Required whenever the mode
             can run the low-latency legs; batches above it must use normal mode.
+        ep_group: Optional process group owned by a non-DeepEP all-to-all
+            solution. Ascend uses it to resolve the HCCL communicator name.
+        num_zero_experts: Number of zero-output experts following the real
+            expert ID range. Ascend MC2 uses them to suppress routed expert
+            work while the model applies any non-zero semantic separately.
+        num_copy_experts: Number of identity/copy experts following the real
+            expert ID range. Only interpreted by solutions that advertise
+            support for copy experts.
+        num_expert_groups: Number of independent logical router groups packed
+            into the expert pool. Distributed backends may use this boundary
+            to chunk a logically flat call without changing its global IDs.
+        num_experts_per_group: Number of real experts in each logical group.
+            Defaults to the kernel weight container's full expert count.
         solution: Optional kernel solution to force through normal selection.
             None leaves the concrete kernel choice to the registry.
 
@@ -710,6 +731,13 @@ def moe_plan(
         "deepep_mode": deepep_mode or "auto",
         "deepep_low_latency_max_num_tokens_per_gpu": (
             deepep_low_latency_max_num_tokens_per_gpu
+        ),
+        "ep_group": ep_group,
+        "num_zero_experts": int(num_zero_experts),
+        "num_copy_experts": int(num_copy_experts),
+        "num_expert_groups": int(num_expert_groups),
+        "num_experts_per_group": (
+            None if num_experts_per_group is None else int(num_experts_per_group)
         ),
         "support_routing": support_routing,
         "supports_precomputed_topk": supports_precomputed_topk,

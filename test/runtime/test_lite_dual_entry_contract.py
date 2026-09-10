@@ -25,7 +25,6 @@ from test.runtime.test_lite_model_loader import lite_config_dict
 import pytest
 
 from tokenspeed.runtime.configs.flash_kda_config import FLASHLocalConfig
-from tokenspeed.runtime.layers.over_embedding import HostLongCatOverEmbedding
 from tokenspeed.runtime.models.flash_kda import _canonical_flash_kda_weight_name
 from tokenspeed.runtime.models.flash_local_checkpoint import FLASHLocalCheckpointLayout
 
@@ -42,14 +41,6 @@ def test_single_config_preserves_flash_lite_semantics() -> None:
     assert config.full_attention_layer_ids == [3]
     assert config.oe_ignore_tokens == list(config.special_token_ids)
     assert config.over_embedding_m == config.oe_table_base_rows
-
-
-def test_shared_host_oe_accepts_the_canonical_flash_config() -> None:
-    host = HostLongCatOverEmbedding(FLASHLocalConfig.from_dict(lite_config_dict()))
-
-    assert len(host.embedders) == 12
-    assert host.projection.shape == (12, 8, 96)
-    assert host.normalize_scale == pytest.approx(13**0.5)
 
 
 @pytest.mark.parametrize(

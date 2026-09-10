@@ -27,10 +27,37 @@ from tokenspeed_kernel.signature import format_signatures
 
 if current_platform().is_npu:
     from tokenspeed_kernel_npu.ops.moe import (
+        ascend_bf16_distributed_precomputed_moe_apply as _distributed_moe_apply,
+    )
+    from tokenspeed_kernel_npu.ops.moe import (
         ascend_bf16_precomputed_moe_apply as _moe_apply,
     )
     from tokenspeed_kernel_npu.ops.moe import (
         ascend_bf16_process_moe_weights as _process_weights,
+    )
+    from tokenspeed_kernel_npu.ops.moe import (
+        ascend_int8_precomputed_moe_apply as _int8_moe_apply,
+    )
+    from tokenspeed_kernel_npu.ops.moe import (
+        ascend_int8_process_moe_weights as _int8_process_weights,
+    )
+    from tokenspeed_kernel_npu.ops.moe import (
+        ascend_routed_bf16_precomputed_moe_apply as _routed_bf16_moe_apply,
+    )
+    from tokenspeed_kernel_npu.ops.moe import (
+        ascend_routed_bf16_process_moe_weights as _routed_bf16_process_weights,
+    )
+    from tokenspeed_kernel_npu.ops.moe import (
+        ascend_routed_full_bf16_process_moe_weights as _routed_full_bf16_process_weights,
+    )
+    from tokenspeed_kernel_npu.ops.moe import (
+        ascend_routed_full_int8_process_moe_weights as _routed_full_int8_process_weights,
+    )
+    from tokenspeed_kernel_npu.ops.moe import (
+        ascend_routed_int8_precomputed_moe_apply as _routed_int8_moe_apply,
+    )
+    from tokenspeed_kernel_npu.ops.moe import (
+        ascend_routed_int8_process_moe_weights as _routed_int8_process_weights,
     )
     from tokenspeed_kernel_npu.ops.moe import (
         ascend_softmax_bias_topk as _softmax_bias_topk,
@@ -77,6 +104,133 @@ if current_platform().is_npu:
     )
     def moe_apply(**kwargs):
         return _moe_apply(**kwargs)
+
+    @register_kernel(
+        "moe",
+        "apply",
+        name="ascend_int8_precomputed_moe_apply",
+        solution="torch_npu",
+        capability=_CAPABILITY,
+        signatures=format_signatures("x", "dense", {torch.bfloat16}),
+        traits={
+            "weight_dtype": frozenset({"int8"}),
+            "activation": frozenset({"silu", "swiglu"}),
+            "routing_mode": frozenset({"precomputed_topk"}),
+            "supports_deferred_finalize": frozenset({False}),
+            "supports_ep": frozenset({True}),
+            "supports_all_to_all_ep": frozenset({False}),
+            "ispp_alignment": frozenset({32}),
+            "internal_activation_dtype": frozenset({"int8"}),
+            "supports_bias": frozenset({False}),
+        },
+        priority=Priority.SPECIALIZED,
+        tags={"ascend", "npu_graph", "w8a8", "nz"},
+        weight_preprocessor=_int8_process_weights,
+    )
+    def int8_moe_apply(**kwargs):
+        return _int8_moe_apply(**kwargs)
+
+    for name, solution, preprocessor in (
+        (
+            "ascend_routed_int8_precomputed_moe_apply",
+            "flash_npu_routed",
+            _routed_int8_process_weights,
+        ),
+        (
+            "ascend_routed_full_int8_precomputed_moe_apply",
+            "flash_npu_routed_full",
+            _routed_full_int8_process_weights,
+        ),
+    ):
+
+        @register_kernel(
+            "moe",
+            "apply",
+            name=name,
+            solution=solution,
+            capability=_CAPABILITY,
+            signatures=format_signatures("x", "dense", {torch.bfloat16}),
+            traits={
+                "weight_dtype": frozenset({"int8"}),
+                "activation": frozenset({"silu", "swiglu"}),
+                "routing_mode": frozenset({"precomputed_topk"}),
+                "supports_deferred_finalize": frozenset({False}),
+                "supports_ep": frozenset({True}),
+                "supports_all_to_all_ep": frozenset({False}),
+                "ispp_alignment": frozenset({32}),
+                "internal_activation_dtype": frozenset({"int8"}),
+                "supports_bias": frozenset({False}),
+            },
+            # Keep the composed production path as the automatic selection.
+            priority=0,
+            tags={"ascend", "npu_graph", "w8a8", "nz", "experimental"},
+            weight_preprocessor=preprocessor,
+        )
+        def routed_int8_moe_apply(**kwargs):
+            return _routed_int8_moe_apply(**kwargs)
+
+    for name, solution, preprocessor in (
+        (
+            "ascend_routed_bf16_precomputed_moe_apply",
+            "flash_npu_routed",
+            _routed_bf16_process_weights,
+        ),
+        (
+            "ascend_routed_full_bf16_precomputed_moe_apply",
+            "flash_npu_routed_full",
+            _routed_full_bf16_process_weights,
+        ),
+    ):
+
+        @register_kernel(
+            "moe",
+            "apply",
+            name=name,
+            solution=solution,
+            capability=_CAPABILITY,
+            signatures=format_signatures("x", "dense", {torch.bfloat16}),
+            traits={
+                "weight_dtype": frozenset({"unquant"}),
+                "activation": frozenset({"silu", "swiglu"}),
+                "routing_mode": frozenset({"precomputed_topk"}),
+                "supports_deferred_finalize": frozenset({False}),
+                "supports_ep": frozenset({True}),
+                "supports_all_to_all_ep": frozenset({False}),
+                "ispp_alignment": frozenset({32}),
+                "internal_activation_dtype": frozenset({"input"}),
+                "supports_bias": frozenset({False}),
+            },
+            priority=0,
+            tags={"ascend", "npu_graph", "bf16", "experimental"},
+            weight_preprocessor=preprocessor,
+        )
+        def routed_bf16_moe_apply(**kwargs):
+            return _routed_bf16_moe_apply(**kwargs)
+
+    @register_kernel(
+        "moe",
+        "apply",
+        name="ascend_bf16_distributed_precomputed_moe_apply",
+        solution="torch_npu",
+        capability=_CAPABILITY,
+        signatures=format_signatures("x", "dense", {torch.bfloat16}),
+        traits={
+            "weight_dtype": frozenset({"unquant"}),
+            "activation": frozenset({"silu", "swiglu"}),
+            "routing_mode": frozenset({"precomputed_topk"}),
+            "supports_deferred_finalize": frozenset({False}),
+            "supports_ep": frozenset({True}),
+            "supports_all_to_all_ep": frozenset({True}),
+            "ispp_alignment": frozenset({32}),
+            "internal_activation_dtype": frozenset({"input"}),
+            "supports_bias": frozenset({False}),
+        },
+        priority=Priority.SPECIALIZED,
+        tags={"ascend", "npu_graph", "all_to_all"},
+        weight_preprocessor=_process_weights,
+    )
+    def distributed_moe_apply(**kwargs):
+        return _distributed_moe_apply(**kwargs)
 
 
 __all__ = ["moe_apply", "softmax_bias_topk"]

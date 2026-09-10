@@ -1,5 +1,8 @@
 # Lite NPU 阶段 7B：OE 请求状态与 Decode Graph Staging
 
+> 历史设计：checkpointed-tail 生产路径已删除，仅保留测试用 CPU 精度 oracle；
+> 当前实现与约束见 `lite-npu-oe-device-hash-host-table.md`。
+
 ## 1. 目标与边界
 
 本阶段把阶段 7A 已完成的 OE host lookup 接入统一 cache/PD 契约，并冻结 Decode graph 的固定地址

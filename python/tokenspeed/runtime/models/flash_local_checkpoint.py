@@ -32,7 +32,10 @@ import torch
 from tokenspeed.runtime.configs.flash_kda_config import FLASHLocalConfig
 
 _LAYER_RE = re.compile(r"^model\.layers\.(\d+)\.(.+)$")
-_EXPERT_RE = re.compile(r"^mlp\.experts\.(\d+)\.(gate|up|down)_proj\.weight$")
+_EXPERT_RE = re.compile(
+    r"^mlp\.experts\.(\d+)\.(gate|up|down)_proj\."
+    r"(weight|weight_scale|smooth_scale)$"
+)
 _ROUTER_RE = re.compile(
     r"^mlp\.expert_groups\.(\d+)\.router\."
     r"(classifier\.weight|e_score_correction_bias)$"
@@ -57,8 +60,16 @@ class FLASHLocalWeightSpec:
 class FLASHLocalCheckpointLayout:
     """Single source of truth for Lite source keys, shapes and placement."""
 
-    def __init__(self, config: FLASHLocalConfig) -> None:
+    def __init__(
+        self,
+        config: FLASHLocalConfig,
+        *,
+        moe_quant_kind: str = "unquant",
+        moe_smooth_quant: bool = False,
+    ) -> None:
         self.config = config
+        self.moe_quant_kind = moe_quant_kind
+        self.moe_smooth_quant = moe_smooth_quant
 
     def iter_source_names(self) -> Iterator[str]:
         yield "model.embed_tokens.weight"
@@ -79,6 +90,11 @@ class FLASHLocalCheckpointLayout:
                 yield f"{expert}.gate_proj.weight"
                 yield f"{expert}.up_proj.weight"
                 yield f"{expert}.down_proj.weight"
+                if self.moe_quant_kind == "int8":
+                    for projection in ("gate_proj", "up_proj", "down_proj"):
+                        yield f"{expert}.{projection}.weight_scale"
+                        if self.moe_smooth_quant:
+                            yield f"{expert}.{projection}.smooth_scale"
             yield f"{prefix}.mlp.norm.weight"
             yield f"{prefix}.mlp.proj_input.weight"
             yield f"{prefix}.mlp.proj_output.weight"
@@ -188,21 +204,43 @@ class FLASHLocalCheckpointLayout:
         if expert_match:
             expert_id = int(expert_match.group(1))
             projection = expert_match.group(2)
+            tensor_kind = expert_match.group(3)
             if expert_id >= config.n_routed_experts * config.moe_group_size:
                 raise ValueError(f"Unexpected Lite checkpoint weight {name!r}.")
             group_hidden = config.hidden_size // config.moe_group_size
-            shape = (
-                (group_hidden, config.expert_ffn_hidden_size)
-                if projection == "down"
-                else (config.expert_ffn_hidden_size, group_hidden)
-            )
-            packed_name = "w2_weight" if projection == "down" else "w13_weight"
+            if tensor_kind == "weight":
+                shape = (
+                    (group_hidden, config.expert_ffn_hidden_size)
+                    if projection == "down"
+                    else (config.expert_ffn_hidden_size, group_hidden)
+                )
+                dtype = torch.int8 if self.moe_quant_kind == "int8" else torch.bfloat16
+            elif self.moe_quant_kind != "int8":
+                raise ValueError(f"Unexpected Lite checkpoint weight {name!r}.")
+            elif tensor_kind == "weight_scale":
+                shape = (
+                    (group_hidden, 1)
+                    if projection == "down"
+                    else (config.expert_ffn_hidden_size, 1)
+                )
+                dtype = torch.bfloat16
+            else:
+                if not self.moe_smooth_quant:
+                    raise ValueError(f"Unexpected Lite checkpoint weight {name!r}.")
+                shape = (
+                    (config.expert_ffn_hidden_size,)
+                    if projection == "down"
+                    else (group_hidden,)
+                )
+                dtype = torch.bfloat16
+            packed_prefix = "w2_" if projection == "down" else "w13_"
+            packed_name = packed_prefix + tensor_kind
             target = name.rsplit(".experts.", 1)[0] + f".experts.{packed_name}"
             return FLASHLocalWeightSpec(
                 name,
                 target,
                 shape,
-                torch.bfloat16,
+                dtype,
                 "expert-ep",
                 expert_id=expert_id,
             )

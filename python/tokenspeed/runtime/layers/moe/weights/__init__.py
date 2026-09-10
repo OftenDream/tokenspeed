@@ -65,6 +65,22 @@ def create_layer_weights(
         )
         return
 
+    if quant_kind == "int8":
+        from tokenspeed.runtime.layers.moe.weights.int8 import (
+            create_int8_weight_pair,
+        )
+
+        create_int8_weight_pair(
+            spec,
+            layer,
+            smooth_quant=bool(
+                (getattr(quant_config, "config", None) or {}).get(
+                    "enable_smooth_quant", False
+                )
+            ),
+        )
+        return
+
     if quant_kind == "nvfp4":
         from tokenspeed.runtime.layers.moe.weights.nvfp4 import (
             create_nvfp4_weight_pair,

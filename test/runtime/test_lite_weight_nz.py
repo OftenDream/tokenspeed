@@ -21,13 +21,9 @@
 from test.runtime.test_lite_model_loader import lite_config_dict, mapping
 from unittest import mock
 
-import torch
-import torch.nn.functional as F
-
 from tokenspeed.runtime.configs.flash_kda_config import FLASHLocalConfig
 from tokenspeed.runtime.models.flash_kda import FLASHLocalForCausalLM
 from tokenspeed.runtime.models.flash_local_attention import WeightNZReplicatedLinear
-from tokenspeed.runtime.models.flash_local_moe import PackedWeight as _Weight
 
 
 def test_weight_nz_server_arg_defaults_off_and_propagates_decode_role():
@@ -69,14 +65,11 @@ def test_lite_weight_nz_whitelist_is_exact():
     marked = {
         name: module.weight_nz
         for name, module in model.named_modules()
-        if isinstance(module, (_Weight, WeightNZReplicatedLinear))
-        and module.weight_nz is not None
+        if isinstance(module, WeightNZReplicatedLinear) and module.weight_nz is not None
     }
     expected = {}
     for layer_id in range(4):
         prefix = f"model.layers.{layer_id}"
-        expected[f"{prefix}.moe.proj_output"] = "standard"
-        expected[f"{prefix}.moe.shared_experts.down_proj"] = "standard"
         if layer_id < 3:
             expected[f"{prefix}.self_attn.o_proj"] = "standard"
         else:
@@ -97,18 +90,3 @@ def test_lite_weight_nz_whitelist_is_exact():
         + 2 * target.num_hidden_layers
         == 105
     )
-
-
-def test_weight_nz_cpu_path_preserves_canonical_linear():
-    module = _Weight((3, 4), torch.bfloat16, weight_nz="transposed")
-    module.weight.data.copy_(
-        torch.arange(12, dtype=torch.bfloat16).reshape_as(module.weight)
-    )
-    source = module.weight.detach().clone()
-    hidden = torch.randn(2, 4, dtype=torch.bfloat16)
-    module.process_weights_after_loading()
-
-    assert not module._weight_nz_prepared
-    assert not module._weight_nz_transposed
-    assert torch.equal(module.weight, source)
-    torch.testing.assert_close(module(hidden), F.linear(hidden, source), rtol=0, atol=0)

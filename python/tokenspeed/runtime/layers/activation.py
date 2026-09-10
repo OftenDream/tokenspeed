@@ -28,6 +28,10 @@ from dataclasses import dataclass
 
 import torch
 from tokenspeed_kernel import prepare_fp8_linear_activation, silu_and_mul
+from tokenspeed_kernel.ops.activation import (
+    dequant_silu_and_mul_quant,
+    silu_and_mul_quant,
+)
 from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.utils import (
@@ -41,6 +45,12 @@ logger = get_colorful_logger(__name__)
 
 
 class SiluAndMul(torch.nn.Module):
+    """SwiGLU, optionally returning INT8 values and FP32 dequantization scales.
+
+    INT32 input with ``int8_out=True`` additionally requires per-column weight
+    and per-row activation scales from the preceding quantized matmul.
+    """
+
     def __init__(self, swiglu_limit: float | None = None) -> None:
         super().__init__()
         self.swiglu_limit = (
@@ -49,60 +59,63 @@ class SiluAndMul(torch.nn.Module):
             else None
         )
 
-    def forward(self, x: torch.Tensor, fp8_out: bool = False) -> torch.Tensor:
-        if x.shape[-1] % 2 != 0:
+    def forward(
+        self,
+        x: torch.Tensor,
+        fp8_out: bool = False,
+        *,
+        int8_out: bool = False,
+        weight_scale: torch.Tensor | None = None,
+        activation_scale: torch.Tensor | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if x.ndim == 0 or x.shape[-1] % 2 != 0:
             raise ValueError(
-                f"SwiGLU expects an even [gate, up] width, got {x.shape[-1]}"
+                f"SwiGLU expects an even [gate, up] width, got shape {tuple(x.shape)}"
             )
-        if not x.is_cuda:
+        if int8_out:
             if fp8_out:
-                raise NotImplementedError("CPU fp8_out silu_and_mul is not implemented")
-            return self.forward_native(x)
-
-        if not _is_amd:
-
-            def get_tma_aligned_scale(x):
-                aligned_size = (x.shape[-2] + 3) // 4 * 4
-                x_s = torch.empty(
-                    x.shape[:-2] + (x.shape[-1] // 128, aligned_size),
-                    device=x.device,
-                    dtype=torch.float32,
-                ).permute(-1, -2)[: x.shape[-2], :]
-                return x_s
-
-            d = x.shape[-1] // 2
-            output_shape = x.shape[:-1] + (d,)
-            if fp8_out:
-                if self.swiglu_limit is not None:
-                    raise NotImplementedError(
-                        "clamped fp8_out silu_and_mul is not implemented"
+                raise ValueError("fp8_out and int8_out are mutually exclusive")
+            if self.swiglu_limit is not None:
+                raise NotImplementedError(
+                    "Clamped INT8-output SwiGLU is not implemented"
+                )
+            if x.dtype == torch.int32:
+                if weight_scale is None or activation_scale is None:
+                    raise ValueError(
+                        "INT32 SwiGLU requires weight and activation scales"
                     )
-                out = torch.empty(
-                    output_shape, dtype=torch.float8_e4m3fn, device=x.device
-                )
-                scale = get_tma_aligned_scale(out)
-                from tokenspeed_kernel.ops.activation.cuda import (
-                    silu_and_mul_fuse_block_quant,
-                )
+                return dequant_silu_and_mul_quant(x, weight_scale, activation_scale)
+            if weight_scale is not None or activation_scale is not None:
+                raise ValueError("Dequantization scales require INT32 input")
+            return silu_and_mul_quant(x)
+        if not fp8_out:
+            return silu_and_mul(x, limit=self.swiglu_limit)
 
-                out, scale = silu_and_mul_fuse_block_quant(x, scale, out)
-                return out, scale
-            out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
-            return silu_and_mul(
-                x,
-                out,
-                limit=self.swiglu_limit,
+        if not x.is_cuda:
+            raise NotImplementedError(
+                "Non-CUDA fp8_out silu_and_mul is not implemented"
             )
-
-        if fp8_out:
+        if _is_amd:
             raise NotImplementedError("AMD fp8_out silu_and_mul is not implemented")
-        d = x.shape[-1] // 2
-        out = torch.empty(x.shape[:-1] + (d,), dtype=x.dtype, device=x.device)
-        return silu_and_mul(
-            x,
-            out,
-            limit=self.swiglu_limit,
+        if self.swiglu_limit is not None:
+            raise NotImplementedError("clamped fp8_out silu_and_mul is not implemented")
+
+        out = torch.empty(
+            x.shape[:-1] + (x.shape[-1] // 2,),
+            dtype=torch.float8_e4m3fn,
+            device=x.device,
         )
+        aligned_size = (out.shape[-2] + 3) // 4 * 4
+        scale = torch.empty(
+            out.shape[:-2] + (out.shape[-1] // 128, aligned_size),
+            device=x.device,
+            dtype=torch.float32,
+        ).permute(-1, -2)[: out.shape[-2], :]
+        from tokenspeed_kernel.ops.activation.cuda import (
+            silu_and_mul_fuse_block_quant,
+        )
+
+        return silu_and_mul_fuse_block_quant(x, scale, out)
 
     def forward_native(self, x: torch.Tensor) -> torch.Tensor:
         d = x.shape[-1] // 2
