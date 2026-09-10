@@ -396,13 +396,14 @@ class SeparateProjectionKimiLinearMLAAttention(KimiLinearMLAAttention):
             weight_nz="transposed",
             prefix=add_prefix("kv_a_proj_with_mqa", prefix),
         )
-        self.g_proj = ReplicatedLinear(
-            config.hidden_size,
-            config.num_attention_heads * config.v_head_dim,
-            bias=False,
-            params_dtype=torch.bfloat16,
-            prefix=add_prefix("g_proj", prefix),
-        )
+        if self.use_output_gate:
+            self.g_proj = ReplicatedLinear(
+                config.hidden_size,
+                config.num_attention_heads * config.v_head_dim,
+                bias=False,
+                params_dtype=torch.bfloat16,
+                prefix=add_prefix("g_proj", prefix),
+            )
         self.q_b_proj = WeightNZReplicatedLinear(
             config.q_lora_rank,
             config.num_attention_heads * qk_dim,
@@ -449,7 +450,7 @@ class SeparateProjectionKimiLinearMLAAttention(KimiLinearMLAAttention):
         comm_manager: Any,
         block_scale: torch.Tensor | None,
         attnres_partial_args: tuple | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, None]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, None]:
         if block_scale is not None or attnres_partial_args is not None:
             raise ValueError(
                 "Separate FLASHLocal MLA projections do not accept quantized "
@@ -457,19 +458,17 @@ class SeparateProjectionKimiLinearMLAAttention(KimiLinearMLAAttention):
             )
         q_a = self.q_a_proj(hidden_states)[0]
         latent_cache = self.kv_a_proj_with_mqa(hidden_states)[0]
-        gate = self.g_proj(hidden_states)[0]
+        gate = self.g_proj(hidden_states)[0] if self.use_output_gate else None
         if comm_manager is not None:
-            projected = comm_manager.pre_attn_comm(
-                torch.cat((q_a, latent_cache, gate), dim=-1), ctx
-            )
-            q_a, latent_cache, gate = projected.split(
-                (
-                    self.q_lora_rank,
-                    self.kv_lora_rank + self.qk_rope_head_dim,
-                    self._gate_width,
-                ),
-                dim=-1,
-            )
+            pieces = [q_a, latent_cache]
+            if gate is not None:
+                pieces.append(gate)
+            widths = [piece.shape[-1] for piece in pieces]
+            projected = comm_manager.pre_attn_comm(torch.cat(pieces, dim=-1), ctx)
+            pieces = projected.split(widths, dim=-1)
+            q_a, latent_cache = pieces[:2]
+            if gate is not None:
+                gate = pieces[2]
         kv_a = latent_cache[..., : self.kv_lora_rank]
         if self.q_b_proj._weight_nz_transposed:
             # Primitive fallback for the same [in, out] weight orientation;
@@ -492,6 +491,18 @@ class SeparateProjectionKimiLinearMLAAttention(KimiLinearMLAAttention):
             qk_rope_head_dim=self.qk_rope_head_dim,
         )
         return query, latent_cache, gate, None
+
+    def _project_q_latent(
+        self,
+        hidden_states: torch.Tensor,
+        ctx: Any,
+        comm_manager: Any,
+        block_scale: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        query, latent_cache, _, _ = self._project_q_latent_gated(
+            hidden_states, ctx, comm_manager, block_scale, None
+        )
+        return query, latent_cache
 
     def _mla_prolog_inputs(
         self,
@@ -592,9 +603,11 @@ class SeparateProjectionKimiLinearMLAAttention(KimiLinearMLAAttention):
                 # Prolog has written KV; attention and output projection remain
                 # explicit model stages, outside the projection helper.
                 _, cache_index = prolog_inputs
-                gate = self.g_proj(hidden_states)[0]
+                gate = self.g_proj(hidden_states)[0] if self.use_output_gate else None
                 fuse_value_gate = ctx.attn_backend.supports_mla_projected_value_decode
-                attn_output = torch.empty_like(gate)
+                attn_output = hidden_states.new_empty(
+                    (hidden_states.shape[0], self.num_heads * self.v_head_dim)
+                )
                 self.forward_absorb_attn_v_proj(
                     query,
                     None,
@@ -604,7 +617,7 @@ class SeparateProjectionKimiLinearMLAAttention(KimiLinearMLAAttention):
                     record_kv_cache=None,
                     output_gate=gate if fuse_value_gate else None,
                 )
-                if not fuse_value_gate:
+                if gate is not None and not fuse_value_gate:
                     attn_output = sigmoid_mul(attn_output, gate)
                 return self.o_proj(attn_output)[0]
         return super().forward(
