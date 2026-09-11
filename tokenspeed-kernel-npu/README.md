@@ -21,8 +21,10 @@ records every Python package mutation needed by this Ascend path, including the
 TokenSpeed applications should continue to import operators from
 `tokenspeed-kernel`; it owns registration and dispatch to this package.
 
-MLA Decode can use the optional `custom.npu_mla_fia_packed.out` operator to
-read the persistent packed cache directly, without a full-cache layout copy.
+MLA Decode automatically uses the optional `custom.npu_mla_fia_packed.out`
+operator when it is available and the capabilities below match. Selection does
+not read an environment variable. The operator reads the persistent packed cache
+directly, without a full-cache layout copy.
 The fast path requires BF16, a single query token, latent/auxiliary widths
 512/64, 1–64 query heads, batch 1–1024, contiguous packed pages of 64 or 128
 tokens, an int32 contiguous page table, and a context bound at most 1M.
@@ -38,9 +40,6 @@ The packed handler participates in the existing `graph.update()` flow:
 Q layout conversion and output allocation happen outside task-update, and
 each replay updates Host lengths while reusing the captured output addresses.
 Cache writes, page-table refresh, Prefill, and MLA prolog are unchanged.
-Set `TOKENSPEED_NPU_PACKED_FIA=0` before starting the process to force native
-FIA for A/B; the default is enabled when all capabilities match. Do not change
-the selection after graphs have been captured.
 
 The native fallback retains FIA with native NPUGraph. Its split Q/cache inputs are
 made contiguous before FIA dispatch, so layout copies execute on graph replay

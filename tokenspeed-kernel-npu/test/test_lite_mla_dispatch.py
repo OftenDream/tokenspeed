@@ -76,6 +76,7 @@ def dispatch():
         qk_nope_head_dim=128,
         qk_rope_head_dim=64,
         v_head_dim=128,
+        use_output_gate=True,
         attention_backend="mla",
         _MLA_KERNEL_BACKENDS=("mla",),
         w_kc=object(),
@@ -87,7 +88,11 @@ def dispatch():
         setattr(layer, name, SimpleNamespace(_weight_nz_transposed=True))
     device = SimpleNamespace(type="npu")
     hidden = SimpleNamespace(
-        device=device, dtype=torch.bfloat16, ndim=2, shape=(32, 3072)
+        device=device,
+        dtype=torch.bfloat16,
+        ndim=2,
+        shape=(32, 3072),
+        new_empty=torch.empty,
     )
     cache = Mock(spec=torch.Tensor)
     cache.dtype, cache.device = torch.bfloat16, device
@@ -168,7 +173,7 @@ def test_forward_passes_selected_cache_to_packaged_path(dispatch, fuse_value_gat
     layer, hidden, ctx, cache, locations, _ = dispatch
     events = []
     query = torch.ones(32, 2)
-    gate = torch.zeros(32, 2)
+    gate = torch.zeros(32, layer.num_heads * layer.v_head_dim)
     layer._project_q_with_mla_prolog = Mock(return_value=query)
     ctx.attn_backend.supports_mla_projected_value_decode = fuse_value_gate
 

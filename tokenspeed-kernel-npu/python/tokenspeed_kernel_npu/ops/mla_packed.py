@@ -21,7 +21,6 @@
 """Optional packed MLA reader using the existing NPUGraph update dispatcher."""
 
 import importlib
-import os
 from functools import lru_cache
 
 import torch
@@ -83,11 +82,10 @@ def packed_mla_decode_op(q, kv_cache, page_table, max_seqlen_k):
 
     Inputs are the absorbed query [B,1,H,576], packed cache [P,S,1,576],
     int32 page table [B,N], and the maximum context bound. Returning None
-    preserves native FIA. Set TOKENSPEED_NPU_PACKED_FIA=0 before launch for A/B.
+    preserves native FIA. Selection depends only on operator capabilities and
+    input geometry.
     This predicate inspects metadata only, never device tensor contents.
     """
-    if os.getenv("TOKENSPEED_NPU_PACKED_FIA", "1") == "0":
-        return None
     if (
         q.ndim != 4
         or not 1 <= q.shape[0] <= 1024
