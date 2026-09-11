@@ -163,6 +163,23 @@ class DeepEPCudaGraphRunnerAdapter:
         cls.clean_buffer()
 
 
+def replay_graph_then_update(graph, update_input) -> None:
+    """Replay a captured decode graph before re-issuing its NPUGraph task groups.
+
+    Every captured FIA task sits behind an ``ExternalEvent`` gate, so the Host
+    may refresh those tasks on the NPUGraph update stream after the replay has
+    been queued: the device keeps executing the layers ahead of each gate while
+    the Host recomputes tiling, instead of idling for the whole update. The gate
+    also keeps the first replay correct — the captured task cannot run before
+    its updated parameters have been recorded. ``update_input`` is ``None`` on
+    non-NPU devices, where only the replay applies.
+    """
+    with nvtx_range("graph_replay", color="red"):
+        graph.replay()
+    if update_input is not None:
+        graph.update(cpu_update_input=update_input)
+
+
 class ForwardStepRunner:
     """Owns one forward step end to end: metadata prep, then execution.
 
@@ -1032,14 +1049,13 @@ class ForwardStepRunner:
             graph = self.graphs[graph_key]
             if self._graph_debug:
                 self._verify_graph_metadata(graph_key)
+            update_input = None
             if self.device == "npu":
-                graph.update(
-                    cpu_update_input=[
-                        {"actual_seq_lengths_kv": seq_lens.to("cpu").tolist()}
-                    ]
-                )
-            with nvtx_range("graph_replay", color="red"):
-                graph.replay()
+                # Materialize the Host lengths while the device is still on the
+                # previous step: the D2H is a blocking copy, so issuing it after
+                # the replay would wait for the whole captured graph.
+                update_input = [{"actual_seq_lengths_kv": seq_lens.to("cpu").tolist()}]
+            replay_graph_then_update(graph, update_input)
 
             (
                 output_tokens,
