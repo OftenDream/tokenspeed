@@ -56,27 +56,28 @@ def geometry(batch, heads, page_size):
 
 @pytest.mark.parametrize("heads", [1, 2, 4, 8, 16, 32, 64])
 @pytest.mark.parametrize("batch,page_size", [(1, 64), (32, 64), (2, 128)])
-def test_supported_geometry(monkeypatch, heads, batch, page_size):
+@pytest.mark.parametrize("legacy_flag", [None, "0", "1"])
+def test_supported_geometry_ignores_legacy_flag(
+    monkeypatch, heads, batch, page_size, legacy_flag
+):
     op = Mock()
     monkeypatch.setattr(adapter, "_packed_op", lambda: op)
-    monkeypatch.setenv("TOKENSPEED_NPU_PACKED_FIA", "1")
+    if legacy_flag is None:
+        monkeypatch.delenv("TOKENSPEED_NPU_PACKED_FIA", raising=False)
+    else:
+        monkeypatch.setenv("TOKENSPEED_NPU_PACKED_FIA", legacy_flag)
     assert (
         adapter.packed_mla_decode_op(*geometry(batch, heads, page_size), 1048576) is op
     )
 
 
-@pytest.mark.parametrize(
-    "case", ["disabled", "dtype", "page", "stride", "table", "bound", "heads"]
-)
+@pytest.mark.parametrize("case", ["dtype", "page", "stride", "table", "bound", "heads"])
 def test_native_fallback(monkeypatch, case):
     q, kv, table = geometry(2, 32, 64)
     bound = 81920
     loader = Mock()
     monkeypatch.setattr(adapter, "_packed_op", loader)
-    monkeypatch.setenv("TOKENSPEED_NPU_PACKED_FIA", "1")
-    if case == "disabled":
-        monkeypatch.setenv("TOKENSPEED_NPU_PACKED_FIA", "0")
-    elif case == "dtype":
+    if case == "dtype":
         q.dtype = torch.float16
     elif case == "page":
         kv.shape = (64, 16, 1, 576)
@@ -186,7 +187,6 @@ def test_packed_graph_live_updates(monkeypatch, batch, heads, page_size, return_
     import torch_npu
     from tokenspeed_kernel_npu.ops.mla import mla_decode_with_kvcache
 
-    monkeypatch.setenv("TOKENSPEED_NPU_PACKED_FIA", "1")
     assert adapter._packed_op() is not None, "packed op and graph handler are required"
     torch.manual_seed(1729)
     device = "npu"
@@ -239,12 +239,12 @@ def test_packed_graph_live_updates(monkeypatch, batch, heads, page_size, return_
         actual = captured if return_lse else (captured,)
         torch.npu.synchronize()
         saved = tuple(t.clone() for t in actual)
-        monkeypatch.setenv("TOKENSPEED_NPU_PACKED_FIA", "0")
-        expected = invoke(lengths)
+        with monkeypatch.context() as native:
+            native.setattr(adapter, "_packed_op", lambda: None)
+            expected = invoke(lengths)
         expected = expected if return_lse else (expected,)
         for a, b in zip(saved, expected):
             torch.testing.assert_close(a, b, rtol=0.01, atol=0.01)
-        monkeypatch.setenv("TOKENSPEED_NPU_PACKED_FIA", "1")
         assert actual[0].data_ptr() == address
 
 
@@ -270,7 +270,6 @@ def test_fused_prolog_to_packed_graph(
     from tokenspeed_kernel_npu.ops.mla import mla_decode_with_kvcache
     from tokenspeed_kernel_npu.ops.mla_prolog import mla_prolog, mla_prolog_available
 
-    monkeypatch.setenv("TOKENSPEED_NPU_PACKED_FIA", "1")
     assert adapter._packed_op() is not None and mla_prolog_available()
     torch.manual_seed(1730)
 
@@ -338,7 +337,7 @@ def test_fused_prolog_to_packed_graph(
         graph.replay()
         torch.npu.synchronize()
         saved = captured.clone()
-        monkeypatch.setenv("TOKENSPEED_NPU_PACKED_FIA", "0")
-        reference = invoke(lengths)
+        with monkeypatch.context() as native:
+            native.setattr(adapter, "_packed_op", lambda: None)
+            reference = invoke(lengths)
         torch.testing.assert_close(saved, reference, rtol=0.01, atol=0.001)
-        monkeypatch.setenv("TOKENSPEED_NPU_PACKED_FIA", "1")
