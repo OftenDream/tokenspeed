@@ -663,12 +663,23 @@ def public_kda_paged_prefill(
     if not keep:
         return KdaPrefillResult(torch.zeros_like(v), initial_state.clone())
 
-    q_prepared = F.normalize(q.float(), p=2, dim=-1).to(q.dtype)
     key_dim = q.shape[-1]
-    beta_scale = torch.sqrt(torch.sigmoid(beta_logits.float()) + 1e-10)
-    k_prepared = (F.normalize(k.float(), p=2, dim=-1) * beta_scale).to(k.dtype)
-    v_prepared = (v.float() * beta_scale).to(v.dtype)
-    beta = torch.ones(q.shape[:-1], dtype=q.dtype, device=q.device)
+    if (
+        q.device.type == "npu"
+        and q.shape[2:] == (4, 128)
+        and all(t.stride(-1) == 1 for t in (q, k, v, beta_logits))
+    ):
+        from tokenspeed_kernel_npu.ops.kda_prepare import prepare_kda_inputs
+
+        q_prepared, k_prepared, v_prepared, beta = prepare_kda_inputs(
+            q, k, v, beta_logits
+        )
+    else:
+        q_prepared = F.normalize(q.float(), p=2, dim=-1).to(q.dtype)
+        beta_scale = torch.sqrt(torch.sigmoid(beta_logits.float()) + 1e-10)
+        k_prepared = (F.normalize(k.float(), p=2, dim=-1) * beta_scale).to(k.dtype)
+        v_prepared = (v.float() * beta_scale).to(v.dtype)
+        beta = torch.ones(q.shape[:-1], dtype=q.dtype, device=q.device)
 
     gate_cumsum = torch.ops.tokenspeed_npu_public_kda.kda_gate_cumsum(
         g_raw.contiguous(),

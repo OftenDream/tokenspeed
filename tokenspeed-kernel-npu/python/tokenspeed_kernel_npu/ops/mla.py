@@ -26,7 +26,10 @@ import math
 
 import torch
 import torch_npu
-from tokenspeed_kernel_npu.ops.mla_packed import packed_mla_decode_op
+from tokenspeed_kernel_npu.ops.mla_packed import (
+    packed_mla_decode_op,
+    packed_mla_prefill_op,
+)
 
 _CAUSAL_MASKS: dict[torch.device, torch.Tensor] = {}
 
@@ -164,10 +167,56 @@ def mla_extend_with_kvcache(
     out: torch.Tensor | None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Run absorbed variable-length MLA over the paged latent cache."""
-    del cu_seqlens_kv, max_seqlen_q, max_seqlen_k, qk_nope_head_dim
+    del cu_seqlens_kv, qk_nope_head_dim
     if logit_cap:
         raise NotImplementedError("Ascend MLA does not support logit caps")
     q_nope, q_aux = q.split((kv_lora_rank, qk_rope_head_dim), dim=-1)
+    packed_op = (
+        packed_mla_prefill_op(q, kv_cache, page_table, max_seqlen_q, max_seqlen_k)
+        if is_causal and (kv_lora_rank, qk_rope_head_dim) == (512, 64)
+        else None
+    )
+    if packed_op is not None:
+        lengths = (
+            cache_seqlens.to("cpu").tolist()
+            if isinstance(cache_seqlens, torch.Tensor)
+            else cache_seqlens
+        )
+        query_lengths = cu_seqlens_q[1:]
+        if isinstance(query_lengths, torch.Tensor):
+            query_lengths = query_lengths.to("cpu").tolist()
+        packed_out = (
+            out
+            if out is not None and out.is_contiguous()
+            else torch.empty(q_nope.shape, dtype=q.dtype, device=q.device)
+        )
+        packed_lse = torch.empty(
+            (q.shape[0], q.shape[1], 1) if return_lse else (0,),
+            dtype=torch.float32,
+            device=q.device,
+        )
+        # Only Q is materialized; the persistent cache remains a packed view.
+        # Once dispatched, errors propagate without retrying the cache writer.
+        output, lse = packed_op(
+            q_nope.contiguous(),
+            q_aux.contiguous(),
+            kv_cache.view(kv_cache.shape[0], kv_cache.shape[1], 576),
+            page_table,
+            lengths,
+            query_lengths,
+            _causal_mask(q.device),
+            num_heads=q.shape[1],
+            scale=softmax_scale,
+            return_lse=return_lse,
+            out=packed_out,
+            lse=packed_lse,
+        )
+        return _result(
+            output,
+            _lse(lse, q.shape[0], q.shape[1]) if return_lse else lse,
+            return_lse=return_lse,
+            out=out,
+        )
     k_nope, k_aux = kv_cache.split((kv_lora_rank, qk_rope_head_dim), dim=-1)
     output, lse = torch_npu.npu_fused_infer_attention_score(
         q_nope,

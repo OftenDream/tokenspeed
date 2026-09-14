@@ -527,6 +527,12 @@ stride, live requests) — no device-side metadata tensor, because the
 per-step pinned staging + H2D it would need lands on the bs=1 latency path;
 padding requests (`[actual_bs, bs)`) and each group's column tail resolve to
 null page 0.
+On NPU, the existing fused decode write-location kernel also consumes the
+stack's device page sizes directly. Converting those fixed device scalars
+to Python integers would synchronize the execution stream on every refresh.
+The kernel writes the same persistent location buffers on that stream,
+after earlier graph consumers and before the next replay.
+
 The bridge's `{gid: view}` dict is the router's input; the router does not
 depend on the views sharing one storage. The slot math lives in
 `paged/write_locations.py` as pure functions with one invariant: `slot = table[req, pos // P] * P + pos % P` is page-size
@@ -762,3 +768,28 @@ mapping remains a separate consumer of the shared mapping helpers
 * New backends implement `refresh_decode_metadata` + `init_cuda_graph_state`;
   capture is inherited from the base default (idle refresh). Only a
   kernel-imposed capture asymmetry justifies an override.
+
+### NPU host attention lengths
+
+NPUGraph task updates consume host attention lengths. For ordinary one-token
+execution, RuntimeStates owns a host record of issued lengths alongside the
+device lengths. The forward thread seeds both from the same local-prefill or
+PD-landing reset values, and advances the host record once per issued forward.
+It never reads the control plane's committed-token count: overlap can issue the
+next forward before that count changes.
+
+Each record is keyed by pool slot and request ID. A reset starts a new slot
+lifetime, even if a re-admitted request has the same ID; a different ID without
+a reset invalidates the old record. Each forward gets an immutable tuple in its
+own request order. Unknown rows or variable acceptance keep the existing device
+readback; known rows still advance if another row takes that fallback. Padding
+is appended as length one only by the graph runner. This changes neither the
+device input/metadata path nor the replay-before-update ExternalEvent contract.
+
+The update stream waits on an event recorded after the preceding replay of the
+same graph, before updating its task groups. Without the former blocking length
+readback, two replays can be queued together; the captured ExternalEvent alone
+does not protect the preceding replay from a later task update. This device
+wait preserves task ownership while allowing the host to enqueue both replays.
+The new completion event is recorded on the execution stream after replay and
+update submission; no host wait or extra copy stream is needed.

@@ -265,3 +265,35 @@ def test_npu_public_prefill_matches_reference(lengths):
             torch.testing.assert_close(
                 actual.final_state[index], initial[index], atol=0, rtol=0
             )
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("tokens", [32, 63, 65, 256, 4096])
+@pytest.mark.parametrize("seed", [3, 11, 29, 97])
+def test_npu_fused_prefill_prepare_matches_torch_with_strides(dtype, tokens, seed):
+    if not current_platform().is_npu:
+        pytest.skip("requires an Ascend NPU")
+    from tokenspeed_kernel_npu.ops.kda_prepare import prepare_kda_inputs
+
+    torch.npu.set_device(0)
+    torch.manual_seed(seed)
+    packed = torch.randn(1, tokens, 3, 4, 128, device="npu:0", dtype=dtype)
+    q, k, v = packed.unbind(2)
+    beta = torch.randn(1, tokens, 4, 256, device="npu:0", dtype=dtype)[..., :128]
+    # Include zero-norm rows and saturated sigmoid at both ends.
+    q[:, 0].zero_()
+    k[:, 1].zero_()
+    beta[:, 0].fill_(-80)
+    beta[:, 1].fill_(80)
+    scale = torch.sqrt(torch.sigmoid(beta.float()) + 1e-10)
+    expected = (
+        F.normalize(q.float(), p=2, dim=-1).to(dtype),
+        (F.normalize(k.float(), p=2, dim=-1) * scale).to(dtype),
+        (v.float() * scale).to(dtype),
+        torch.ones(q.shape[:-1], device="npu:0", dtype=dtype),
+    )
+    for _ in range(3):
+        actual = prepare_kda_inputs(q, k, v, beta)
+        for result, reference in zip(actual, expected):
+            assert result.is_contiguous() and torch.isfinite(result).all()
+            torch.testing.assert_close(result, reference, atol=0, rtol=0)

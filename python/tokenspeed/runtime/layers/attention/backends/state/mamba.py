@@ -48,13 +48,11 @@ from tokenspeed_kernel.ops.attention.gdn.triton import (
     fused_qkv_split_gdn_prefill,
 )
 from tokenspeed_kernel.ops.attention.gdn.triton import (
-    prepare_prefill_state_inputs as _prepare_cache_prefill_state_inputs,
-)
-from tokenspeed_kernel.ops.attention.gdn.triton import (
     set_total_chunks_hint,
     set_total_chunks_hint_uniform,
 )
 from tokenspeed_kernel.ops.attention.kda.triton import verify_state_blocks
+from tokenspeed_kernel.ops.copy.state import gather_state_rows, scatter_state_rows_
 from tokenspeed_kernel.ops.kvcache.triton import copy_state_rows
 
 from tokenspeed.runtime.execution.breakable_cuda_graph import (
@@ -227,6 +225,27 @@ def _slice_prefill_recurrent_inputs(
         f_a_out=None if f_a_out is None else f_a_out[token_start:token_end],
         beta_raw=None if beta_raw is None else beta_raw[token_start:token_end],
     )
+
+
+def _prepare_cache_prefill_state_inputs(
+    ssm_states: torch.Tensor,
+    state_in_blocks: torch.Tensor,
+    state_out_blocks: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Gather recurrent input and conv read slots without reading null state.
+
+    Fresh rows use their destination slot and a false initial-state mask.
+    Convolution owns publication to the destination; preparation never copies
+    its state. Recurrent inputs retain their existing gather and zero mask.
+    """
+    has_initial_state = state_in_blocks > 0
+    safe_input_pages = torch.where(has_initial_state, state_in_blocks, state_out_blocks)
+    recurrent_state = gather_state_rows(ssm_states, safe_input_pages)
+    broadcast_mask = has_initial_state.reshape(
+        (-1,) + (1,) * (recurrent_state.ndim - 1)
+    )
+    recurrent_state.masked_fill_(~broadcast_mask, 0)
+    return recurrent_state, has_initial_state, safe_input_pages
 
 
 def _prepare_gdn_decode_state_path(
@@ -2176,13 +2195,12 @@ class MambaAttnBackend(AttentionBackend):
             )
             checkpoint_blocks = self._layer_prefill_checkpoint_blocks(layer_id)
             checkpoint_batch = self.forward_metadata.prefill_checkpoint_batch
-            recurrent_state, has_initial_states = _prepare_cache_prefill_state_inputs(
-                conv_states,
-                ssm_states,
-                state_in_blocks,
-                state_out_blocks,
+            state_out_long = state_out_blocks.to(torch.int64)
+            recurrent_state, has_initial_states, conv_read_indices = (
+                _prepare_cache_prefill_state_inputs(
+                    ssm_states, state_in_blocks, state_out_blocks
+                )
             )
-            conv_cache_indices = state_out_blocks
             extend_seq_lens_cpu = self.forward_metadata.extend_seq_lens_cpu
 
             # Zero padded rows so garbage can't reach recurrent state (see scrub_padding_tail).
@@ -2209,7 +2227,8 @@ class MambaAttnBackend(AttentionBackend):
                 conv_weights,
                 bias,
                 activation,
-                conv_cache_indices,
+                conv_read_indices,
+                state_out_blocks,
                 query_start_loc,
                 has_initial_states,
                 extend_seq_lens_cpu,
@@ -2317,7 +2336,7 @@ class MambaAttnBackend(AttentionBackend):
             )
             last_recurrent_state = last_recurrent_state.to(ssm_states.dtype, copy=False)
             # Extend indices never carry pad(-1), so this write is unguarded.
-            ssm_states[state_out_blocks] = last_recurrent_state
+            scatter_state_rows_(ssm_states, state_out_long, last_recurrent_state)
 
         return core_attn_out
 
@@ -2328,12 +2347,19 @@ class MambaAttnBackend(AttentionBackend):
         conv_weights: torch.Tensor,
         bias: torch.Tensor | None,
         activation: str | None,
-        state_indices: torch.Tensor,
+        read_indices: torch.Tensor,
+        write_indices: torch.Tensor,
         query_start_loc: torch.Tensor,
         has_initial_states: torch.Tensor,
         seq_lens_cpu: torch.Tensor | None,
         **_kwargs,
     ) -> torch.Tensor:
+        # This kernel has one state index. Stage its input at the destination;
+        # leaves with independent read/write indices consume the checkpoint directly.
+        conv_input = gather_state_rows(conv_states, read_indices.to(torch.int64))
+        scatter_state_rows_(
+            conv_states, write_indices.to(torch.int64), conv_input
+        )
         return causal_conv1d_fn(
             mixed_qkv.transpose(0, 1),
             conv_weights,
@@ -2341,7 +2367,7 @@ class MambaAttnBackend(AttentionBackend):
             activation=activation,
             conv_states=conv_states,
             has_initial_state=has_initial_states,
-            cache_indices=state_indices,
+            cache_indices=write_indices,
             query_start_loc=query_start_loc,
             prefill_metadata=self.forward_metadata.conv_prefill_metadata,
         ).transpose(0, 1)

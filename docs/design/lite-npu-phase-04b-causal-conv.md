@@ -419,3 +419,66 @@ replay，并逐字节检查整个 arena。单算子额外覆盖非零 storage of
 B1/B16、Prefill eager / Decode eager / Decode graph，共60组；配套122项回归通过。
 完整口径、真实arena stride及结果见[本轮 fused/ref 报告](lite-npu-causal-conv-fused-ref-perf.md)。
 本轮设备统计包含 ref 的 AI_CPU ViewCopy；不能把调用段收益等同于纯卷积核或整模型收益。
+
+
+## 12. Prefill checkpoint ownership
+
+The fused Prefill registration covers both small and large request batches,
+including a single 4096-token chunk. The current adapter already passes the
+original width-major arena view, initial-state mask and independent read/write
+indices to the packaged operator. Reapplying the historical batch-threshold or
+compact/scatter changes would duplicate existing work.
+
+Prefill state preparation now returns safe convolution read indices along with
+the unchanged gathered/masked recurrent input. It does not copy convolution
+checkpoints to working slots. A fresh request maps its read to its destination
+and supplies a false initial-state mask, so neither stale destination bytes nor
+the null slot become history. A continuation reads its committed checkpoint and
+publishes the last three input rows directly to the scheduler's destination.
+The KDA leaf passes these two indices through the common kernel facade. The
+single-index Mamba convolution leaf stages the checkpoint at its own boundary,
+where that staging is still required by its kernel. This keeps one Prefill
+scheduling path and leaves recurrent preparation, allocation, cache geometry,
+transfer, and Decode execution unchanged.
+
+The packaged kernel must support `CAUSAL_CONV1D_STATE_SLOT_STRIDE` and independent
+Prefill destinations in both its wheel and matching OPP. The capability marker
+is necessary; an old same-schema OPP must not be paired with a newer wheel.
+The automatic missing-package fallback still uses the same independent R/W
+contract through the reference convolution.
+
+Regression entry: `test/runtime/test_lite_kda_prefill_conv_state.py`. It covers
+TP8 packed C=1536, BF16/FP16, short initial/continuation chunks, all sixteen
+4096-token chunks of one 64K request, nonzero field offsets in real recipe
+arenas, untouched arena bytes, and BS32 changed-input/changed-slot Decode graph
+replay. The existing causal-conv and real-arena suites retain empty/padded and
+in-place update coverage. The production-shape Prefill/Decode comparison uses
+the current width-major convolution pool; its CPU oracle remains channel-major.
+
+
+### Validation on the updated baseline
+
+On baseline `baf1d08b`, the convolution and cache suites passed 40 cases. The
+candidate passed 120 focused runtime/kernel cases and an eight-case final
+checkpoint/graph recheck. The baseline's constructed KDA backend also replayed
+BS32 convolution plus recurrent Decode on the actual recipe arena: changing
+inputs and independent slots produced bitwise-identical output and entire
+arena bytes versus eager execution. Recurrent state was FP32 K-major with
+strides `[73728,16384,128,1]`; convolution state was BF16 with strides
+`[147456,1536,1]`. These are bounded 67-slot backend probes, not full-service
+capacity validation.
+
+Profiler-off paired wall timing for B1/T4096/C1536/BF16 used one arena and
+stream, ten warmups and nine alternating rounds of thirty calls. The measured
+scope is recurrent-input preparation plus convolution, excluding the scan.
+Initial-chunk median was 203.670 to 165.545 microseconds; continuation median
+was 202.573 to 165.845 microseconds. Baseline and candidate output and complete
+arena bytes matched exactly. Separately collected profiles show one fused
+`CausalConv1d` per call on both sides and removal of the four convolution
+`IndexPutImpl` kernels per call. Neither side has the historical AI_CPU path.
+
+The exact baseline's TP8 full-model launch failed during Host OE initialization:
+the available `flash_npu_kernel` package lacked `npu_append_packed_oe_lookup` and
+`npu_register_host_oe_tables`, required by that baseline. It never reached a
+model forward. No full-model correctness or performance benefit is established
+by this validation; no older OE path was substituted to obtain a number.

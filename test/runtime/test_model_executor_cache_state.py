@@ -25,11 +25,13 @@ import pytest
 import torch
 
 from tokenspeed.runtime.execution.model_executor import ModelExecutor
+from tokenspeed.runtime.execution.queued_cache_lengths import QueuedCacheLengths
 
 
 class _RuntimeStates:
     def __init__(self):
         self.valid_cache_lengths = torch.arange(20, dtype=torch.int32)
+        self.queued_cache_lengths = QueuedCacheLengths()
 
     def reset_states(self, req_pool_indices, prefix_lens):
         self.valid_cache_lengths[req_pool_indices] = prefix_lens
@@ -49,6 +51,7 @@ def test_mixed_batch_resets_only_prefill_lengths(monkeypatch):
     executor.runtime_states = _RuntimeStates()
 
     forward_op = SimpleNamespace(
+        request_ids=["p", "a", "b"],
         request_pool_indices=[2, 3, 4],
         extend_prefix_lens=[10],
         num_extends=lambda: 1,
@@ -68,6 +71,9 @@ def test_mixed_batch_resets_only_prefill_lengths(monkeypatch):
     assert executor.runtime_states.valid_cache_lengths[2].item() == 10
     assert executor.runtime_states.valid_cache_lengths[3].item() == 3
     assert executor.runtime_states.valid_cache_lengths[4].item() == 4
+    assert executor.runtime_states.queued_cache_lengths.advance(
+        ("p",), (2,), (1,), 0, True
+    ) == (11,)
 
 
 def test_remote_prefill_seeds_the_complete_prompt_length(monkeypatch):
@@ -82,6 +88,7 @@ def test_remote_prefill_seeds_the_complete_prompt_length(monkeypatch):
     executor.runtime_states = _RuntimeStates()
 
     forward_op = SimpleNamespace(
+        request_ids=["p", "q", "r"],
         request_pool_indices=[7, 11, 13],
         prefill_lengths=[15, 17, 19],
         extend_prefix_lens=[0, 0],
@@ -103,6 +110,9 @@ def test_remote_prefill_seeds_the_complete_prompt_length(monkeypatch):
     assert executor.runtime_states.valid_cache_lengths[11].item() == 17
     # Only the extend rows are seeded; the third row is not part of this op.
     assert executor.runtime_states.valid_cache_lengths[13].item() == 13
+    assert executor.runtime_states.queued_cache_lengths.advance(
+        ("q", "p"), (11, 7), (1, 1), 0, True
+    ) == (18, 16)
 
 
 def test_draft_final_step_follows_the_complete_drafter_run():

@@ -1847,7 +1847,7 @@ class ServerArgs:
         parser.add_argument(
             "--npu-enable-weight-nz",
             action="store_true",
-            help="Prepare selected Lite Decode weights in Ascend FRACTAL_NZ format.",
+            help="Prepare selected Lite weights in Ascend FRACTAL_NZ format; Prefill selects only MLA prolog inputs.",
         )
         parser.add_argument(
             "--oe-table-placement",

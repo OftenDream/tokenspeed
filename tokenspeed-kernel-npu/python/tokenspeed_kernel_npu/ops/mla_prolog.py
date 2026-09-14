@@ -70,7 +70,7 @@ def _supports_mla_prolog(
     if tokens == 0 or weight_uk.ndim != 3:
         return False
     heads = weight_uk.shape[0]
-    if (hidden, heads) not in ((3072, 32), (4096, 64)):
+    if hidden not in (3072, 4096) or heads not in (4, 8, 16, 32, 64):
         return False
     expected = (
         (token_x, (tokens, hidden)),

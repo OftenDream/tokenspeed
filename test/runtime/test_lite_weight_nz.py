@@ -90,3 +90,23 @@ def test_lite_weight_nz_whitelist_is_exact():
         + 2 * target.num_hidden_layers
         == 105
     )
+
+
+def test_prefill_weight_nz_is_limited_to_mla_prolog_inputs():
+    config = FLASHLocalConfig.from_dict(lite_config_dict())
+    model = FLASHLocalForCausalLM(
+        config,
+        mapping(8, rank=0, role="prefill"),
+        oe_table_placement="host",
+    )
+    marked = {
+        name
+        for name, module in model.named_modules()
+        if isinstance(module, WeightNZReplicatedLinear) and module.prefill_weight_nz
+    }
+    prefix = "model.layers.3.self_attn"
+    assert marked == {
+        f"{prefix}.q_a_proj",
+        f"{prefix}.kv_a_proj_with_mqa",
+        f"{prefix}.q_b_proj",
+    }

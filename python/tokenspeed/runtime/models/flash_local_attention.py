@@ -37,7 +37,7 @@ from torch import nn
 from torch.nn import functional as F
 
 from tokenspeed.runtime.layers.layernorm import FusedRMSNorm, RMSNorm
-from tokenspeed.runtime.layers.linear import ReplicatedLinear
+from tokenspeed.runtime.layers.linear import ColumnParallelLinear, ReplicatedLinear
 from tokenspeed.runtime.models.deepseek_v3 import _prepare_mla_kv_b_proj_weights
 from tokenspeed.runtime.models.kimi_k3 import KimiLinearMLAAttention
 from tokenspeed.runtime.utils import add_prefix, set_weight_attrs
@@ -63,6 +63,7 @@ class WeightNZReplicatedLinear(ReplicatedLinear):
         output_size: int,
         *,
         weight_nz: Literal["standard", "transposed"],
+        prefill_weight_nz: bool,
         prefix: str,
     ) -> None:
         super().__init__(
@@ -73,15 +74,19 @@ class WeightNZReplicatedLinear(ReplicatedLinear):
             prefix=prefix,
         )
         self.weight_nz = weight_nz
+        self.prefill_weight_nz = prefill_weight_nz
         self._weight_nz_prepared = False
         self._weight_nz_transposed = False
 
     def process_weights_after_loading(self, _module: nn.Module | None = None) -> None:
         if self._weight_nz_prepared or self.weight.device.type != "npu":
             return
-        if (
-            not global_server_args_dict.get("npu_enable_weight_nz", False)
-            or global_server_args_dict.get("disaggregation_mode") != "decode"
+        if not global_server_args_dict.get("npu_enable_weight_nz", False) or not (
+            global_server_args_dict.get("disaggregation_mode") == "decode"
+            or (
+                self.prefill_weight_nz
+                and global_server_args_dict.get("disaggregation_mode") == "prefill"
+            )
         ):
             return
 
@@ -99,6 +104,68 @@ class WeightNZReplicatedLinear(ReplicatedLinear):
             return torch.matmul(hidden_states, self.weight), None
         if self._weight_nz_prepared:
             return F.linear(hidden_states, self.weight), None
+        return super().forward(hidden_states)
+
+
+class WeightNZHeadParallelLinear(WeightNZReplicatedLinear):
+    """Load a head shard before preparing its optional Weight-NZ layout.
+
+    ``shard_dim`` selects output rows (0) or input columns (1) of the
+    checkpoint's [out, in] weight. Forward returns the local projection and
+    no bias. Input-column shards return a partial hidden state; the decoder
+    layer owns its single reduction before residual addition and RMSNorm.
+    """
+
+    def __init__(
+        self,
+        input_size: int,
+        output_size: int,
+        *,
+        shard_dim: int,
+        tp_rank: int,
+        tp_size: int,
+        weight_nz: Literal["standard", "transposed"],
+        prefill_weight_nz: bool,
+        prefix: str,
+    ) -> None:
+        if shard_dim not in (0, 1) or not 0 <= tp_rank < tp_size:
+            raise ValueError("Invalid head projection shard.")
+        full_shape = (output_size, input_size)
+        if full_shape[shard_dim] % tp_size:
+            raise ValueError("Head projection size must be divisible by TP size.")
+        self.shard_dim = shard_dim
+        self.tp_rank = tp_rank
+        self.accumulate_output = shard_dim == 1 and tp_size > 1
+        self.full_weight_shape = full_shape
+        super().__init__(
+            input_size // tp_size if shard_dim == 1 else input_size,
+            output_size // tp_size if shard_dim == 0 else output_size,
+            weight_nz=weight_nz,
+            prefill_weight_nz=prefill_weight_nz,
+            prefix=prefix,
+        )
+
+    def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor) -> None:
+        if tuple(loaded_weight.shape) != self.full_weight_shape:
+            raise ValueError(
+                "Head projection loader requires the full checkpoint weight."
+            )
+        if self._weight_nz_prepared:
+            raise ValueError(
+                "Head projection must be loaded before Weight-NZ preparation."
+            )
+        width = param.shape[self.shard_dim]
+        local = loaded_weight.narrow(self.shard_dim, self.tp_rank * width, width)
+        super().weight_loader(param, local, shard_id=None, begin_size=None)
+
+    def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, None]:
+        if self.accumulate_output:
+            # Preserve local dot products until the decoder reduces all heads.
+            # Casting already-rounded BF16 partials to FP32 cannot recover them.
+            weight = self.weight.float()
+            if self._weight_nz_transposed:
+                return torch.matmul(hidden_states.float(), weight), None
+            return F.linear(hidden_states.float(), weight), None
         return super().forward(hidden_states)
 
 
@@ -251,6 +318,7 @@ class PackedFLASHLocalKDA(nn.Module):
             local_projection,
             config.hidden_size,
             weight_nz="standard",
+            prefill_weight_nz=False,
             prefix="o_proj",
         )
 
@@ -388,41 +456,59 @@ class SeparateProjectionKimiLinearMLAAttention(KimiLinearMLAAttention):
             config.hidden_size,
             config.q_lora_rank,
             weight_nz="transposed",
+            prefill_weight_nz=True,
             prefix=add_prefix("q_a_proj", prefix),
         )
         self.kv_a_proj_with_mqa = WeightNZReplicatedLinear(
             config.hidden_size,
             config.kv_lora_rank + config.qk_rope_head_dim,
             weight_nz="transposed",
+            prefill_weight_nz=True,
             prefix=add_prefix("kv_a_proj_with_mqa", prefix),
         )
         if self.use_output_gate:
-            self.g_proj = ReplicatedLinear(
+            self.g_proj = ColumnParallelLinear(
                 config.hidden_size,
                 config.num_attention_heads * config.v_head_dim,
                 bias=False,
                 params_dtype=torch.bfloat16,
                 prefix=add_prefix("g_proj", prefix),
+                tp_rank=component_mapping.tp_rank,
+                tp_size=component_mapping.tp_size,
+                tp_group=component_mapping.tp_group,
+                gather_output=False,
             )
-        self.q_b_proj = WeightNZReplicatedLinear(
+        self.q_b_proj = WeightNZHeadParallelLinear(
             config.q_lora_rank,
             config.num_attention_heads * qk_dim,
+            shard_dim=0,
+            tp_rank=component_mapping.tp_rank,
+            tp_size=component_mapping.tp_size,
             # The prolog consumes logical [in, out] NZ weights. Preparation
-            # happens once on load under the existing Decode Weight-NZ switch.
+            # happens once on load under the Weight-NZ switch.
             weight_nz="transposed",
+            prefill_weight_nz=True,
             prefix=add_prefix("q_b_proj", prefix),
         )
-        self.kv_b_proj = ReplicatedLinear(
+        self.kv_b_proj = ColumnParallelLinear(
             config.kv_lora_rank,
             config.num_attention_heads * (config.qk_nope_head_dim + config.v_head_dim),
             bias=False,
             params_dtype=torch.bfloat16,
             prefix=add_prefix("kv_b_proj", prefix),
+            tp_rank=component_mapping.tp_rank,
+            tp_size=component_mapping.tp_size,
+            tp_group=component_mapping.tp_group,
+            gather_output=False,
         )
-        self.o_proj = WeightNZReplicatedLinear(
+        self.o_proj = WeightNZHeadParallelLinear(
             config.num_attention_heads * config.v_head_dim,
             config.hidden_size,
+            shard_dim=1,
+            tp_rank=component_mapping.tp_rank,
+            tp_size=component_mapping.tp_size,
             weight_nz="standard",
+            prefill_weight_nz=False,
             prefix=add_prefix("o_proj", prefix),
         )
         self._mla_scales_prepared = False
@@ -516,19 +602,30 @@ class SeparateProjectionKimiLinearMLAAttention(KimiLinearMLAAttention):
             block_scale is not None
             or attnres_partial_args is not None
             or hidden_states.ndim != 2
-            or not ctx.forward_mode.is_decode()
             or ctx.bs == 0
-            or ctx.num_extends != 0
-            or ctx.input_num_tokens != ctx.bs
-            or hidden_states.shape[0] != ctx.bs
+            or hidden_states.shape[0] != ctx.input_num_tokens
             or (ctx.attn_backend.spec_num_tokens or 1) != 1
-            or self.component_mapping.tp_size != 1
             or self.attention_backend not in self._MLA_KERNEL_BACKENDS
             or self.w_kc is None
             or not self.q_a_proj._weight_nz_transposed
             or not self.kv_a_proj_with_mqa._weight_nz_transposed
             or not self.q_b_proj._weight_nz_transposed
         ):
+            return None
+        if ctx.forward_mode.is_decode():
+            if ctx.num_extends != 0 or ctx.input_num_tokens != ctx.bs:
+                return None
+        elif ctx.forward_mode.is_extend():
+            metadata = ctx.attn_backend.chunked_prefill_metadata
+            # V3 returns an absorbed query. The backend alone decides whether
+            # cached Extend uses that algorithm; first chunks stay explicit.
+            if (
+                ctx.num_extends != ctx.bs
+                or not metadata.use_absorbed_cached_extend
+                or sum(metadata.extend_seq_lens_cpu) != ctx.input_num_tokens
+            ):
+                return None
+        else:
             return None
         # Fusing projection with cache writes cannot bypass a token all-gather.
         # Keep the existing projection/communication path when rows are scattered.
@@ -556,7 +653,7 @@ class SeparateProjectionKimiLinearMLAAttention(KimiLinearMLAAttention):
         ):
             return None
         selected = ctx.attn_backend.write_locations(self.attn_mqa, ctx.forward_mode)
-        if selected.numel() != ctx.bs:
+        if selected.numel() != ctx.input_num_tokens:
             return None
         return cache.view(-1, page_size, 1, cache_width), selected
 
@@ -604,9 +701,12 @@ class SeparateProjectionKimiLinearMLAAttention(KimiLinearMLAAttention):
                 # explicit model stages, outside the projection helper.
                 _, cache_index = prolog_inputs
                 gate = self.g_proj(hidden_states)[0] if self.use_output_gate else None
-                fuse_value_gate = ctx.attn_backend.supports_mla_projected_value_decode
+                fuse_value_gate = (
+                    ctx.num_extends == 0
+                    and ctx.attn_backend.supports_mla_projected_value_decode
+                )
                 attn_output = hidden_states.new_empty(
-                    (hidden_states.shape[0], self.num_heads * self.v_head_dim)
+                    (hidden_states.shape[0], self.num_local_heads * self.v_head_dim)
                 )
                 self.forward_absorb_attn_v_proj(
                     query,

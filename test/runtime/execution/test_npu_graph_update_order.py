@@ -20,12 +20,19 @@
 
 """The NPU decode graph must be replayed before its FIA tasks are refreshed."""
 
+from types import SimpleNamespace
+
 from tokenspeed.runtime.execution.forward_step import replay_graph_then_update
 
 
 class _RecordingGraph:
     def __init__(self) -> None:
         self.calls: list = []
+        self.graph_dispatch_mode = SimpleNamespace(
+            update_stream=SimpleNamespace(
+                wait_event=lambda event: self.calls.append(("wait", event))
+            )
+        )
 
     def replay(self) -> None:
         self.calls.append(("replay", None))
@@ -38,14 +45,29 @@ def test_replay_is_queued_before_the_task_update() -> None:
     graph = _RecordingGraph()
     payload = [{"actual_seq_lengths_kv": [4, 5]}]
 
-    replay_graph_then_update(graph, payload)
+    done = SimpleNamespace(record=lambda: graph.calls.append(("record", None)))
+    replay_graph_then_update(graph, payload, None, done)
 
-    assert graph.calls == [("replay", None), ("update", payload)]
+    assert graph.calls == [("replay", None), ("update", payload), ("record", None)]
 
 
 def test_replay_without_update_input_never_touches_update() -> None:
     graph = _RecordingGraph()
 
-    replay_graph_then_update(graph, None)
+    replay_graph_then_update(graph, None, None, None)
 
     assert graph.calls == [("replay", None)]
+
+
+def test_next_update_waits_for_previous_replay_without_host_synchronization():
+    graph = _RecordingGraph()
+    previous = object()
+    done = SimpleNamespace(record=lambda: graph.calls.append(("record", None)))
+    payload = [{"actual_seq_lengths_kv": [128, 129]}]
+    replay_graph_then_update(graph, payload, previous, done)
+    assert graph.calls == [
+        ("replay", None),
+        ("wait", previous),
+        ("update", payload),
+        ("record", None),
+    ]

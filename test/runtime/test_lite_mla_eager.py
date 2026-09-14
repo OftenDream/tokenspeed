@@ -303,6 +303,7 @@ def test_ascend_mla_prolog_accepts_attention_tp8_with_replicated_weights(monkeyp
     layer = _layer(True, 8).to("npu")
     layer.hidden_size = 3072
     layer.num_heads = 32
+    layer.num_local_heads = 32
     layer.q_lora_rank = 1536
     layer.kv_lora_rank = 512
     layer.qk_nope_head_dim = 128
@@ -549,3 +550,103 @@ def test_ascend_lite_mla_decode_graph_updates_live_lengths():
         if previous is not None:
             assert not torch.equal(output, previous)
         previous = output.clone()
+
+
+@pytest.mark.parametrize(
+    "case,eligible",
+    [
+        ("continuation", True),
+        ("first_chunk", False),
+        ("mixed", False),
+        ("padded_rows", False),
+        ("short_locations", False),
+        ("short_metadata", False),
+        ("token_gather", False),
+        ("missing_nz", False),
+    ],
+)
+def test_lite_mla_prefill_prolog_admission_preserves_backend_contract(
+    monkeypatch, case, eligible
+):
+    monkeypatch.setattr(
+        "tokenspeed.runtime.models.flash_local_attention.mla_prolog_available",
+        lambda: True,
+    )
+    layer = _layer(True, 8)
+    layer.process_weights_after_loading()
+    layer.attention_backend = "mla"
+    for projection in (layer.q_a_proj, layer.kv_a_proj_with_mqa, layer.q_b_proj):
+        projection._weight_nz_transposed = True
+    hidden = torch.empty(4096, 8, dtype=torch.bfloat16)
+    ctx = _ctx(ForwardMode.EXTEND, torch.empty(4096, 2, 3), [])
+    ctx.bs = ctx.num_extends = 1
+    metadata = ctx.attn_backend.chunked_prefill_metadata
+    metadata.use_absorbed_cached_extend = case != "first_chunk"
+    backing = torch.zeros(70, 64, 1, 4, dtype=torch.bfloat16)
+    ctx.token_to_kv_pool.cache = backing[1:-1]
+    ctx.token_to_kv_pool.arena.kv_page_size = 64
+    ctx.attn_backend.locations = torch.arange(127, 127 + 4096, dtype=torch.int32)
+    comm = None
+    if case == "mixed":
+        ctx.forward_mode = ForwardMode.MIXED
+        ctx.bs = 2
+    elif case == "padded_rows":
+        ctx.input_num_tokens -= 1
+    elif case == "short_locations":
+        ctx.attn_backend.locations = ctx.attn_backend.locations[:-1]
+    elif case == "short_metadata":
+        metadata.extend_seq_lens_cpu = [4095]
+    elif case == "token_gather":
+        comm = SimpleNamespace(
+            layer_id=3,
+            attn_mapping=SimpleNamespace(has_tp=True),
+            prev_is_moe=True,
+            use_all_reduce=lambda _: False,
+        )
+    elif case == "missing_nz":
+        layer.q_b_proj._weight_nz_transposed = False
+    result = layer._mla_prolog_inputs(hidden, ctx, comm, None, None)
+    assert (result is not None) == eligible
+    if eligible:
+        cache, locations = result
+        assert cache.data_ptr() == ctx.token_to_kv_pool.cache.data_ptr()
+        assert cache.stride() == (256, 4, 4, 1)
+        assert cache.storage_offset() == 256
+        assert locations is ctx.attn_backend.locations
+    assert torch.count_nonzero(backing) == 0
+
+
+def test_lite_mla_prefill_prolog_keeps_value_gate_after_attention(monkeypatch):
+    layer = _layer(True, 1)
+    layer.process_weights_after_loading()
+    hidden = torch.randn(2, 8, dtype=torch.bfloat16)
+    events = []
+    ctx = _ctx(ForwardMode.EXTEND, torch.empty(2, 2, 3), events)
+    ctx.bs = ctx.num_extends = 1
+    ctx.attn_backend.supports_mla_projected_value_decode = True
+    locations = torch.tensor([63, 128], dtype=torch.int32)
+    cache = torch.zeros(4, 64, 1, 4, dtype=torch.bfloat16)
+    monkeypatch.setattr(layer, "_mla_prolog_inputs", lambda *args: (cache, locations))
+
+    def project(x, target, slots):
+        assert target is cache and slots is locations
+        events.append("write")
+        return torch.ones(2, 2, 4, dtype=torch.bfloat16)
+
+    def attention(q, k, context, slots, output, *, record_kv_cache, output_gate):
+        assert events == ["write"]
+        assert context is ctx and slots is locations and k is None
+        assert record_kv_cache is None and output_gate is None
+        events.append("attention")
+        output.fill_(1.0)
+        return output
+
+    monkeypatch.setattr(layer, "_project_q_with_mla_prolog", project)
+    monkeypatch.setattr(layer, "forward_absorb_attn_v_proj", attention)
+    with torch.no_grad():
+        result = layer(torch.arange(2), hidden, ctx, None, None, None)
+        expected = layer.o_proj(
+            torch.sigmoid(layer.g_proj(hidden)[0].float()).to(hidden.dtype)
+        )[0]
+    torch.testing.assert_close(result, expected, rtol=0, atol=0)
+    assert events == ["write", "attention"]

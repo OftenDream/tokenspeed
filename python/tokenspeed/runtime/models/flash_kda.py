@@ -42,6 +42,7 @@ from transformers import PretrainedConfig as _PretrainedConfig
 from tokenspeed.runtime.configs.flash_kda_config import FLASHLocalConfig
 from tokenspeed.runtime.configs.utils import get_rope_theta as _get_rope_theta
 from tokenspeed.runtime.distributed.comm_manager import CommManager as _CommManager
+from tokenspeed.runtime.distributed.comm_ops import all_reduce
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.forward_step import (
@@ -620,8 +621,10 @@ class FLASHLocalMoE(nn.Module):
         )
         # Fused MoE kernels still read every selected expert id while building
         # the dispatch plan, so zero-expert slots must keep a valid id.
-        topk_output.topk_ids[zero_expert_mask] = 0
-        topk_output.topk_weights[zero_expert_mask] = 0.0
+        # Boolean indexing lowers to dynamic NonZero on NPU and cannot be
+        # captured. Masked fills retain the buffers and their static shapes.
+        topk_output.topk_ids.masked_fill_(zero_expert_mask, 0)
+        topk_output.topk_weights.masked_fill_(zero_expert_mask, 0.0)
 
         if self.zero_expert_type in ("identity", "copy"):
             zero_weight = zero_expert_weights.sum(dim=-1, keepdim=True).to(
@@ -1243,6 +1246,16 @@ class FLASHLocalDecoderLayer(nn.Module):
         ctx: ForwardContext,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if isinstance(self.self_attn, SeparateProjectionKimiLinearMLAAttention):
+            component = self.self_attn.component_mapping
+            if component.tp_size > 1:
+                # Keep projection partials and the head sum in FP32, then
+                # restore the residual dtype exactly once before normalization.
+                hidden_states = all_reduce(
+                    hidden_states.float(),
+                    component.tp_group,
+                    backend=None,
+                    op=torch.distributed.ReduceOp.SUM,
+                ).to(residual.dtype)
             return self.post_attention_layernorm(hidden_states, residual)
         return self.moe_comm.post_attn_reduce_norm(hidden_states, residual, ctx)
 

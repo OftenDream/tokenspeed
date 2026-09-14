@@ -74,6 +74,13 @@ capture 与 replay 必须保持：
 5. graph capture warmup 不得污染 request slot、null page、KDA recurrent state 或 OE context；
 6. 服务 ready 后不得再出现 capture，不允许未记录的 eager fallback。
 
+Zero-expert routing keeps the top-k ID and weight buffers in place with
+`masked_fill_`. Boolean-index assignment lowers to `NonZero` on NPU and
+requires a host synchronization that capture rejects. The identity/copy
+contribution uses the original zero-expert weights; routed slots then carry
+ID 0 and weight 0. The changed-route replay regression is
+`test/runtime/test_lite_zero_expert_graph.py`.
+
 同步 finite probe 包含 host scalar read，不放入 graph 体也不用它证明 replay 数值。graph
 正确性由组件 pointer/state 对齐、executor 的 post-replay NaN guard 和真实服务输出共同
 证明；如这些证据不足以覆盖某个实际失败，只在 graph 外增加最小的 test-only
