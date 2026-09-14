@@ -30,7 +30,7 @@ from tokenspeed_kernel.ops.over_embedding import (
 )
 
 torch_npu = pytest.importorskip("torch_npu")
-pytest.importorskip("flash_npu_kernel")
+pytest.importorskip("flash_ops")
 
 
 @pytest.mark.skipif(not torch.npu.is_available(), reason="requires Ascend NPU")

@@ -27,10 +27,10 @@ import torch
 
 def _load_flash_oe_ops() -> None:
     try:
-        import flash_npu_kernel  # noqa: F401
+        import flash_ops  # noqa: F401
     except ImportError as exc:
         raise RuntimeError(
-            "flash_npu_kernel with LongCat OE operators is required"
+            "flash_ops with the standard LongCat OE operator is required"
         ) from exc
     required = (
         "npu_append_packed_oe_lookup",
@@ -39,7 +39,7 @@ def _load_flash_oe_ops() -> None:
     missing = [name for name in required if not hasattr(torch.ops.flash, name)]
     if missing:
         raise RuntimeError(
-            "flash_npu_kernel is missing required OE operators: " + ", ".join(missing)
+            "flash_ops is missing required OE operators: " + ", ".join(missing)
         )
 
 
