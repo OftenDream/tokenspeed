@@ -100,8 +100,9 @@ class FLASHLocalCheckpointLayout:
                 yield f"{core}.o_norm.weight"
                 yield f"{core}.o_proj.weight"
             else:
+                if self.config.mla_use_output_gate:
+                    yield f"{attention}.g_proj.weight"
                 for suffix in (
-                    "g_proj.weight",
                     "q_a_proj.weight",
                     "q_a_layernorm.weight",
                     "q_b_proj.weight",
@@ -337,6 +338,8 @@ class FLASHLocalCheckpointLayout:
                 config.num_attention_heads * config.v_head_dim,
             ),
         }
+        if not config.mla_use_output_gate:
+            shapes.pop("g_proj.weight")
         if suffix not in shapes:
             raise ValueError(f"Unexpected Lite MLA weight {name!r}.")
         return self._replicated(name, shapes[suffix])

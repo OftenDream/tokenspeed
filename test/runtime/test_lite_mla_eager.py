@@ -33,7 +33,7 @@ from tokenspeed.runtime.models.flash_local_attention import (
 _NPU_AVAILABLE = hasattr(torch, "npu") and torch.npu.is_available()
 
 
-def _config():
+def _config(use_output_gate):
     return SimpleNamespace(
         hidden_size=8,
         num_attention_heads=2,
@@ -45,7 +45,7 @@ def _config():
         rms_norm_eps=1e-5,
         mla_scale_q_lora=True,
         mla_scale_kv_lora=True,
-        mla_use_output_gate=True,
+        mla_use_output_gate=use_output_gate,
         max_position_embeddings=128,
     )
 
@@ -117,11 +117,11 @@ class _Context:
     input_num_tokens: int
 
 
-def _layer():
+def _layer(use_output_gate):
     torch.manual_seed(5501)
     component = SimpleNamespace(tp_size=1, tp_rank=0, tp_group=(0,))
     layer = SeparateProjectionKimiLinearMLAAttention(
-        _config(),
+        _config(use_output_gate),
         SimpleNamespace(attn=component, mla_weight=component),
         layer_id=3,
     ).to(torch.bfloat16)
@@ -143,7 +143,7 @@ def _ctx(mode, output, events):
 
 
 def test_lite_mla_post_load_scales_once_and_prepares_absorbed_weights():
-    layer = _layer()
+    layer = _layer(True)
     q_weight = layer.q_a_layernorm.weight.detach().clone()
     kv_weight = layer.kv_a_layernorm.weight.detach().clone()
 
@@ -161,8 +161,12 @@ def test_lite_mla_post_load_scales_once_and_prepares_absorbed_weights():
 
 
 @pytest.mark.parametrize("mode", [ForwardMode.EXTEND, ForwardMode.DECODE])
-def test_lite_mla_writes_one_live_cache_before_attention_and_applies_gate(mode):
-    layer = _layer()
+@pytest.mark.parametrize("use_output_gate", [True, False])
+def test_lite_mla_writes_one_live_cache_before_attention_and_applies_gate(
+    mode, use_output_gate
+):
+    layer = _layer(use_output_gate)
+    assert hasattr(layer, "g_proj") is use_output_gate
     layer.process_weights_after_loading()
     hidden = torch.randn(2, 8, dtype=torch.bfloat16)
     events = []
@@ -188,7 +192,7 @@ def test_lite_mla_writes_one_live_cache_before_attention_and_applies_gate(mode):
 
 
 def test_lite_mla_nope_auxiliary_is_preserved_without_rotation():
-    layer = _layer()
+    layer = _layer(True)
     layer.process_weights_after_loading()
     hidden = torch.randn(3, 8, dtype=torch.bfloat16)
     with torch.no_grad():
@@ -216,7 +220,7 @@ def test_lite_mla_nope_auxiliary_is_preserved_without_rotation():
 
 
 def test_lite_mla_cached_extend_uses_absorbed_attention():
-    layer = _layer()
+    layer = _layer(True)
     layer.process_weights_after_loading()
     hidden = torch.randn(2, 8, dtype=torch.bfloat16)
     events = []
@@ -239,7 +243,7 @@ def test_lite_mla_cached_extend_uses_absorbed_attention():
 @pytest.mark.parametrize("mode", [ForwardMode.EXTEND, ForwardMode.DECODE])
 @pytest.mark.skipif(not _NPU_AVAILABLE, reason="Ascend NPU is unavailable")
 def test_ascend_lite_mla_model_path_uses_registered_projection(mode):
-    layer = _layer().to("npu")
+    layer = _layer(True).to("npu")
     layer.process_weights_after_loading()
     hidden = torch.randn(2, 8, dtype=torch.bfloat16, device="npu")
     events = []

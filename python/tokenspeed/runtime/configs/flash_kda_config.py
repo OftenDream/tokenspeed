@@ -635,8 +635,8 @@ class FLASHLocalConfig(PretrainedConfig):
             raise ValueError("moe_topk exceeds the experts available in one group.")
         if self.linear_method.upper() != "FGBKDA" or not self.kda_use_full_rank_gate:
             raise ValueError("Flash-Lite requires FGBKDA with the full-rank gate.")
-        if not (self.kda_nope and self.mla_use_output_gate):
-            raise ValueError("Flash-Lite requires NoPE MLA with the output gate.")
+        if not self.kda_nope:
+            raise ValueError("Flash-Lite requires NoPE MLA.")
         if not self.use_mla or self.attention_method.upper() != "MLA":
             raise ValueError("Flash-Lite requires the hybrid MLA attention path.")
         if self.zero_expert_type != "identity":
