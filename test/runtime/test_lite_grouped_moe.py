@@ -34,12 +34,64 @@ from torch.nn import functional as F
 from tokenspeed.runtime.configs.flash_kda_config import FLASHLocalConfig
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
-from tokenspeed.runtime.models.flash_kda import FLASHLocalForCausalLM
+from tokenspeed.runtime.models.flash_kda import (
+    FLASHLocalDecoderLayer,
+    FLASHLocalForCausalLM,
+)
 from tokenspeed.runtime.models.flash_local_moe import (
     GroupAwareFlashLocalMoE,
     gmoe_local_expert_ids,
     gmoe_topology,
 )
+
+
+@pytest.mark.parametrize("ep_size", (8, 16))
+def test_group_aware_tp8_keeps_replicated_token_rows(monkeypatch, ep_size) -> None:
+    from tokenspeed.runtime.distributed import comm_manager
+
+    config = FLASHLocalConfig.from_dict(lite_config_dict())
+    topology = Mapping(
+        rank=0,
+        world_size=ep_size,
+        nprocs_per_node=ep_size,
+        attn_tp_size=8,
+        linear_attn_tp_size=8,
+        mla_weight_tp_size=1,
+        dense_tp_size=8,
+        moe_tp_size=1,
+        moe_ep_size=ep_size,
+    )
+    layer = FLASHLocalDecoderLayer(
+        config=config,
+        mapping=topology,
+        layer_id=0,
+        quant_config=None,
+        prefix="",
+        alt_stream=None,
+    )
+    assert not layer.moe_comm.is_moe
+    x = torch.arange(32 * 96, dtype=torch.float32).reshape(32, 96)
+    residual = torch.ones_like(x)
+    calls = []
+
+    def reduce(partial, group):
+        calls.append(tuple(group))
+        return partial * len(group)
+
+    def unexpected_scatter(*args, **kwargs):
+        raise AssertionError("TP-replicated group-aware rows must not be scattered")
+
+    monkeypatch.setattr(comm_manager, "all_reduce", reduce)
+    monkeypatch.setattr(comm_manager, "token_reduce_scatter", unexpected_scatter)
+    result, kept_residual = layer.moe_comm.post_attn_comm(
+        x,
+        residual,
+        SimpleNamespace(global_num_tokens=[32] * ep_size, input_num_tokens=32),
+    )
+    assert result.shape == (32, 96)
+    assert torch.equal(result, x * 8)
+    assert kept_residual is residual
+    assert calls == [tuple(range(8))]
 
 
 def test_lite_group_aware_moe_import_does_not_require_accelerator() -> None:

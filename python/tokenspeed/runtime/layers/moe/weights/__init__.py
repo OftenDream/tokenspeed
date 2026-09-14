@@ -70,12 +70,14 @@ def create_layer_weights(
             create_int8_weight_pair,
         )
 
+        int8_config = getattr(quant_config, "config", None) or {}
         create_int8_weight_pair(
             spec,
             layer,
             smooth_quant=bool(
-                (getattr(quant_config, "config", None) or {}).get(
-                    "enable_smooth_quant", False
+                int8_config.get(
+                    "moe_enable_smooth_quant",
+                    int8_config.get("enable_smooth_quant", False),
                 )
             ),
         )

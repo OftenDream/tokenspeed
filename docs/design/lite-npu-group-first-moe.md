@@ -7,6 +7,17 @@ implementation. Strategy selection does not inspect the accelerator type.
 ## Contract
 
 The group-aware path uses one group-first layout for both Prefill and Decode.
+The strict checkpoint ledger follows the instantiated shared MLP's weight dtype,
+not the device type. INT8 shared gate/up/down projections require INT8 weights
+and FP32 per-output-channel `weight_scale` tensors of shape `[output, 1]`.
+Unquantized shared projections retain BF16 weights without scale sidecars.
+Checkpoint tensors remain in standard dense layout; backend preparation owns NZ
+conversion. Routed expert SmoothQuant is independent of shared linear scales.
+`quantization_config.moe_enable_smooth_quant` scopes SmoothQuant sidecars to the
+routed experts; when absent, the existing global `enable_smooth_quant` flag is
+retained as the fallback. Dense INT8 SmoothQuant remains unsupported and still
+fails explicitly. A routed-only flag must not request dense SmoothQuant.
+
 For `W` model ranks and `G` logical MoE groups:
 
 ```text
@@ -35,6 +46,14 @@ The two AllToAll operations use equal first-dimension splits. Both roles must
 therefore enter this path with the same padded token capacity on every rank;
 their actual token count and graph policy may differ, but the MoE algorithm does
 not.
+
+The enclosing decoder retains the dense/attention token layout when using
+group-aware MoE: this module owns the expert exchange and returns complete rows,
+so its EP size must not trigger another generic pre-MoE ReduceScatter. With
+attention/KDA/dense TP8, each TP group may feed the same 32 rows on all eight
+ranks. Those are 32 unique requests per TP group, not 256 independent requests.
+KDA partials still require their TP reduction; replicated MLA outputs do not.
+This does not introduce an independent-token sharding strategy.
 
 ### Precision matrix and persistent stability tests
 

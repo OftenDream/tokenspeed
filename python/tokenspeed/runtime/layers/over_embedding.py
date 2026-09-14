@@ -99,6 +99,30 @@ def _spec(
 # directly rather than dispatching through model-specific factory functions.
 _LONGCAT_OE_SPEC_BY_CONFIG: dict[_LongCatOeConfig, OverEmbeddingSpec] = {
     **{
+        (163840, 4096, 5, 4, 5008098, tp_size, rank): _spec(
+            profile="longcat-lite",
+            vocab_size=163840,
+            hidden_size=4096,
+            max_ngram_order=5,
+            hashes_per_order=4,
+            modulus0=5008098,
+            tp_size=tp_size,
+            tp_rank=rank,
+            branch_width=256,
+            fragments=tuple(
+                _fragment(
+                    branch_id,
+                    hashes_per_order=4,
+                    modulus0=5008098,
+                    feature_width=256,
+                )
+                for branch_id in range(rank, 16, tp_size)
+            ),
+        )
+        for tp_size in (8, 16)
+        for rank in range(tp_size)
+    },
+    **{
         (163840, 8192, 5, 4, 16476898, 8, rank): _spec(
             profile="longcat-2.0",
             vocab_size=163840,

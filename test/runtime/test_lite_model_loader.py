@@ -114,7 +114,7 @@ def mapping(world_size=1, rank=0, role="prefill"):
         linear_attn=SimpleNamespace(tp_size=size, tp_rank=rank, tp_group=world_group),
         mla_weight=SimpleNamespace(tp_size=1, tp_rank=0, tp_group=(rank,)),
         moe=SimpleNamespace(
-            tp_size=1, ep_size=size, ep_rank=rank, ep_group=world_group
+            tp_size=1, tp_rank=0, ep_size=size, ep_rank=rank, ep_group=world_group
         ),
         attn=SimpleNamespace(
             tp_size=size if replicated else 1,
@@ -170,6 +170,7 @@ def test_lite_strict_layout_describes_w8a8_expert_sidecars():
     config = FLASHLocalConfig.from_dict(lite_config_dict())
     layout = FLASHLocalCheckpointLayout(
         config,
+        shared_quant_kind="unquant",
         moe_quant_kind="int8",
         moe_smooth_quant=True,
     )
@@ -211,6 +212,82 @@ def test_lite_config_exposes_linear_tp_cache_geometry():
     assert conv_dtype == torch.bfloat16
     assert state_dtype == torch.float32
     assert layer_ids == config.linear_layer_ids
+
+
+@pytest.mark.parametrize("kind", ["unquant", "int8"])
+def test_lite_shared_checkpoint_weights_and_scales(kind):
+    config = FLASHLocalConfig.from_dict(lite_config_dict())
+    layout = FLASHLocalCheckpointLayout(config, shared_quant_kind=kind)
+    names = set(layout.iter_source_names())
+    prefix = "model.layers.0.mlp.shared_experts"
+    for projection in ("gate", "up", "down"):
+        name = f"{prefix}.{projection}_proj.weight"
+        assert layout.spec(name).dtype == (
+            torch.int8 if kind == "int8" else torch.bfloat16
+        )
+        scale = name + "_scale"
+        if kind == "int8":
+            assert scale in names
+            assert layout.spec(scale).dtype == torch.float32
+            assert layout.spec(scale).shape == (96, 1)
+        else:
+            assert scale not in names
+            with pytest.raises(ValueError, match="Unexpected Lite checkpoint"):
+                layout.spec(scale)
+
+
+def test_lite_strict_shared_int8_loads_weight_and_channel_scales():
+    from tokenspeed.runtime.layers.quantization.compressed_tensors.compressed_tensors import (
+        CompressedTensorsConfig,
+    )
+
+    quant = CompressedTensorsConfig.from_config(
+        {
+            "format": "int-quantized",
+            "quant_method": "compressed-tensors",
+            "moe_enable_smooth_quant": True,
+            "ignore": ["lm_head", "re:.*self_attn.*", "re:.*embed_tokens.*"],
+            "config_groups": {
+                "group_0": {
+                    "targets": ["Linear"],
+                    "weights": {
+                        "num_bits": 8,
+                        "type": "int",
+                        "strategy": "channel",
+                        "symmetric": True,
+                        "dynamic": False,
+                    },
+                    "input_activations": {
+                        "num_bits": 8,
+                        "type": "int",
+                        "strategy": "token",
+                        "symmetric": True,
+                        "dynamic": True,
+                    },
+                }
+            },
+        }
+    )
+    config = FLASHLocalConfig.from_dict(lite_config_dict())
+    model = FLASHLocalForCausalLM(
+        config, mapping(8, rank=1), quant_config=quant, oe_table_placement="host"
+    )
+    assert model.checkpoint_layout.shared_quant_kind == "int8"
+    assert model.checkpoint_layout.moe_smooth_quant
+    assert hasattr(model.model.layers[0].moe.experts, "w13_smooth_scale")
+    assert hasattr(model.model.layers[0].moe.experts, "w2_smooth_scale")
+
+    def values(_index, name, tensor):
+        if ".shared_experts." in name:
+            return tensor.fill_(0.125 if name.endswith("weight_scale") else 3)
+        return tensor
+
+    model.load_weights(weights(model.checkpoint_layout, values))
+    shared = model.model.layers[0].moe.shared_experts
+    for layer in (shared.gate_up_proj, shared.down_proj):
+        assert layer.weight.dtype == torch.int8
+        assert torch.all(layer.weight == 3)
+        assert torch.all(layer.weight_scale == 0.125)
 
 
 def test_lite_config_fails_closed_on_raw_checkpoint_fields():
@@ -283,7 +360,7 @@ def test_real_layout_has_exact_source_count_and_shapes():
             ngram_vocab_size_ratio=59.604,
         )
     )
-    layout = FLASHLocalCheckpointLayout(config)
+    layout = FLASHLocalCheckpointLayout(config, shared_quant_kind="unquant")
     names = list(layout.iter_source_names())
 
     assert len(names) == len(set(names)) == 129_878
@@ -598,3 +675,38 @@ def test_strict_loader_rejects_incomplete_or_ambiguous_stream(case, message):
 
     with pytest.raises(ValueError, match=message):
         model.load_weights(checkpoint)
+
+
+@pytest.mark.parametrize("filtered", [False, True])
+@pytest.mark.parametrize("missing_local", [False, True])
+def test_strict_loader_allows_only_nonlocal_oe_sources_to_be_omitted(
+    filtered, missing_local
+):
+    config = FLASHLocalConfig.from_dict(lite_config_dict())
+    model = FLASHLocalForCausalLM(
+        config, mapping(8, rank=0, role="replicated"), oe_table_placement="host"
+    )
+    checkpoint = list(weights(model.checkpoint_layout))
+    nonlocal_names = {
+        name for name, _ in checkpoint if not model.checkpoint_weight_name_filter(name)
+    }
+    assert nonlocal_names
+    if filtered:
+        checkpoint = [
+            (name, value) for name, value in checkpoint if name not in nonlocal_names
+        ]
+    if missing_local:
+        local_oe = next(
+            name
+            for name, _ in checkpoint
+            if ".embedders." in name and name not in nonlocal_names
+        )
+        checkpoint = [(name, value) for name, value in checkpoint if name != local_oe]
+    with mock.patch.object(model, "post_load_weights") as post_load:
+        if missing_local:
+            with pytest.raises(ValueError, match="missing 1 source"):
+                model.load_weights(checkpoint)
+            post_load.assert_not_called()
+        else:
+            model.load_weights(checkpoint)
+            post_load.assert_called_once_with()

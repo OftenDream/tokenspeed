@@ -85,6 +85,8 @@ def _history_view(
         (3072, 4, 4718593, 4, 768, [4718593, 4718601, 4718609]),
         (3072, 4, 4718593, 8, 384, [4718593, 4718609]),
         (4096, 5, 9765520, 8, 512, [9765520, 9765536]),
+        (4096, 5, 5008098, 8, 512, [5008098, 5008114]),
+        (4096, 5, 5008098, 16, 256, [5008098]),
     ),
 )
 def test_oe_configuration_registry_matches_checkpoint_geometry(
@@ -108,6 +110,28 @@ def test_oe_configuration_registry_matches_checkpoint_geometry(
     assert spec.branch_count == (max_ngram_order - 1) * 4
     assert spec.local_width == expected_width
     assert [fragment.modulus for fragment in spec.fragments] == expected_moduli
+
+
+@pytest.mark.parametrize("tp_size", (8, 16))
+def test_lite_4096_ratio_30567_oe_ownership_covers_all_branches(tp_size: int) -> None:
+    owned = []
+    for rank in range(tp_size):
+        spec = resolve_longcat_oe_spec(
+            vocab_size=163840,
+            hidden_size=4096,
+            max_ngram_order=5,
+            hashes_per_order=4,
+            modulus0=5008098,
+            tp_size=tp_size,
+            tp_rank=rank,
+        )
+        assert spec.local_width == 4096 // tp_size
+        for fragment in spec.fragments:
+            assert fragment.feature_begin == 0
+            assert fragment.feature_width == 256
+            assert fragment.modulus == 5008098 + 2 * fragment.branch_id
+            owned.append(fragment.branch_id)
+    assert sorted(owned) == list(range(16))
 
 
 def test_projection_preserves_word_embedding_for_bypassed_tokens() -> None:

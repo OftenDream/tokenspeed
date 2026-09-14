@@ -1187,13 +1187,13 @@ class FLASHLocalDecoderLayer(nn.Module):
             self.input_layernorm.to(dtype=torch.bfloat16)
             self.post_attention_layernorm.to(dtype=torch.bfloat16)
 
-        # CommManager: plain pre-attn / post-attn / pre-mlp / post-mlp fusion.
-        # The MoE block uses its own CommManager scope (is_moe=True) for the
-        # routed expert all-reduce.
+        # Group-aware MoE owns its expert exchange and returns complete output
+        # rows. Keep the surrounding dense/attention token layout; its EP size
+        # must not cause an extra generic pre-MoE ReduceScatter.
         self.moe_comm = _CommManager(
             mapping=mapping,
             layer_id=self.layer_id,
-            is_moe=True,
+            is_moe=not isinstance(self.moe, GroupAwareFlashLocalMoE),
             prev_is_moe=False,
             input_layernorm=self.input_layernorm,
             post_attn_layernorm=self.post_attention_layernorm,
@@ -1496,13 +1496,16 @@ class FLASHLocalForCausalLM(BaseCausalLM):
                 add_prefix("model.layers.0.moe", prefix)
             )
         )
+        moe_quant_settings = getattr(moe_quant_config, "config", None) or {}
         self.checkpoint_layout = (
             FLASHLocalCheckpointLayout(
                 config,
+                shared_quant_kind="unquant",
                 moe_quant_kind=moe_quant_kind,
                 moe_smooth_quant=bool(
-                    (getattr(moe_quant_config, "config", None) or {}).get(
-                        "enable_smooth_quant", False
+                    moe_quant_settings.get(
+                        "moe_enable_smooth_quant",
+                        moe_quant_settings.get("enable_smooth_quant", False),
                     )
                 ),
             )
@@ -1515,6 +1518,18 @@ class FLASHLocalForCausalLM(BaseCausalLM):
             quant_config=quant_config,
             prefix=prefix,
         )
+
+        if self.checkpoint_layout is not None:
+            shared_dtypes = {
+                layer.moe.shared_experts.gate_up_proj.weight.dtype
+                for layer in self.model.layers
+                if hasattr(layer, "moe")
+            }
+            if len(shared_dtypes) > 1:
+                raise ValueError("Flash-Lite requires uniform shared expert dtypes.")
+            self.checkpoint_layout.shared_quant_kind = (
+                "int8" if shared_dtypes == {torch.int8} else "unquant"
+            )
 
     def resolve_model(
         self,

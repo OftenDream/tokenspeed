@@ -78,7 +78,9 @@ def test_checkpoint_sources_preserve_current_physical_layouts(
     flash_target: str,
     lite_target: str,
 ) -> None:
-    layout = FLASHLocalCheckpointLayout(FLASHLocalConfig.from_dict(lite_config_dict()))
+    layout = FLASHLocalCheckpointLayout(
+        FLASHLocalConfig.from_dict(lite_config_dict()), shared_quant_kind="unquant"
+    )
 
     assert _canonical_flash_kda_weight_name(source_name) == flash_target
     assert layout.spec(source_name).target_name == lite_target

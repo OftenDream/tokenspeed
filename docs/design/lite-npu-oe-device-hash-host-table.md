@@ -30,6 +30,12 @@ through the Host mapping. This new 4096-hidden layout is currently registered
 for TP8 only. Its `oe_vocab_size_ratio=59.604` gives
 `modulus0=int(163840*59.604)+1=9765520`.
 
+The 4096-hidden geometry with `oe_vocab_size_ratio=30.567` is also registered:
+`modulus0=int(163840*30.567)+1=5008098`. It keeps the same 16 branches of
+width 256. TP8 owns branches `r` and `r+8`; TP16 owns branch `r`, with local
+lookup/projection width 256. Both layouts cover every branch exactly once,
+without splitting table rows or changing the hash/lookup implementation.
+
 The existing 3072-hidden checkpoint remains supported. Its
 `oe_neighbor_num=4`, `oe_split_num=4` layout has 12 branches: TP4 owns three
 complete branches `r/r+4/r+8` (local width 768), while TP8 owns complete branch
@@ -38,6 +44,11 @@ complete branches `r/r+4/r+8` (local width 768), while TP8 owns complete branch
 Host loading adopts each local safetensors tensor without a copy. Both local
 branches are row-contiguous `[rows, 256]` mappings, preserving file-backed mmap
 storage and avoiding a multi-GiB anonymous copy.
+
+Checkpoint shard filtering may omit files containing only non-local OE branches.
+The strict loader requires every local source, but permits those non-local OE
+sources to be absent. If a mixed shard still yields them, their shape, dtype and
+uniqueness are validated normally; filtering never relaxes local-weight checks.
 
 The local projection is `[512, 4096]`. The portable Torch `project_add_word_`
 path combines the local word and OE partials with the checkpoint normalization.

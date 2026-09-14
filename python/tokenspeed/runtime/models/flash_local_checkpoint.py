@@ -66,10 +66,14 @@ class FLASHLocalCheckpointLayout:
         *,
         moe_quant_kind: str = "unquant",
         moe_smooth_quant: bool = False,
+        shared_quant_kind: str,
     ) -> None:
         self.config = config
         self.moe_quant_kind = moe_quant_kind
         self.moe_smooth_quant = moe_smooth_quant
+        if shared_quant_kind not in {"unquant", "int8"}:
+            raise ValueError(f"Unsupported shared expert dtype {shared_quant_kind!r}.")
+        self.shared_quant_kind = shared_quant_kind
 
     def iter_source_names(self) -> Iterator[str]:
         yield "model.embed_tokens.weight"
@@ -100,6 +104,8 @@ class FLASHLocalCheckpointLayout:
             yield f"{prefix}.mlp.proj_output.weight"
             for projection in ("gate_proj", "up_proj", "down_proj"):
                 yield f"{prefix}.mlp.shared_experts.{projection}.weight"
+                if self.shared_quant_kind == "int8":
+                    yield f"{prefix}.mlp.shared_experts.{projection}.weight_scale"
 
             attention = f"{prefix}.self_attn"
             if self.config.is_kda_layer(layer_id):
@@ -245,21 +251,44 @@ class FLASHLocalCheckpointLayout:
                 expert_id=expert_id,
             )
 
+        shared_match = re.fullmatch(
+            r"mlp\.shared_experts\.(gate|up|down)_proj\.(weight|weight_scale)",
+            suffix,
+        )
+        if shared_match:
+            projection, tensor_kind = shared_match.groups()
+            intermediate = config.ffn_hidden_size * getattr(
+                config, "n_shared_experts", 1
+            )
+            output_size, input_size = (
+                (config.hidden_size, intermediate)
+                if projection == "down"
+                else (intermediate, config.hidden_size)
+            )
+            if tensor_kind == "weight_scale":
+                if self.shared_quant_kind != "int8":
+                    raise ValueError(f"Unexpected Lite checkpoint weight {name!r}.")
+                shape, dtype = (output_size, 1), torch.float32
+                shard_axis = None if projection == "down" else 0
+            else:
+                shape = (output_size, input_size)
+                dtype = (
+                    torch.int8 if self.shared_quant_kind == "int8" else torch.bfloat16
+                )
+                shard_axis = 1 if projection == "down" else 0
+            return FLASHLocalWeightSpec(
+                name,
+                name,
+                shape,
+                dtype,
+                "dense-shard",
+                "dense" if shard_axis is not None else None,
+                shard_axis,
+            )
+
         dense_shapes = {
             "mlp.proj_input.weight": (config.hidden_size, config.hidden_size),
             "mlp.proj_output.weight": (config.hidden_size, config.hidden_size),
-            "mlp.shared_experts.gate_proj.weight": (
-                config.ffn_hidden_size,
-                config.hidden_size,
-            ),
-            "mlp.shared_experts.up_proj.weight": (
-                config.ffn_hidden_size,
-                config.hidden_size,
-            ),
-            "mlp.shared_experts.down_proj.weight": (
-                config.hidden_size,
-                config.ffn_hidden_size,
-            ),
         }
         if suffix in dense_shapes:
             shard_axis = (
