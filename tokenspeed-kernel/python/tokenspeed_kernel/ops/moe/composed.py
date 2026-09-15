@@ -82,9 +82,11 @@ def gmoe_post(
         topk_ids >= context.num_experts,
         topk_weights,
         torch.zeros_like(topk_weights),
-    ).sum(dim=-1, keepdim=True)
-    routed = routed + inputs.local_received * identity_weight.to(
-        inputs.local_received.dtype
+    ).sum(dim=-1, keepdim=True, dtype=torch.float32)
+    # Keep identity weights and the weighted addition in FP32. Round only the
+    # combined result, not the weight and identity product independently.
+    routed = (routed.float() + inputs.local_received.float() * identity_weight).to(
+        routed.dtype
     )
     restored = torch.empty_like(routed)
     context.all_to_all(restored, routed.contiguous(), context.exchange_group)

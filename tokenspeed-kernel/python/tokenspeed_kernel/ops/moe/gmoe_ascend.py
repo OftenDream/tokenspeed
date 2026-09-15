@@ -79,7 +79,7 @@ if current_platform().is_npu:
         return prepare(context, device=device, options=options)
 
     def prepare_router_ffn(context, *, device, options):
-        options = dict(options)
+        options = {"router_cores": 24, **options}
         binding = options.pop("ffn_binding", None)
         shared = prepare_shared_ffn(context.shared_experts, binding=binding)
         context = prepare_router(context, device=device, options=options)
@@ -128,15 +128,15 @@ if current_platform().is_npu:
             exchange.check_router_shape(tokens, hidden, context.top_k)
         else:
             exchange.check_shape(tokens, hidden)
-        projected = context.proj_input(hidden_states)
-        # Fork before norm/scale, but after projection: overlapping both GEMMs
-        # regresses the limited shared stream on the validated decode workload.
+        # Shared consumes the original input, not its projection. Fork after
+        # input production so projection/norm/dispatch can hide shared work.
         shared_output, shared_wait = exchange.run_shared(
             context.prepared_shared if fused_shared else context.shared_experts,
             hidden_states,
         )
+        projected = context.proj_input(hidden_states)
         projected = context.norm(projected)
-        grouped = (projected * context.norm_scale).view(tokens, context.num_groups, -1)
+        grouped = projected.view(tokens, context.num_groups, -1)
         if fused_router:
             received, weights, ids = exchange.exchange_router(
                 grouped,
@@ -144,9 +144,10 @@ if current_platform().is_npu:
                 context.top_k,
                 context.routed_scaling_factor,
                 context.renormalize_topk,
+                input_scale=context.norm_scale,
             )
         else:
-            received = exchange.exchange(grouped)
+            received = exchange.exchange(grouped, input_scale=context.norm_scale)
             weights, ids = context.route(received)
         local_rows = tokens * context.num_groups
         local_received = received.narrow(0, context.egp_rank * local_rows, local_rows)

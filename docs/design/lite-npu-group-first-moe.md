@@ -47,6 +47,13 @@ therefore enter this path with the same padded token capacity on every rank;
 their actual token count and graph policy may differ, but the MoE algorithm does
 not.
 
+The composed path's HCCL token ReduceScatter passes equal-sized, contiguous
+rank slices directly to the collective: it does not allocate/zero a padding
+buffer or copy the slices into one. Noncontiguous equal-sized inputs need only
+the layout conversion. Unequal token splits retain zero padding and unpacking;
+single-rank output copy semantics are unchanged. This affects buffer preparation,
+not the reduction dtype, reduction order, or group membership.
+
 The enclosing decoder retains the dense/attention token layout when using
 group-aware MoE: this module owns the expert exchange and returns complete rows,
 so its EP size must not trigger another generic pre-MoE ReduceScatter. With
@@ -417,12 +424,12 @@ retained for A/B testing; the init-routing through finalize-routing leaf is
 unchanged. Projection, normalization, scaling, router and shared MLP still use
 their existing operators and weights, including W8A8 NZ preparation.
 
-Shared computation starts after input projection, before norm/scale, and overlaps
+Shared computation starts before input projection and overlaps
 **forward dispatch**, not zero-expert combine:
 
 ```text
-projection
-  main stream:   norm / scale -> fused A2A+AG -> router -> wait shared
+input ready
+  main stream:   projection -> norm / scale -> fused A2A+AG -> router -> wait shared
   shared stream: limited shared MLP -> event --------------^
 -> unchanged init-routing ... finalize-routing
 -> fused RS + zero expert + A2A -> output projection + shared add
@@ -514,8 +521,17 @@ FFN together with dispatch/router fusion. Keep `gmoe_post_solution="flash_npu"`
 and set `gmoe_exchange_options.ffn_binding` to the deployed FFN binding. This is
 opt-in: automatic selection and the serial shared default remain unchanged.
 Set `shared_overlap=true` to test the existing limited shared stream with this
-FFN. Core quotas are unchanged: shared 4 Cube / 8 Vector, dispatch/router
-20 Cube / 40 Vector. Input/event waits and the join before init routing remain.
+FFN. This solution defaults to 24 router AIV workers: shared 8 Cube / 16 Vector,
+dispatch/router 16 Cube / 32 Vector on a 24-Cube/48-Vector device. Shared forks
+before input projection and still joins before init routing. Its input wait
+covers original hidden-state production; it does not wait for projection.
+Projection remains on the unrestricted main stream, so contention between the
+two GEMMs must be measured, not assumed absent. Explicit quota overrides remain
+supported and overcommit is rejected. Setting router_cores=32 restores the
+previous default shared quota of 4 Cube / 8 Vector. The router-only solution
+retains its 32-AIV default. This changes framework scheduling/attributes only,
+not operator source or weight layout. Historical results below retain their
+original schedules and quotas and do not validate the new defaults.
 
 The FFN supports bias-free, unclamped TP1 BF16 and symmetric dynamic-token W8A8.
 W8A8 fuses input dynamic quant, MM13, dequant/SwiGLU/requant and MM2/dequant in
@@ -573,7 +589,27 @@ The fused kernel performs input A2A, then computes router on `G*T` local rows
 while gathering hidden, followed by gathering its TopK weights/IDs. It returns
 hidden `[EP*T,H/G]` and group-local routes `[EP*T,K]` in the existing order.
 The local hidden narrow-view remains the source for zero experts in combine.
-The shared expert forks after projection but before norm/scale, overlaps dispatch, and joins before init-routing;
+Optional Ascend pre-stages now pass the RMSNorm output and an explicit
+`input_scale=context.norm_scale` to dispatch, instead of launching a separate
+cast/multiply/cast before A2A. After A2A, dispatch converts the local received
+rows to FP32 and multiplies there. Fused routing consumes these FP32 values
+directly; the returned expert input is rounded once to BF16 (or FP16 for FP16
+input). Both ordinary and zero experts therefore still consume scaled input.
+Shared experts continue to consume the original, unprojected hidden states.
+
+With EGP>1, hidden AG waits for every router conversion worker's scaled-payload
+publication, then overlaps router GEMM/TopK. With EGP=1, output copying follows
+router completion so reclaimed communication workers cannot wait on themselves.
+Chunked dispatch propagates the same scalar to every token tile. `input_scale`
+is distinct from `routed_scaling_factor`, which scales selected route weights.
+Preparation requires binding capability bit 1 and a matching rebuilt OPP;
+the default scale of 1 preserves standalone operator callers. The composed
+implementation remains the unfused control. For non-power-of-two scales its
+BF16-rounded router input differs intentionally from the new FP32 router input;
+do not claim universal bitwise route equivalence. Check near-tie IDs against
+higher precision scores as well as route-weight error and output stability.
+
+The shared expert forks before projection, overlaps dispatch, and joins before init-routing;
 it does not overlap the later combine. FP32 routing avoids a BF16 classifier
 conversion, but floating reduction order can differ: route IDs are tested
 exactly and weights numerically, not assumed bitwise identical.
@@ -624,7 +660,7 @@ shared quota. Separate eager traces retain input shapes when graph replay
 does not. `summarize_lite_moe_router_timeline.py` verifies ten fused calls per
 rank, absence of separate TopK in the new trace, and shared-stream overlap.
 
-The current pre-stage forks shared after input projection but before norm and
+The previously measured pre-stage forked shared after input projection but before norm and
 scale. Shared consumes the original hidden states; its stream wait deliberately
 includes input projection to avoid overlapping the two input GEMMs. Moving it
 ahead of projection was also tested: the shared gate/up GEMM increased from
@@ -788,8 +824,19 @@ placement remain visible in profiling:
   before the reverse group exchange.
 
 The composed identity epilogue remains separate as the correctness/performance
-control. The optional fused post-stage applies the same identity contribution
-once, after its RS, in the split-core restore operator described above.
+control. Its identity route weights are summed in FP32; both the group input
+and the reduced real-expert output are promoted to FP32 for the weighted
+addition. Only the combined result is rounded back to the routed tensor dtype
+before reverse AllToAll. Do not round identity weights or their product to BF16
+first: this can discard small identity contributions, especially under
+cancellation. The ReduceScatter dtype and output projection/shared-add
+boundaries are unchanged. This contract applies equally to Prefill and Decode.
+
+The optional fused post-stage applies the identity contribution once, after
+its RS, in the split-core restore operator described above. Its arithmetic is
+not changed by the composed-stage fix; old strict-bit comparison records do
+not establish bitwise agreement with this updated composed epilogue. Validate
+each implementation against its numerical oracle when comparing them.
 
 ## Decode timeline
 

@@ -79,10 +79,14 @@ class GMoEExchange:
                 "Group-first input exceeds the configured zero-restore window"
             )
 
-    def exchange(self, grouped: torch.Tensor) -> torch.Tensor:
+    def exchange(self, grouped: torch.Tensor, *, input_scale: float) -> torch.Tensor:
         self.check_shape(grouped.shape[0], grouped.shape[2])
         return torch.ops.custom.gmoe_dispatch(
-            grouped, self.comm_name, self.world_size, self.egp_size
+            grouped,
+            self.comm_name,
+            self.world_size,
+            self.egp_size,
+            input_scale=input_scale,
         )
 
     def check_router_shape(self, tokens: int, hidden: int, top_k: int) -> None:
@@ -97,7 +101,9 @@ class GMoEExchange:
         if required + self.egp_size * route_bytes > self.window_bytes:
             raise ValueError("Hidden and router metadata exceed the exchange window")
 
-    def exchange_router(self, grouped, router, top_k, scaling_factor, renormalize):
+    def exchange_router(
+        self, grouped, router, top_k, scaling_factor, renormalize, *, input_scale
+    ):
         """Return gathered hidden and routes, computed only on pre-AG local rows."""
         return torch.ops.custom.gmoe_dispatch.router(
             grouped,
@@ -111,6 +117,7 @@ class GMoEExchange:
             renormalize=renormalize,
             router_cores=self.router_cores,
             overlap=True,
+            input_scale=input_scale,
         )
 
     def restore_zero(self, routed, local_received, weights, ids):
@@ -237,11 +244,15 @@ def prepare_gmoe_exchange(
     router_cores = int(options.get("router_cores", 0))
     if router_cores and (not 2 <= router_cores <= 32 or router_cores % 2):
         raise ValueError("router_cores must be zero or even in [2,32]")
-    shared_cube = int(options.get("shared_cube_cores", 4 if router_cores else 8))
-    shared_vector = int(options.get("shared_vector_cores", 8))
     limits = torch.npu.get_device_limit(device)
     main_vector = 8 + router_cores
     main_cube = main_vector // 2 if router_cores else 1
+    shared_cube = int(
+        options.get("shared_cube_cores", min(8, limits["cube_core_num"] - main_cube))
+    )
+    shared_vector = int(
+        options.get("shared_vector_cores", 2 * shared_cube if router_cores else 8)
+    )
     if main_cube > limits["cube_core_num"] or main_vector > limits["vector_core_num"]:
         raise ValueError("Insufficient cores for fused dispatch/router")
     if overlap:
@@ -290,6 +301,12 @@ def prepare_gmoe_exchange(
             )
     if router_cores and not hasattr(torch.ops.custom.gmoe_dispatch, "router"):
         raise RuntimeError("Group-first binding is missing gmoe_dispatch.router")
+    if not hasattr(torch.ops.custom, "gmoe_comm_capabilities") or not (
+        torch.ops.custom.gmoe_comm_capabilities() & 2
+    ):
+        raise RuntimeError(
+            "GMoE input_scale requires the matching updated binding and OPP"
+        )
     process_group = create_group(tuple(ep_group), "gmoe_exchange")
     rank = dist.get_rank(process_group)
     if dist.get_world_size(process_group) != world or ep_group[rank] != dist.get_rank():

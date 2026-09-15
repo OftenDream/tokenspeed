@@ -20,7 +20,7 @@
 
 """Contracts for optional fused exchange, resource isolation and shared overlap."""
 
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from types import SimpleNamespace
 
 import pytest
@@ -73,6 +73,10 @@ def preparation(monkeypatch, tmp_path):
         synchronize=lambda: events.append(("sync",)),
     )
     monkeypatch.setattr(torch, "npu", npu, raising=False)
+    # Pin capabilities: installed extensions must not affect mock-only tests.
+    monkeypatch.setattr(
+        torch.ops.custom, "gmoe_comm_capabilities", lambda: 2, raising=False
+    )
     for name in (
         "gmoe_dispatch",
         "gmoe_combine",
@@ -217,7 +221,7 @@ def test_capacity_checked_without_launch(preparation):
 def test_chunked_binding_accepts_large_logical_tokens(preparation, monkeypatch):
     args, events = preparation
     monkeypatch.setattr(
-        torch.ops.custom, "gmoe_comm_capabilities", lambda: 1, raising=False
+        torch.ops.custom, "gmoe_comm_capabilities", lambda: 3, raising=False
     )
     resource = backend.prepare_gmoe_exchange(**args)
     assert resource.token_chunking
@@ -244,17 +248,45 @@ def test_fused_selection_is_opt_in():
     assert default.post.name == "composed_gmoe_post"
 
 
-def test_router_core_budget_and_post_reuse(preparation):
+@pytest.mark.parametrize("router_cores,cube,vector", [(32, 4, 8), (24, 8, 16)])
+def test_router_core_budget_and_post_reuse(preparation, router_cores, cube, vector):
     args, events = preparation
     args["options"]["shared_overlap"] = True
-    args["options"]["router_cores"] = 32
+    args["options"]["router_cores"] = router_cores
     resource = backend.prepare_gmoe_exchange(**args)
-    assert resource.router_cores == 32
-    assert ("limit", {"cube_num": 4, "vector_num": 8}) in events
+    assert resource.router_cores == router_cores
+    assert ("limit", {"cube_num": cube, "vector_num": vector}) in events
     from tokenspeed_kernel.ops.moe import gmoe_ascend as stages
 
     context = SimpleNamespace(exchange=resource)
     assert stages.prepare(context, device="npu:0", options=args["options"]) is context
+
+
+@pytest.mark.parametrize("options,router_cores", [({}, 24), ({"router_cores": 32}, 32)])
+def test_shared_ffn_router_default_preserves_override(
+    monkeypatch, options, router_cores
+):
+    from tokenspeed_kernel.ops.moe import gmoe_ascend as stages
+
+    @dataclass
+    class Context:
+        shared_experts: object
+        prepared_shared: object
+
+    context = Context(object(), None)
+    shared = object()
+    seen = []
+    monkeypatch.setattr(stages, "prepare_shared_ffn", lambda *a, **kw: shared)
+
+    def prepare_router(value, *, device, options):
+        seen.append(options)
+        return value
+
+    monkeypatch.setattr(stages, "prepare_router", prepare_router)
+    result = stages.prepare_router_ffn(context, device="npu:0", options=options)
+    assert seen == [{"router_cores": router_cores}]
+    assert result.prepared_shared is shared
+    assert context.prepared_shared is None
 
 
 @pytest.mark.parametrize(
@@ -307,6 +339,14 @@ def test_missing_router_overload_fails_before_collectives(preparation, monkeypat
     assert not events
 
 
+def test_missing_input_scale_fails_before_collectives(preparation, monkeypatch):
+    args, events = preparation
+    monkeypatch.setattr(torch.ops.custom, "gmoe_comm_capabilities", lambda: 1)
+    with pytest.raises(RuntimeError, match="input_scale"):
+        backend.prepare_gmoe_exchange(**args)
+    assert not events
+
+
 def test_router_passes_existing_weights_and_policy(preparation):
     args, events = preparation
     args["options"]["router_cores"] = 32
@@ -316,7 +356,7 @@ def test_router_passes_existing_weights_and_policy(preparation):
         e_score_correction_bias=torch.empty(416, dtype=torch.float32),
     )
     x = torch.empty(32, 8, 512, dtype=torch.bfloat16)
-    resource.exchange_router(x, router, 16, 2.5, True)
+    resource.exchange_router(x, router, 16, 2.5, True, input_scale=2.0)
     name, positional, keywords = events[-1]
     assert name == "router"
     assert positional[0] is x
@@ -324,7 +364,11 @@ def test_router_passes_existing_weights_and_policy(preparation):
     assert positional[2] is router.e_score_correction_bias
     assert positional[3:] == ("dedicated", 16, 2, 16)
     assert keywords == dict(
-        routed_scaling_factor=2.5, renormalize=True, router_cores=32, overlap=True
+        routed_scaling_factor=2.5,
+        renormalize=True,
+        router_cores=32,
+        overlap=True,
+        input_scale=2.0,
     )
 
 
@@ -377,7 +421,10 @@ def test_router_selection_remains_explicit(fused_router):
 @pytest.mark.parametrize(
     "fused_router,fused_shared", [(False, False), (True, False), (True, True)]
 )
-def test_pre_joins_shared_after_dispatch_before_experts(fused_router, fused_shared):
+@pytest.mark.parametrize("input_scale", [1.0, 2.0, 1.4142135623730951, 0.0, -0.25])
+def test_pre_joins_shared_after_dispatch_before_experts(
+    fused_router, fused_shared, input_scale
+):
     from tokenspeed_kernel.ops.moe import gmoe_ascend as stages
 
     if not hasattr(stages, "gmoe_pre"):
@@ -399,9 +446,11 @@ def test_pre_joins_shared_after_dispatch_before_experts(fused_router, fused_shar
         events.append("norm")
         return value
 
-    def exchange(value):
+    def exchange(value, *, input_scale):
         events.append("dispatch")
-        return value.permute(1, 0, 2).flatten(0, 1).repeat(egp, 1)
+        assert torch.equal(value, x.view(tokens, groups, hidden))
+        scaled = (value.float() * input_scale).to(value.dtype)
+        return scaled.permute(1, 0, 2).flatten(0, 1).repeat(egp, 1)
 
     def route(value):
         events.append("router")
@@ -412,8 +461,8 @@ def test_pre_joins_shared_after_dispatch_before_experts(fused_router, fused_shar
     def forbidden(*args):
         raise AssertionError("Fused stages must not call old framework collectives")
 
-    def exchange_router(value, *args):
-        received = exchange(value)
+    def exchange_router(value, *args, input_scale):
+        received = exchange(value, input_scale=input_scale)
         weights, ids = route(received)
         return received, weights, ids
 
@@ -432,7 +481,7 @@ def test_pre_joins_shared_after_dispatch_before_experts(fused_router, fused_shar
         egp_rank=1,
         exchange_group=tuple(range(groups)),
         num_experts=384,
-        norm_scale=1,
+        norm_scale=input_scale,
         proj_input=projection,
         norm=norm,
         shared_experts=identity,
@@ -455,8 +504,8 @@ def test_pre_joins_shared_after_dispatch_before_experts(fused_router, fused_shar
     )
     result = pre(hidden_states=x, context=context)
     assert events == [
-        "projection",
         "shared_fork",
+        "projection",
         "norm",
         "dispatch",
         "router",
@@ -468,6 +517,10 @@ def test_pre_joins_shared_after_dispatch_before_experts(fused_router, fused_shar
         == result.received.untyped_storage().data_ptr()
     )
     assert torch.equal(result.shared_output, x * 2 if fused_shared else x)
+    expected = (x.float() * input_scale).to(x.dtype).view(tokens, groups, hidden)
+    assert torch.equal(
+        result.received, expected.permute(1, 0, 2).flatten(0, 1).repeat(egp, 1)
+    )
 
 
 def test_shared_ffn_selection_is_explicit():

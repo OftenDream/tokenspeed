@@ -240,13 +240,18 @@ def test_shared_flash_local_loader_uses_group_aware_ownership(
 
     experts = model.model.layers[0].moe.experts
     assert model.model.layers[0].moe.local_expert_ids == (4, 5, 6, 7)
+    local_id = model.model.layers[0].moe.local_expert_ids.index(5)
     assert torch.equal(
-        experts.w13_weight[0, :16], torch.ones_like(experts.w13_weight[0, :16])
+        experts.w13_weight[local_id, :16],
+        torch.ones_like(experts.w13_weight[local_id, :16]),
     )
     assert torch.equal(
-        experts.w13_weight[0, 16:], torch.full_like(experts.w13_weight[0, 16:], 2)
+        experts.w13_weight[local_id, 16:],
+        torch.full_like(experts.w13_weight[local_id, 16:], 2),
     )
-    assert torch.equal(experts.w2_weight[0], torch.full_like(experts.w2_weight[0], 3))
+    assert torch.equal(
+        experts.w2_weight[local_id], torch.full_like(experts.w2_weight[local_id], 3)
+    )
 
 
 def test_lite_grouped_moe_empty_and_distributed_context_contract() -> None:
@@ -289,11 +294,13 @@ def _local_expert_oracle(
                 continue
             local_id = expert_id - expert_lo
             gate_up = F.linear(
-                hidden_states[token_id], layer.experts.w13_weight[local_id]
+                hidden_states[token_id],
+                layer.experts.w13_weight[local_id].to(hidden_states.dtype),
             )
             gate, up = gate_up.chunk(2)
             expert_output = F.linear(
-                F.silu(gate) * up, layer.experts.w2_weight[local_id]
+                F.silu(gate) * up,
+                layer.experts.w2_weight[local_id].to(hidden_states.dtype),
             )
             output[token_id] += expert_output * topk_weights[token_id, route_id].to(
                 output.dtype
@@ -346,6 +353,48 @@ def test_lite_gmoe_collectives_and_identity_math(
         token_reduce_scatter=token_scatter,
     )
     import tokenspeed_kernel
+    from tokenspeed_kernel.ops.moe.gmoe import GMoEContext, select_gmoe_stages
+
+    topology = layer.topology
+
+    def cpu_norm(x: torch.Tensor) -> torch.Tensor:
+        x_fp32 = x.float()
+        return (
+            x_fp32
+            * torch.rsqrt(
+                x_fp32.square().mean(dim=-1, keepdim=True) + config.rms_norm_eps
+            )
+            * layer.norm.weight.float()
+        ).to(x.dtype)
+
+    layer._moe_stages = select_gmoe_stages(
+        input_dtype=torch.bfloat16,
+        traits={},
+        pre_solution="composed",
+        post_solution="composed",
+    )
+    layer._moe_stage_context = GMoEContext(
+        num_groups=topology.num_groups,
+        egp_group=topology.egp_group,
+        egp_rank=topology.egp_rank,
+        exchange_group=topology.exchange_group,
+        num_experts=layer.n_routed_experts,
+        norm_scale=config.grouped_moe_norm_scale,
+        proj_input=layer.proj_input,
+        # Keep this communication/identity unit test independent of whichever
+        # accelerator-specific RMSNorm implementation the test host loaded.
+        norm=cpu_norm,
+        shared_experts=layer.shared_experts,
+        proj_output=layer.proj_output,
+        route=layer._route,
+        router=layer.router,
+        top_k=config.moe_topk,
+        routed_scaling_factor=config.routed_scaling_factor,
+        renormalize_topk=layer.renormalize_topk,
+        all_to_all=all_to_all,
+        all_gather=token_gather,
+        reduce_scatter=token_scatter,
+    )
 
     def moe_apply(_plan, x, _experts, _router_logits, **kwargs):
         return _local_expert_oracle(

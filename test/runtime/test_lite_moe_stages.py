@@ -175,6 +175,83 @@ def test_composed_stages_identity_and_communication(groups, egp_rank, egp_size, 
     assert inputs.topk_ids.shape[0] == tokens * groups * egp_size
 
 
+@pytest.mark.parametrize("groups,egp_rank,egp_size", [(8, 0, 1), (4, 0, 2), (4, 1, 2)])
+@pytest.mark.parametrize(
+    "tokens,group_hidden", [(1, 8), (3, 32), (32, 768), (4096, 768)]
+)
+@pytest.mark.parametrize("routes", ["real", "identity", "mixed"])
+def test_composed_identity_keeps_fp32_until_combined_output(
+    groups, egp_rank, egp_size, tokens, group_hidden, routes
+):
+    """An exactly representable cancellation exposes premature BF16 rounding."""
+    stages = select_gmoe_stages(input_dtype=torch.bfloat16, traits={})
+    local_rows = groups * tokens
+    local = (
+        1
+        + torch.arange(local_rows * group_hidden).reshape(local_rows, group_hidden)
+        % 9
+        / 8
+    ).to(torch.bfloat16)
+    local_routed = -local
+    # The identity sum is 1 + 3/1024, which rounds to 1 in BF16. Keep the
+    # cancellation residue instead of dropping it before the multiplication.
+    ids_row = {"real": [0, 1, 2], "identity": [4, 5, 4], "mixed": [0, 4, 5]}[routes]
+    weights_row = {
+        "real": [0.25, 1.0, 3 / 1024],
+        "identity": [1.0, 1 / 1024, 2 / 1024],
+        "mixed": [0.25, 1.0, 3 / 1024],
+    }[routes]
+    ids = torch.tensor(ids_row, dtype=torch.int32).expand(local_rows * egp_size, -1)
+    weights = torch.tensor(weights_row, dtype=torch.float32).expand_as(ids).clone()
+    # Different remote metadata checks the local shard on both EGP ranks.
+    for peer in range(egp_size):
+        if peer != egp_rank:
+            weights[peer * local_rows : (peer + 1) * local_rows].zero_()
+    routed = local_routed.repeat(egp_size, 1)
+    comm_dtypes = []
+
+    def a2a(out, value, group):
+        comm_dtypes.append(value.dtype)
+        out.copy_(value)
+
+    def rs(value, group, splits):
+        assert splits == [local_rows] * egp_size
+        return value.narrow(0, egp_rank * local_rows, local_rows)
+
+    ctx = SimpleNamespace(
+        num_groups=groups,
+        egp_group=tuple(range(egp_size)),
+        egp_rank=egp_rank,
+        exchange_group=tuple(range(groups)),
+        num_experts=4,
+        reduce_scatter=rs,
+        all_to_all=a2a,
+        proj_output=torch.nn.Identity(),
+    )
+    inputs = GMoEInputs(
+        local.repeat(egp_size, 1),
+        local,
+        weights,
+        ids,
+        torch.zeros(tokens, groups * group_hidden, dtype=torch.bfloat16),
+    )
+    actual = stages.post(routed=routed, inputs=inputs, context=ctx)
+    zero_sum = sum(w for i, w in zip(ids_row, weights_row, strict=True) if i >= 4)
+    # Independent FP64 oracle; fixture products and sums are exact in FP32.
+    expected_grouped = (local_routed.double() + local.double() * zero_sum).to(
+        torch.bfloat16
+    )
+    expected = (
+        expected_grouped.view(groups, tokens, group_hidden).permute(1, 0, 2).flatten(1)
+    )
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert comm_dtypes == [torch.bfloat16]
+    if routes != "real":
+        legacy = local_routed + local * torch.tensor(zero_sum, dtype=torch.bfloat16)
+        assert torch.count_nonzero(legacy) == 0
+        assert torch.count_nonzero(actual) == actual.numel()
+
+
 def test_model_forward_keeps_middle_call_and_uses_stages(monkeypatch):
     x = torch.ones(3, 32, dtype=torch.bfloat16)
     received = torch.ones(48, 4, dtype=torch.bfloat16)

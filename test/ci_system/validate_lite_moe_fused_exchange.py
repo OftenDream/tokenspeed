@@ -1046,6 +1046,7 @@ def main():
                 context.top_k,
                 context.routed_scaling_factor,
                 context.renormalize_topk,
+                input_scale=1.0,  # This test-only old schedule already scaled grouped.
             )
             rows = tokens * context.num_groups
             local = received.narrow(0, context.egp_rank * rows, rows)

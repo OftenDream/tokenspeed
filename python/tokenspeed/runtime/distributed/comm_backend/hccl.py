@@ -135,6 +135,15 @@ class HcclBackend(CommBackend):
         scattered_num_tokens: list[int],
     ) -> torch.Tensor:
         max_tokens = max(scattered_num_tokens)
+        if (
+            len(group) > 1
+            and len(scattered_num_tokens) == len(group)
+            and all(tokens == max_tokens for tokens in scattered_num_tokens)
+            and tensor.shape[0] == len(group) * max_tokens
+        ):
+            # Equal splits are already laid out for ReduceScatter. Only make
+            # noncontiguous inputs contiguous; do not zero/copy another buffer.
+            return self.reduce_scatter(tensor.contiguous(), group)
         padded = tensor.new_zeros(
             len(group) * max_tokens,
             tensor.shape[-1],

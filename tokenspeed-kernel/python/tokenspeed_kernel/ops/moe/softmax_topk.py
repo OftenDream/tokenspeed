@@ -23,7 +23,7 @@
 from __future__ import annotations
 
 import torch
-from tokenspeed_kernel.platform import pdl_enabled
+from tokenspeed_kernel.platform import current_platform, pdl_enabled
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.selection import select_kernel
 from tokenspeed_kernel.signature import (
@@ -156,7 +156,9 @@ def moe_softmax_bias_topk(
             torch.empty(shape, device=router_logits.device, dtype=torch.int32),
         )
 
-    if solution is None and not Platform.get().is_npu:
+    if solution is None and (
+        not current_platform().is_npu or router_logits.device.type == "cpu"
+    ):
         solution = "torch"
     kernel = select_kernel(
         "moe",
