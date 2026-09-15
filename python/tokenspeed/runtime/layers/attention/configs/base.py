@@ -35,7 +35,7 @@ their component explicitly: ``Backend(config, spec)``.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TypeVar
+from typing import ClassVar, TypeVar
 
 import torch
 from tokenspeed_kernel.ops.attention.dsv4 import dsv4_decode_supports_partials
@@ -130,6 +130,9 @@ class AttnComponentSpec:
 class SoftmaxAttnConfig(AttnComponentSpec):
     """Base of the softmax-attention families (MHA / MLA / DSA / MSA)."""
 
+    is_dsa: ClassVar[bool] = False
+    uses_dsa_dcp_partials: bool = False
+
     num_attention_heads: int
     num_kv_heads: int
     head_dim: int
@@ -213,18 +216,25 @@ class AttnConfig:
                 f"{[type(c).__name__ for c in self.components] or 'none'}"
             )
         if self.dcp_size > 1:
-            if softmax_components[0].backend_name != "deepseek_v4":
+            softmax = softmax_components[0]
+            if softmax.uses_dsa_dcp_partials:
+                # LongCat DSA combines context-shard partials with the max/sum
+                # emitted by SparseFlashAttentionDecode. The backend validates
+                # its stricter full-head topology when it is constructed.
+                pass
+            elif softmax.backend_name != "deepseek_v4":
                 raise ValueError(
-                    "DCP currently requires the DeepSeek V4 attention backend"
+                    "DCP currently requires DeepSeek V4 or LongCat DSA attention"
                 )
-            # Partials merge through a no-sink LSE; fail here rather than at the
-            # first decode's kernel selection on platforms without that kernel.
-            platform = current_platform()
-            if not dsv4_decode_supports_partials(platform):
-                raise ValueError(
-                    "DCP requires a DeepSeek V4 decode kernel that returns a "
-                    f"no-sink LSE; none is registered for {platform.device_name}"
-                )
+            else:
+                # Partials merge through a no-sink LSE; fail here rather than at
+                # the first decode's kernel selection on platforms without it.
+                platform = current_platform()
+                if not dsv4_decode_supports_partials(platform):
+                    raise ValueError(
+                        "DCP requires a DeepSeek V4 decode kernel that returns a "
+                        f"no-sink LSE; none is registered for {platform.device_name}"
+                    )
 
     def component(self, cls: type[ComponentT]) -> ComponentT | None:
         """The first component that is a ``cls``, or None.

@@ -122,6 +122,14 @@ class FLASHLocalCheckpointLayout:
                 yield f"{core}.o_norm.weight"
                 yield f"{core}.o_proj.weight"
             else:
+                if self.config.is_longcat_dsa:
+                    for suffix in (
+                        "wq_b.weight",
+                        "wk.weight",
+                        "weights_proj.weight",
+                        "k_norm.weight",
+                    ):
+                        yield f"{attention}.indexer.{suffix}"
                 if self.config.mla_use_output_gate:
                     yield f"{attention}.g_proj.weight"
                 for suffix in (
@@ -378,6 +386,22 @@ class FLASHLocalCheckpointLayout:
 
     def _mla_spec(self, name: str, suffix: str) -> FLASHLocalWeightSpec:
         config = self.config
+        if config.is_longcat_dsa and suffix.startswith("indexer."):
+            index_shapes = {
+                "indexer.wq_b.weight": (
+                    config.index_n_heads * config.index_head_dim,
+                    config.q_lora_rank,
+                ),
+                "indexer.wk.weight": (config.index_head_dim, config.hidden_size),
+                "indexer.weights_proj.weight": (
+                    config.index_n_heads,
+                    config.hidden_size,
+                ),
+                "indexer.k_norm.weight": (config.index_head_dim,),
+            }
+            if suffix not in index_shapes:
+                raise ValueError(f"Unexpected LongCatDSA indexer weight {name!r}")
+            return self._replicated(name, index_shapes[suffix])
         qk_dim = config.qk_nope_head_dim + config.qk_rope_head_dim
         shapes = {
             "g_proj.weight": (

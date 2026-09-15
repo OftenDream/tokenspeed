@@ -190,6 +190,11 @@ class KimiK3Recipe(CacheRecipe):
     @property
     @override
     def max_padding_fraction(self) -> float:
+        if self.attn_config.component(MLAConfig).uses_separate_bf16_index_cache:
+            # KDA state shares latent planes, but not the separate RoPE/index
+            # planes required by sparse kernels. Bound the reservation rather
+            # than disabling the planner's padding check.
+            return 1.0
         # A draft adds MLA planes of its own; the target-only bound would
         # reject the wider arena they imply.
         if self.num_draft_layers:
@@ -225,7 +230,13 @@ class KimiK3Recipe(CacheRecipe):
             )
         if self.attn_config.kv_cache_quant_method == "per_token_head":
             raise ValueError("Kimi-K3 cache does not support per_token_head MLA cache")
-        if getattr(self._text_config, "mla_use_nope", None) is not True:
+        uses_separate_bf16_index_cache = self.attn_config.component(
+            MLAConfig
+        ).uses_separate_bf16_index_cache
+        if (
+            not uses_separate_bf16_index_cache
+            and getattr(self._text_config, "mla_use_nope", None) is not True
+        ):
             raise ValueError("Kimi-K3 cache requires mla_use_nope=True")
         linear_attn = self.attn_config.component(LinearAttnConfig)
         if linear_attn is None:
@@ -249,6 +260,25 @@ class KimiK3Recipe(CacheRecipe):
                 else self.draft_attn_config
             )
             spec = config.component(MLAConfig)
+            if spec.uses_separate_bf16_index_cache:
+                return (
+                    CacheFieldSpec(
+                        f"layer.{layer_id}.latent_kv",
+                        plane_id,
+                        (
+                            self.prefix_granularity,
+                            1,
+                            spec.kv_lora_rank + spec.qk_rope_head_dim,
+                        ),
+                        cache_dtype_name(torch.bfloat16),
+                    ),
+                    CacheFieldSpec(
+                        f"layer.{layer_id}.dsa_index_k",
+                        f"dsa_index_k.{occurrence}",
+                        (self.prefix_granularity, 1, spec.index_head_dim),
+                        cache_dtype_name(torch.bfloat16),
+                    ),
+                )
             latent_width = spec.kv_lora_rank + spec.qk_rope_head_dim
             return (
                 CacheFieldSpec(
@@ -282,7 +312,9 @@ class KimiK3Recipe(CacheRecipe):
     def packing(self, groups: tuple[CacheGroupDeclaration, ...]) -> Mapping[str, int]:
         fields_by_group = {spec.group_id: fields for spec, fields in groups}
         mla_page_bytes = next(
-            field.payload_bytes for field in fields_by_group[FULL_ATTENTION]
+            field.payload_bytes
+            for field in fields_by_group[FULL_ATTENTION]
+            if field.field_id.endswith(".latent_kv")
         )
         first_state = f"{LINEAR_ATTENTION}_0"
         linear_plane_bytes = sum(
@@ -316,10 +348,14 @@ class KimiK3Recipe(CacheRecipe):
             group_id == FULL_ATTENTION for group_id in self.target_group_ids
         )
         expected = num_mla_layers + self.num_draft_layers
+        if self.attn_config.component(MLAConfig).uses_separate_bf16_index_cache:
+            # Sparse attention reads one exact contiguous [NoPE|RoPE] plane;
+            # the Indexer keeps its independent exact-stride key plane.
+            expected *= 2
         if len(layout.plane_bytes) != expected:
             raise ValueError(
-                f"Kimi-K3 LCM requires {num_mla_layers} target planes (one per "
-                f"MLA layer) plus {self.num_draft_layers} draft planes, got "
+                f"Kimi-K3 LCM requires {expected} planes for full-attention "
+                f"and draft layers, got "
                 f"{len(layout.plane_bytes)}"
             )
 

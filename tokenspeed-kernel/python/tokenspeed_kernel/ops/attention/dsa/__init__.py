@@ -90,6 +90,28 @@ LSE_LN = math.log2(math.e)
 # ===-----------------------------------------------------------------------===#
 
 
+def dsa_interleave_rope(
+    tensor: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    *,
+    rope_dim: int,
+) -> torch.Tensor:
+    """Apply the DSA indexer's interleaved rotary embedding."""
+    kernel = select_kernel(
+        "attention",
+        "dsa_interleave_rope",
+        _attention_format_signature(tensor=tensor),
+        traits={"rope_dim": int(rope_dim)},
+    )
+    return kernel(
+        tensor=tensor,
+        positions=positions,
+        cos_sin_cache=cos_sin_cache,
+        rope_dim=rope_dim,
+    )
+
+
 def dsa_decode(
     q: torch.Tensor,
     kv_cache: torch.Tensor | None,
@@ -770,6 +792,7 @@ def dsa_plan(
 # Backend registration (side-effect imports)
 # isort: off
 import tokenspeed_kernel.ops.attention.dsa.cuda  # noqa: E402,F401
+import tokenspeed_kernel.ops.attention.dsa.ascend  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.dsa.cute_dsl  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.dsa.deep_gemm  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.dsa.flashinfer  # noqa: E402,F401
@@ -784,4 +807,5 @@ __all__ = [
     "dsa_prefill_topk",
     "dsa_decode_topk",
     "dsa_plan",
+    "dsa_interleave_rope",
 ]

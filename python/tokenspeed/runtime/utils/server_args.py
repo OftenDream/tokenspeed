@@ -1537,6 +1537,7 @@ class ServerArgs:
         attention_backend_choices = [
             "mha",
             "mla",
+            "longcat_dsa",
             "fa3",
             "fa4",
             "triton",

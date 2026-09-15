@@ -68,6 +68,7 @@ class HybridKDATokenToKVPool(MLATokenToKVPool):
         **MLATokenToKVPool.layer_plane_bindings,
         "conv_state": "_conv_state",
         "recurrent_state": "_recurrent_state",
+        "dsa_index_k": "_dsa_index_k",
     }
 
     def _bind_layer_planes(self) -> None:
@@ -102,6 +103,11 @@ class HybridKDATokenToKVPool(MLATokenToKVPool):
         """Return one KDA state plane. Latent KV is read via ``kv_buffer``."""
         if self.layerwise_load_tracker is not None:
             self.layerwise_load_tracker.wait_for_layer(layer_id)
+        if component_name == "dsa_index_k":
+            value = getattr(self, "_" + component_name)[layer_id]
+            if value is None:
+                raise ValueError(f"Layer {layer_id} has no {component_name} cache")
+            return value
         try:
             conv, recurrent = self._state_buffers_by_layer[layer_id]
         except KeyError as exc:

@@ -37,12 +37,12 @@ checkpoint stores ``A_log`` in a ``[head_dim]``-sized buffer zero-padded past
 from __future__ import annotations
 
 import torch
-from triton.runtime.jit import ConstexprFunction
 
 
 def _ensure_triton_constexpr() -> None:
     """Restore stock Triton constexpr builtins changed by tokenspeed-triton."""
     import triton
+    from triton.runtime.jit import ConstexprFunction
 
     if not isinstance(triton.next_power_of_2, ConstexprFunction):
         triton.next_power_of_2 = ConstexprFunction(triton.next_power_of_2)
@@ -75,8 +75,6 @@ def kda_chunk_prefill(
     stream-synchronizing D2H per KDA layer per chunk); with queued work ahead
     on the stream, that sync stalls the launch thread until the queue drains.
     """
-    from fla.ops.kda import chunk_kda
-
     # ``use_beta_sigmoid_in_kernel`` is a backend-extension kwarg that FLA's
     # native chunk_kda silently swallows via **kwargs — passing raw logits
     # with that flag makes the native path consume the LOGIT as the delta
@@ -86,6 +84,8 @@ def kda_chunk_prefill(
     if beta_is_logit:
         beta = beta.float().sigmoid()
     _ensure_triton_constexpr()
+    from fla.ops.kda import chunk_kda
+
     return chunk_kda(
         q,
         k,
@@ -223,11 +223,11 @@ def kda_recurrent_decode(
     (not in-place), so the caller must write it back. Same layout as
     :func:`kda_chunk_prefill`; safe gate applied in-kernel.
     """
-    from fla.ops.kda.fused_recurrent import fused_recurrent_kda
-
     # Unlike ``chunk_kda``, ``fused_recurrent_kda`` has no ``safe_gate`` flag: it
     # applies the safe gate whenever ``lower_bound`` is set.
     _ensure_triton_constexpr()
+    from fla.ops.kda.fused_recurrent import fused_recurrent_kda
+
     return fused_recurrent_kda(
         q,
         k,

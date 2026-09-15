@@ -38,17 +38,24 @@ def apply_rope(
     k_rope_out: torch.Tensor | None = None,
 ) -> None:
     """Apply RoPE to Q and K, writing into outputs or the inputs in place."""
+    if q.shape[0] == 0:
+        return
+    # The public contract also accepts [tokens, heads, head_dim] views.
+    # ACLNN accepts only [tokens, heads * head_dim], including when the
+    # caller selects a non-contiguous rotary slice of a wider head.
     q_out, k_out = torch_npu.npu_mrope(
         positions,
-        q,
-        k,
+        q.reshape(q.shape[0], -1).contiguous(),
+        k.reshape(k.shape[0], -1).contiguous(),
         cos_sin_cache.to(q.dtype),
         head_size,
         mrope_section=[0, 0, 0],
         rotary_mode="half" if is_neox else "interleave",
     )
-    (q if q_rope_out is None else q_rope_out).copy_(q_out)
-    (k if k_rope_out is None else k_rope_out).copy_(k_out)
+    q_target = q if q_rope_out is None else q_rope_out
+    k_target = k if k_rope_out is None else k_rope_out
+    q_target.copy_(q_out.view_as(q_target))
+    k_target.copy_(k_out.view_as(k_target))
 
 
 __all__ = ["apply_rope"]

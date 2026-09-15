@@ -81,12 +81,9 @@ class WeightNZReplicatedLinear(ReplicatedLinear):
     def process_weights_after_loading(self, _module: nn.Module | None = None) -> None:
         if self._weight_nz_prepared or self.weight.device.type != "npu":
             return
+        role = global_server_args_dict.get("disaggregation_mode")
         if not global_server_args_dict.get("npu_enable_weight_nz", False) or not (
-            global_server_args_dict.get("disaggregation_mode") == "decode"
-            or (
-                self.prefill_weight_nz
-                and global_server_args_dict.get("disaggregation_mode") == "prefill"
-            )
+            role == "decode" or (self.prefill_weight_nz and role in ("prefill", "null"))
         ):
             return
 

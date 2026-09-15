@@ -35,6 +35,46 @@ def test_flash_kda_config_resolves_hybrid_layer_pattern() -> None:
     assert config.full_attention_layer_ids == [3, 7]
 
 
+def test_flash_lite_independent_dsa_selection_is_explicit() -> None:
+    from tokenspeed.runtime.configs.flash_kda_config import FLASHLocalConfig
+
+    config = FLASHLocalConfig(index_n_heads=16, cli_factor=1)
+
+    assert config.is_longcat_dsa
+    assert config.uses_independent_dsa_selection
+
+
+def test_flash_lite_independent_selection_uses_standard_dsa_architecture() -> None:
+    from tokenspeed.runtime.configs.model_config import (
+        AttentionArch,
+        configure_mla_attention,
+    )
+
+    text_config = SimpleNamespace(
+        uses_independent_dsa_selection=True,
+        kv_lora_rank=512,
+        qk_nope_head_dim=128,
+        qk_rope_head_dim=64,
+        v_head_dim=128,
+        index_topk=2048,
+        index_head_dim=128,
+        index_n_heads=16,
+        index_init_tokens=4,
+        index_local_tokens=1024,
+        rope_scaling=None,
+    )
+    model_config = SimpleNamespace(
+        hf_text_config=text_config,
+        hf_config=text_config,
+    )
+
+    configure_mla_attention(model_config)
+
+    assert model_config.attention_arch is AttentionArch.DSA
+    assert model_config.index_init_tokens == 4
+    assert model_config.index_local_tokens == 1024
+
+
 @pytest.mark.parametrize("pattern", ["1111111011111110111011111110", "10101"])
 def test_flash_kda_explicit_hybrid_layout(pattern: str) -> None:
     from tokenspeed.runtime.configs.flash_kda_config import FLASHLocalConfig

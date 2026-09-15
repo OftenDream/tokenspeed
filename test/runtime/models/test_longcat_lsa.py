@@ -20,6 +20,7 @@
 
 """LongCat LSA ownership, Indexer, and checkpoint-loading contracts."""
 
+from dataclasses import dataclass
 from types import SimpleNamespace
 
 import pytest

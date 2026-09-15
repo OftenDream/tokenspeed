@@ -19,11 +19,57 @@
 # SOFTWARE.
 
 from test.runtime.test_lite_model_loader import lite_config_dict, mapping
+from types import SimpleNamespace
 from unittest import mock
+
+import pytest
 
 from tokenspeed.runtime.configs.flash_kda_config import FLASHLocalConfig
 from tokenspeed.runtime.models.flash_kda import FLASHLocalForCausalLM
 from tokenspeed.runtime.models.flash_local_attention import WeightNZReplicatedLinear
+
+
+@pytest.mark.parametrize(
+    ("role", "prefill_safe", "expected"),
+    [
+        ("decode", False, True),
+        ("decode", True, True),
+        ("prefill", False, False),
+        ("prefill", True, True),
+        ("null", False, False),
+        ("null", True, True),
+    ],
+)
+def test_weight_nz_role_admission(role, prefill_safe, expected):
+    import tokenspeed_kernel
+
+    from tokenspeed.runtime.utils.env import global_server_args_dict
+
+    original = object()
+    weight = SimpleNamespace(device=SimpleNamespace(type="npu"), data=original)
+    layer = SimpleNamespace(
+        _weight_nz_prepared=False,
+        _weight_nz_transposed=False,
+        weight=weight,
+        weight_nz="transposed",
+        prefill_weight_nz=prefill_safe,
+    )
+    snapshot = dict(global_server_args_dict)
+    try:
+        global_server_args_dict.update(
+            npu_enable_weight_nz=True, disaggregation_mode=role
+        )
+        with mock.patch.object(
+            tokenspeed_kernel, "prepare_weight_nz", return_value="prepared"
+        ) as prepare:
+            WeightNZReplicatedLinear.process_weights_after_loading(layer)
+        assert prepare.called is expected
+        assert layer._weight_nz_prepared is expected
+        assert layer._weight_nz_transposed is expected
+        assert weight.data == ("prepared" if expected else original)
+    finally:
+        global_server_args_dict.clear()
+        global_server_args_dict.update(snapshot)
 
 
 def test_weight_nz_server_arg_defaults_off_and_propagates_decode_role():

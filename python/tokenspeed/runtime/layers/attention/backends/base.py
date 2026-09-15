@@ -41,7 +41,7 @@ carries a "no tables" arm. Padding is the consumer's job: requests in
 from __future__ import annotations
 
 from abc import ABC
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -172,6 +172,21 @@ class AttentionBackend(CachePoolBinding, ABC):
     def configure_runtime(self, **kwargs) -> None:
         """Post-load configuration hook (information unavailable at
         construction, e.g. sliding window sizes). Default: no-op."""
+
+    def run_projection_branches(
+        self,
+        layer: PagedAttention,
+        primary: Callable[[], Any],
+        secondary: Callable[[], Any],
+    ) -> tuple[Any, Any]:
+        """Run two independent model projections before one attention call.
+
+        The default preserves program order. Device leaves may overlap the
+        branches without exposing streams, graph state, or core budgets to
+        model code; composites delegate using ``layer``.
+        """
+        del layer
+        return primary(), secondary()
 
     def init_prefill_graph_state(self, max_num_tokens: int, max_bs: int) -> None:
         """Allocate static buffers the breakable prefill graphs bake.

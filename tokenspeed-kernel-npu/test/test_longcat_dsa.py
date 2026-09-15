@@ -18,6 +18,32 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-from tokenspeed_kernel._triton import tl, triton
+import pytest
+import torch
 
-__all__ = ["tl", "triton"]
+pytest.importorskip("torch_npu")
+
+from tokenspeed_kernel_npu.ops.longcat_dsa import AscendDSAKernels
+
+
+def test_full_scan_chunk_hints_are_cached_by_shape():
+    kernels = AscendDSAKernels.__new__(AscendDSAKernels)
+    kernels._full_scan_chunks = {}
+    indices = torch.zeros(3, 1, 2048, dtype=torch.int32)
+
+    first = kernels._full_scan_chunk_hints(indices)
+    second = kernels._full_scan_chunk_hints(indices)
+
+    assert first.data_ptr() == second.data_ptr()
+    assert first.tolist() == [16, 16, 16]
+
+
+def test_optional_cp_primitives_fail_at_device_boundary():
+    kernels = AscendDSAKernels.__new__(AscendDSAKernels)
+    kernels._select_local = None
+    kernels._merge_partials = None
+
+    with pytest.raises(RuntimeError, match="SelectLocalTopkIndices"):
+        kernels.select_local(torch.empty(0), torch.empty(0), 0)
+    with pytest.raises(RuntimeError, match="KvpAttentionMerge"):
+        kernels.merge_partials(torch.empty(0), torch.empty(0))

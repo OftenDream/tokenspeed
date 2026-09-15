@@ -46,8 +46,6 @@ from tokenspeed_kernel.ops.attention.gdn.triton import (
     CausalConv1dPrefillMetadata,
     build_causal_conv1d_prefill_metadata,
     fused_qkv_split_gdn_prefill,
-)
-from tokenspeed_kernel.ops.attention.gdn.triton import (
     set_total_chunks_hint,
     set_total_chunks_hint_uniform,
 )
@@ -2357,9 +2355,7 @@ class MambaAttnBackend(AttentionBackend):
         # This kernel has one state index. Stage its input at the destination;
         # leaves with independent read/write indices consume the checkpoint directly.
         conv_input = gather_state_rows(conv_states, read_indices.to(torch.int64))
-        scatter_state_rows_(
-            conv_states, write_indices.to(torch.int64), conv_input
-        )
+        scatter_state_rows_(conv_states, write_indices.to(torch.int64), conv_input)
         return causal_conv1d_fn(
             mixed_qkv.transpose(0, 1),
             conv_weights,

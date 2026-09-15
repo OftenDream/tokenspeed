@@ -95,6 +95,7 @@ from tokenspeed.runtime.models.flash_local_moe import (
 from tokenspeed.runtime.models.kimi_k3 import (
     KimiLinearMLAAttention,
 )
+from tokenspeed.runtime.models.longcat_dsa import LongCatDSAAttention
 from tokenspeed.runtime.moe.distribution_recorder import (
     get_global_expert_distribution_recorder,
 )
@@ -103,6 +104,7 @@ from tokenspeed.runtime.moe.expert_location import (
 )
 from tokenspeed.runtime.utils import LazyValue, add_prefix, get_colorful_logger
 from tokenspeed.runtime.utils.cuda_stream import StreamFork as _StreamFork
+from tokenspeed.runtime.utils.cuda_stream import new_device_stream as _new_device_stream
 from tokenspeed.runtime.utils.env import global_server_args_dict
 
 logger = get_colorful_logger(__name__)
@@ -1090,6 +1092,31 @@ class FLASHLocalDecoderLayer(nn.Module):
                 self.self_attn = SeperateFLASHLocal(
                     config, mapping, layer_id, quant_config, attn_prefix
                 )
+        elif config.is_longcat_dsa:
+            self.self_attn = LongCatDSAAttention(
+                config=config,
+                mapping=mapping,
+                hidden_size=config.hidden_size,
+                num_heads=config.num_attention_heads,
+                qk_nope_head_dim=config.qk_nope_head_dim,
+                qk_rope_head_dim=config.qk_rope_head_dim,
+                v_head_dim=config.v_head_dim,
+                q_lora_rank=config.q_lora_rank,
+                kv_lora_rank=config.kv_lora_rank,
+                rope_theta=rope_theta,
+                rope_scaling=rope_scaling,
+                max_position_embeddings=max_position_embeddings,
+                quant_config=None,
+                layer_id=layer_id,
+                prefix=attn_prefix,
+                reduce_attn_results=False,
+                alt_stream=alt_stream,
+                computes_selection=True,
+                selection_owner_layer_id=layer_id,
+                lora_norm_eps=config.rms_norm_eps,
+                component_mapping=mapping.mla_weight,
+                separate_mla_projections=flash_local_prefers_packed_projections(),
+            )
         else:
             # reduce_attn_results=False: the o_proj returns a TP partial and
             # CommManager.post_attn_reduce_norm owns the all-reduce / RSAG,
@@ -1340,7 +1367,7 @@ class FLASHLocalModel(nn.Module):
             quant_config,
             oe_table_placement,
         )
-        self.alt_stream = torch.cuda.Stream() if torch.cuda.is_available() else None
+        self.alt_stream = _new_device_stream()
 
         def get_layer(idx: int, prefix: str):
             return FLASHLocalDecoderLayer(
@@ -1757,9 +1784,29 @@ class FLASHLocalForCausalLM(BaseCausalLM):
                 and ".self_attn." in source_name
                 and isinstance(
                     self.model.layers[layer_id].self_attn,
-                    SeparateProjectionKimiLinearMLAAttention,
+                    (SeparateProjectionKimiLinearMLAAttention, LongCatDSAAttention),
                 )
             ):
+                attention = self.model.layers[layer_id].self_attn
+                if isinstance(attention, LongCatDSAAttention) and hasattr(
+                    attention, "fused_qkv_a_proj_with_mqa"
+                ):
+                    # Reuse LongCat's packed Q/KV down projection, while the
+                    # strict checkpoint ledger keeps the two source tensors.
+                    if source_name.endswith(
+                        (".q_a_proj.weight", ".kv_a_proj_with_mqa.weight")
+                    ):
+                        offset = (
+                            0
+                            if source_name.endswith(".q_a_proj.weight")
+                            else config.q_lora_rank
+                        )
+                        target = attention.fused_qkv_a_proj_with_mqa.weight
+                        default_weight_loader(
+                            target.narrow(0, offset, loaded_weight.shape[0]),
+                            loaded_weight,
+                        )
+                        continue
                 param = params_dict.get(checkpoint_spec.target_name)
                 if param is None:
                     raise ValueError(
@@ -1971,7 +2018,10 @@ class FLASHLocalForCausalLM(BaseCausalLM):
             embed.validate_loaded_weights()
         for layer in self.model.layers:
             self_attn = layer.self_attn
-            if isinstance(self_attn, SeparateProjectionKimiLinearMLAAttention):
+            if isinstance(
+                self_attn,
+                (SeparateProjectionKimiLinearMLAAttention, LongCatDSAAttention),
+            ):
                 self_attn.process_weights_after_loading()
             elif isinstance(self_attn, KimiLinearMLAAttention):
                 self_attn.w_kc, self_attn.w_vc = _prepare_mla_kv_b_proj_weights(

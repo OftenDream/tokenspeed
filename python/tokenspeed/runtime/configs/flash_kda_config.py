@@ -712,6 +712,47 @@ class FLASHLocalConfig(PretrainedConfig):
                 "Flash-Lite checkpoint scaling and OE switches must be enabled."
             )
         self.special_token_ids
+        if self.is_longcat_dsa:
+            required = (
+                "cli_factor",
+                "index_dtype",
+                "index_k_norm_type",
+                "index_head_dim",
+                "index_topk",
+                "index_init_tokens",
+                "index_local_tokens",
+            )
+            missing = [name for name in required if getattr(self, name, None) is None]
+            if missing:
+                raise ValueError(f"Lite LongCatDSA config is incomplete: {missing}")
+            if self.cli_factor != 1:
+                raise ValueError("Lite LongCatDSA currently requires CLI=1")
+            if self.index_dtype != "bf16" or self.index_k_norm_type != "rms":
+                raise ValueError("Lite LongCatDSA requires BF16 index keys and RMSNorm")
+            if self.index_head_dim != 128 or self.index_n_heads != 16:
+                raise ValueError(
+                    "Lite LongCatDSA currently requires 16 index heads of width 128"
+                )
+            if self.index_topk != 2048:
+                raise ValueError("Lite LongCatDSA currently requires index_topk=2048")
+            if self.index_init_tokens < 0 or self.index_local_tokens < 0:
+                raise ValueError(
+                    "LongCatDSA initial/local token counts must be nonnegative"
+                )
+            if self.index_init_tokens + self.index_local_tokens > self.index_topk:
+                raise ValueError(
+                    "LongCatDSA initial/local candidates exceed index_topk"
+                )
+
+    @property
+    def is_longcat_dsa(self) -> bool:
+        """Sparse LongCat attention is selected by checkpoint indexer fields."""
+        return getattr(self, "index_n_heads", None) is not None
+
+    @property
+    def uses_independent_dsa_selection(self) -> bool:
+        """Whether every physical attention layer owns its own Indexer."""
+        return self.is_longcat_dsa and self.cli_factor == 1
 
     # ----- helpers -----
 

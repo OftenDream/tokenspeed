@@ -125,7 +125,8 @@ def mla_prolog(
     *,
     rmsnorm_epsilon_cq: float,
     rmsnorm_epsilon_ckv: float,
-) -> tuple[torch.Tensor, torch.Tensor] | None:
+    return_query_norm: bool = False,
+) -> tuple[torch.Tensor, ...] | None:
     """Fuse Lite projections/norm/absorption and write the existing packed cache.
 
     Projection weights use logical [in, out] NZ layout; weight_uk is
@@ -181,7 +182,7 @@ def mla_prolog(
         rmsnorm_epsilon_cq=rmsnorm_epsilon_cq,
         rmsnorm_epsilon_ckv=rmsnorm_epsilon_ckv,
         cache_mode="PA_BSND",
-        query_norm_flag=False,
+        query_norm_flag=return_query_norm,
         weight_quant_mode=0,
         kv_cache_quant_mode=0,
         query_quant_mode=0,
@@ -192,4 +193,6 @@ def mla_prolog(
         kc_scale=1.0,
         enable_rope=False,
     )
+    if return_query_norm:
+        return outputs[0], outputs[1], outputs[3]
     return outputs[0], outputs[1]

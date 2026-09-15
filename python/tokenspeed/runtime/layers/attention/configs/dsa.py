@@ -47,16 +47,33 @@ def dsa_index_k_row_bytes(index_head_dim: int) -> int:
 
 @dataclass(kw_only=True)
 class DSAConfig(MLAConfig):
+    is_dsa = True
+
     index_topk: int
     index_head_dim: int
     index_n_heads: int
     indexer_layer_ids: frozenset[int] | None = None
     index_kpool: int | None = None
+    # Index-cache and selection contracts vary independently of the model
+    # family. Existing GPU DSA keeps the packed cache defaults; Lite selects
+    # the separate BF16 layout and DCP partial reduction from checkpoint facts.
+    index_init_tokens: int = 0
+    index_local_tokens: int = 0
+
+    def __post_init__(self) -> None:
+        if self.index_init_tokens < 0 or self.index_local_tokens < 0:
+            raise ValueError("DSA initial/local token counts must be nonnegative")
+        if self.index_init_tokens + self.index_local_tokens > self.index_topk:
+            raise ValueError("DSA initial/local candidates must fit inside index_topk")
 
     @classmethod
     def _spec_kwargs(
         cls, server_args: ServerArgs, model_config: ModelConfig, is_draft: bool
     ) -> dict:
+        text_config = model_config.hf_text_config
+        independent_selection = bool(
+            getattr(text_config, "uses_independent_dsa_selection", False)
+        )
         return dict(
             **super()._spec_kwargs(server_args, model_config, is_draft),
             index_topk=model_config.index_topk,
@@ -64,6 +81,10 @@ class DSAConfig(MLAConfig):
             index_n_heads=model_config.index_n_heads,
             index_kpool=getattr(model_config, "index_kpool", None),
             indexer_layer_ids=getattr(model_config, "indexer_layer_ids", None),
+            uses_separate_bf16_index_cache=independent_selection,
+            uses_dsa_dcp_partials=independent_selection,
+            index_init_tokens=getattr(model_config, "index_init_tokens", 0),
+            index_local_tokens=getattr(model_config, "index_local_tokens", 0),
         )
 
     @classmethod
@@ -73,7 +94,22 @@ class DSAConfig(MLAConfig):
         model_config: ModelConfig,
         is_draft: bool = False,
     ) -> AttnConfig:
+        text_config = model_config.hf_text_config
+        independent_selection = bool(
+            getattr(text_config, "uses_independent_dsa_selection", False)
+        )
+        if independent_selection and (
+            is_draft or server_args.speculative_algorithm is not None
+        ):
+            raise ValueError("Independent DSA selection does not support MTP")
         config = super().generate(server_args, model_config, is_draft)
+        spec = config.component(DSAConfig)
+        if spec.uses_separate_bf16_index_cache and (
+            config.kv_cache_dtype != torch.bfloat16
+        ):
+            raise ValueError(
+                "Separate DSA index cache currently requires BF16 KV cache"
+            )
         if config.kv_cache_dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
             platform = current_platform()
             if not (platform.is_blackwell_plus or platform.is_cdna4_plus):
@@ -91,6 +127,11 @@ class DSAConfig(MLAConfig):
         return self.indexer_layer_ids is None or layer_id in self.indexer_layer_ids
 
     def cache_cell_size(self, config: AttnConfig) -> int:
+        if self.uses_separate_bf16_index_cache:
+            element_size = torch._utils._element_size(torch.bfloat16)
+            return element_size * (
+                self.kv_lora_rank + self.qk_rope_head_dim + self.index_head_dim
+            )
         index_k_cell_size = dsa_index_k_row_bytes(
             self.index_head_dim,
         )

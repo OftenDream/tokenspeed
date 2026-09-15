@@ -352,6 +352,22 @@ def _resolve_full_attn_backend_name(
 ) -> str:
     """The name the full-attention layers run on (the hybrid sub-backend,
     or the config's own resolution)."""
+    if softmax_attn.is_dsa:
+        # DSA is the outer sparse-attention wrapper. Existing NVIDIA LongCat
+        # launch commands name its TRT-LLM dense delegate explicitly; preserve
+        # that spelling while still constructing the required outer wrapper.
+        if hybrid_request not in (
+            None,
+            "dsa",
+            "longcat_dsa",
+            "hybrid_linear_attn",
+            "trtllm_mla",
+        ):
+            raise ValueError(
+                "DSA checkpoint requires a DSA-compatible attention backend "
+                "(dsa, longcat_dsa, trtllm_mla, or auto)"
+            )
+        return "dsa"
     if profile.is_hybrid_linear:
         return _resolve_hybrid_full_backend_name(
             hybrid_request,
@@ -535,11 +551,10 @@ def _create_attn_config(
     arch = model_config.attention_arch
     if arch not in _CONFIG_CLS:
         raise NotImplementedError(f"Not supported Attention Arch: {arch!r}")
-    config_cls = (
-        DeepseekV41Config
-        if is_deepseek_v41_config(model_config.hf_config)
-        else _CONFIG_CLS[arch]
-    )
+    if is_deepseek_v41_config(model_config.hf_config):
+        config_cls = DeepseekV41Config
+    else:
+        config_cls = _CONFIG_CLS[arch]
     config = config_cls.generate(server_args, model_config, is_draft)
     # Extra components are built through the same generate() protocol and
     # composed into config.components (consumers look them up by class via
