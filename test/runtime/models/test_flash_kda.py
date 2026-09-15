@@ -35,6 +35,53 @@ def test_flash_kda_config_resolves_hybrid_layer_pattern() -> None:
     assert config.full_attention_layer_ids == [3, 7]
 
 
+@pytest.mark.parametrize("pattern", ["1111111011111110111011111110", "10101"])
+def test_flash_kda_explicit_hybrid_layout(pattern: str) -> None:
+    from tokenspeed.runtime.configs.flash_kda_config import FLASHLocalConfig
+
+    config = FLASHLocalConfig.from_dict(
+        {"num_layers": len(pattern), "hybrid_attn_layers": pattern}
+    )
+    assert config.linear_layer_ids == [
+        i for i, kind in enumerate(pattern) if kind == "1"
+    ]
+    assert config.full_attention_layer_ids == [
+        i for i, kind in enumerate(pattern) if kind == "0"
+    ]
+
+
+@pytest.mark.parametrize("pattern", ["111", "111x", [1, 1, 1, 0]])
+def test_flash_kda_rejects_invalid_hybrid_layout(pattern) -> None:
+    from tokenspeed.runtime.configs.flash_kda_config import FLASHLocalConfig
+
+    with pytest.raises(ValueError, match="hybrid_attn_layers"):
+        FLASHLocalConfig(num_hidden_layers=4, hybrid_attn_layers=pattern)
+
+
+def test_flash_kda_rejects_conflicting_hybrid_layout() -> None:
+    from tokenspeed.runtime.configs.flash_kda_config import FLASHLocalConfig
+
+    with pytest.raises(ValueError, match="conflicts"):
+        FLASHLocalConfig(
+            num_hidden_layers=4,
+            hybrid_attn_layers="1110",
+            linear_attn_config={"kda_layers": [1, 2]},
+        )
+
+
+def test_flash_lite_strict_explicit_layout_without_interval() -> None:
+    from test.runtime.test_lite_model_loader import lite_config_dict
+
+    from tokenspeed.runtime.configs.flash_kda_config import FLASHLocalConfig
+
+    data = lite_config_dict(num_layers=5, hybrid_attn_layers="10101")
+    data.pop("fa_interval")
+    config = FLASHLocalConfig.from_dict(data)
+    assert config.full_attention_layer_ids == [1, 3]
+    restored = FLASHLocalConfig.from_dict(config.to_dict())
+    assert restored.layer_types == config.layer_types
+
+
 def test_flash_kda_config_rejects_unimplemented_sigmoid_router() -> None:
     from tokenspeed.runtime.configs.flash_kda_config import FLASHLocalConfig
 
@@ -364,6 +411,12 @@ def test_flash_lite_cache_allows_its_wider_recurrent_state() -> None:
         recipe.draft_attn_config = None
         recipe.model_config = SimpleNamespace(
             hf_text_config=SimpleNamespace(model_type=model_type)
+        )
+        recipe.target_group_ids = (
+            "linear_attention_0",
+            "linear_attention_1",
+            "linear_attention_2",
+            "full_attention",
         )
         return recipe.max_padding_fraction
 

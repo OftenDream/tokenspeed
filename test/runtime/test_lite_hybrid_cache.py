@@ -133,6 +133,55 @@ def _lite_recipe(
     )
 
 
+@pytest.mark.parametrize("kda_count,mla_count", [(21, 7), (24, 4), (20, 7), (1, 20)])
+def test_lite_groups_follow_mla_width(kda_count: int, mla_count: int) -> None:
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.kimi_k3 import (
+        KimiK3Recipe,
+    )
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import pack
+
+    recipe = _lite_recipe(8)
+    # Put MLA first to cover non-periodic placement, including layer zero.
+    text = FLASHLocalConfig(
+        num_hidden_layers=kda_count + mla_count,
+        hybrid_attn_layers="0" * mla_count + "1" * kda_count,
+    )
+    recipe.model_config.hf_text_config = text
+    counts = Counter(recipe.target_group_ids)
+    assert counts[FULL_ATTENTION] == mla_count
+    for index in range((kda_count + mla_count - 1) // mla_count):
+        assert counts[f"{LINEAR_ATTENTION}_{index}"] == min(
+            mla_count, kda_count - index * mla_count
+        )
+    groups = recipe.groups()
+    # Exercise the non-OE padding bound too; OE has an independent tiny field.
+    attention_groups = tuple(item for item in groups if item[0].group_id != "lite_oe")
+    layout = pack(
+        attention_groups,
+        prefix_granularity=128,
+        cache_blocks_per_lcm_block=KimiK3Recipe.packing(recipe, attention_groups),
+        alignment=recipe.alignment,
+        max_padding_fraction=KimiK3Recipe.max_padding_fraction.fget(recipe),
+    )
+    recipe.check_layout(layout)
+    assert len(layout.plane_bytes) == mla_count
+    assert layout.lcm_block_bytes == mla_count * 294_912
+    assert dict(layout.group_packing)[FULL_ATTENTION] == 2
+    assert len(layout.fields) == mla_count + 2 * kda_count
+    oe_layout = pack(
+        groups,
+        prefix_granularity=128,
+        cache_blocks_per_lcm_block=recipe.packing(groups),
+        alignment=recipe.alignment,
+        max_padding_fraction=recipe.max_padding_fraction,
+    )
+    recipe.check_layout(oe_layout)
+    assert oe_layout.lcm_block_bytes == layout.lcm_block_bytes
+    assert (
+        tuple(f for f in oe_layout.fields if f.group_id != "lite_oe") == layout.fields
+    )
+
+
 def _layout(tp_size: int, **recipe_kwargs):
     from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import pack
 
