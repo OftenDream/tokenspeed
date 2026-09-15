@@ -116,16 +116,21 @@ class KimiK3Recipe(CacheRecipe):
                 "Kimi-K3 cache requires both KDA and full-attention layers, got "
                 f"{len(kda_layer_ids)} and {len(full_layer_ids)}"
             )
-        if num_layers == _KIMI_K3_LAYERS and (
-            len(kda_layer_ids) != _KIMI_K3_KDA_LAYERS
-            or len(full_layer_ids) != _KIMI_K3_MLA_LAYERS
+        is_lite = getattr(self._text_config, "model_type", None) == "flash_kda"
+        if (
+            not is_lite
+            and num_layers == _KIMI_K3_LAYERS
+            and (
+                len(kda_layer_ids) != _KIMI_K3_KDA_LAYERS
+                or len(full_layer_ids) != _KIMI_K3_MLA_LAYERS
+            )
         ):
             raise ValueError(
                 f"{_KIMI_K3_LAYERS}-layer Kimi-K3 requires "
                 f"{_KIMI_K3_KDA_LAYERS} KDA and {_KIMI_K3_MLA_LAYERS} MLA "
                 f"layers, got {len(kda_layer_ids)} and {len(full_layer_ids)}"
             )
-        if len(kda_layer_ids) % _KIMI_K3_STATE_GROUPS:
+        if not is_lite and len(kda_layer_ids) % _KIMI_K3_STATE_GROUPS:
             raise ValueError(
                 "Kimi-K3 cache requires the KDA layer count to divide into "
                 f"{_KIMI_K3_STATE_GROUPS} state groups, got {len(kda_layer_ids)}"
@@ -148,7 +153,13 @@ class KimiK3Recipe(CacheRecipe):
                 )
 
         group_ids = [FULL_ATTENTION] * num_layers
-        per_group = len(kda_layer_ids) // _KIMI_K3_STATE_GROUPS
+        # Lite uses one slot per MLA layer. KDA groups reuse those slots;
+        # the final group may leave trailing slots unused.
+        per_group = (
+            len(full_layer_ids)
+            if is_lite
+            else len(kda_layer_ids) // _KIMI_K3_STATE_GROUPS
+        )
         for index, layer_id in enumerate(kda_layer_ids):
             group_ids[layer_id] = f"{LINEAR_ATTENTION}_{index // per_group}"
         return tuple(group_ids)
@@ -186,7 +197,14 @@ class KimiK3Recipe(CacheRecipe):
         # Flash-Lite reuses this cache family but its BF16 recurrent state is
         # wider than Kimi-K3's state relative to one MLA page.
         if getattr(self._text_config, "model_type", None) == "flash_kda":
-            return 0.75
+            counts = {}
+            for group_id in self.target_group_ids:
+                counts[group_id] = counts.get(group_id, 0) + 1
+            width = counts[FULL_ATTENTION]
+            tail = min(count for gid, count in counts.items() if gid != FULL_ATTENTION)
+            # Preserve the per-plane allowance and account for unused tail
+            # planes in the parent-sized allocation charged to this group.
+            return 1.75 * width / tail - 1.0
         return 0.25
 
     # ---- fields ----

@@ -296,7 +296,14 @@ class FLASHLocalConfig(PretrainedConfig):
     def from_dict(cls, config_dict: dict, **kwargs):
         strict = _STRICT_FLASH_LITE_MARKERS.issubset(config_dict)
         if strict:
-            missing = sorted(_STRICT_FLASH_LITE_FIELDS.difference(config_dict))
+            required = _STRICT_FLASH_LITE_FIELDS
+            if (
+                config_dict.get("hybrid_attn_layers") is not None
+                or (config_dict.get("linear_attn_config") or {}).get("kda_layers")
+                is not None
+            ):
+                required = required.difference({"fa_interval"})
+            missing = sorted(required.difference(config_dict))
             if missing:
                 raise ValueError(
                     "Flash-Lite checkpoint config is missing required fields: "
@@ -529,6 +536,36 @@ class FLASHLocalConfig(PretrainedConfig):
         self.special_token_scope = special_token_scope
 
         # KDA / linear attention
+        hybrid_attn_layers = kwargs.get("hybrid_attn_layers")
+        self._explicit_layer_layout = (
+            hybrid_attn_layers is not None
+            or (linear_attn_config or {}).get("kda_layers") is not None
+        )
+        if hybrid_attn_layers is not None:
+            if (
+                not isinstance(hybrid_attn_layers, str)
+                or len(hybrid_attn_layers) != self.num_hidden_layers
+                or set(hybrid_attn_layers) - {"0", "1"}
+            ):
+                raise ValueError(
+                    "hybrid_attn_layers must contain one 0 (MLA) or 1 (KDA) "
+                    "per model layer"
+                )
+            kda_layers = [
+                i + 1 for i, kind in enumerate(hybrid_attn_layers) if kind == "1"
+            ]
+            full_layers = [
+                i + 1 for i, kind in enumerate(hybrid_attn_layers) if kind == "0"
+            ]
+            linear_attn_config = dict(linear_attn_config or {})
+            for name, layers in (
+                ("kda_layers", kda_layers),
+                ("full_attn_layers", full_layers),
+            ):
+                declared = linear_attn_config.get(name)
+                if declared is not None and sorted(declared) != layers:
+                    raise ValueError(f"hybrid_attn_layers conflicts with {name}")
+                linear_attn_config[name] = layers
         self.linear_hidden_size = (
             linear_hidden_size if linear_hidden_size is not None else hidden_size
         )
@@ -621,7 +658,10 @@ class FLASHLocalConfig(PretrainedConfig):
             raise ValueError(
                 "Flash-Lite config fields must be positive: " + ", ".join(invalid)
             )
-        if self.num_hidden_layers % self.fa_interval:
+        if (
+            not self._explicit_layer_layout
+            and self.num_hidden_layers % self.fa_interval
+        ):
             raise ValueError("num_layers must be divisible by fa_interval.")
         if self.linear_hidden_size != self.hidden_size:
             raise ValueError("linear_hidden_size must equal hidden_size.")
