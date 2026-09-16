@@ -1640,7 +1640,11 @@ class FLASHLocalForCausalLM(BaseCausalLM):
         )
 
         expected_sources = (
-            set(self.checkpoint_layout.iter_source_names())
+            {
+                name
+                for name in self.checkpoint_layout.iter_source_names()
+                if self.checkpoint_weight_name_filter(name)
+            }
             if self.checkpoint_layout is not None
             else None
         )
