@@ -30,10 +30,8 @@ from typing import Any
 import torch
 from tokenspeed_kernel.ops.over_embedding import (
     OverEmbeddingSpec,
+    TableFragmentSpec,
     append_packed_lookup_,
-    longcat_lite_tp4_spec,
-    longcat_lite_tp8_spec,
-    longcat_pro_tp8_spec,
     project_add_word_,
 )
 from torch import nn
@@ -70,41 +68,71 @@ def resolve_longcat_oe_spec(
     tp_size: int,
     tp_rank: int,
 ) -> OverEmbeddingSpec:
-    """Resolve and validate one supported LongCat OE ownership profile."""
-    if (vocab_size, hidden_size, tp_size) == (163840, 8192, 8):
-        spec = longcat_pro_tp8_spec(tp_rank)
-    elif (vocab_size, hidden_size, tp_size) == (163840, 3072, 4):
-        spec = longcat_lite_tp4_spec(tp_rank)
-    elif (vocab_size, hidden_size, tp_size) == (163840, 3072, 8):
-        spec = longcat_lite_tp8_spec(tp_rank)
-    else:
-        raise ValueError(
-            "unsupported LongCat OE profile: "
-            f"vocab_size={vocab_size}, hidden_size={hidden_size}, TP={tp_size}"
+    """Derive rank-local table feature slices from checkpoint geometry.
+
+    Branch widths follow the checkpoint's floor division. Complete branches
+    are assigned first; the remaining branch features are partitioned over
+    ranks without duplication. Two-whole-branch ownership stays contiguous
+    to preserve Pro's layout; other full rounds are interleaved, as in Lite.
+    Kernel selection still checks executable fragment shapes independently.
+    """
+    for name, value, minimum in (
+        ("vocab_size", vocab_size, 1),
+        ("hidden_size", hidden_size, 1),
+        ("max_ngram_order", max_ngram_order, 2),
+        ("hashes_per_order", hashes_per_order, 1),
+        ("modulus0", modulus0, 1),
+        ("tp_size", tp_size, 1),
+        ("tp_rank", tp_rank, 0),
+    ):
+        if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+            raise ValueError(f"{name} must be an integer >= {minimum}, got {value!r}")
+    if tp_rank >= tp_size:
+        raise ValueError(f"tp_rank must be less than tp_size, got {tp_rank}/{tp_size}")
+    branch_count = (max_ngram_order - 1) * hashes_per_order
+    branch_width = hidden_size // branch_count
+    if branch_width == 0 or branch_count * branch_width < tp_size:
+        raise ValueError("OE geometry must provide at least one feature per TP rank")
+    full_rounds, tail_branches = divmod(branch_count, tp_size)
+    fragments = []
+
+    def append_fragment(branch: int, begin: int, width: int) -> None:
+        fragments.append(
+            TableFragmentSpec(
+                branch_id=branch,
+                ngram_order=branch // hashes_per_order + 2,
+                modulus=modulus0 + 2 * branch,
+                feature_begin=begin,
+                feature_width=width,
+            )
         )
 
-    branch_count = (max_ngram_order - 1) * hashes_per_order
-    expected = {
-        "max_ngram_order": (max_ngram_order, spec.max_ngram_order),
-        "branch_count": (branch_count, spec.branch_count),
-        "modulus0": (
-            modulus0,
-            min(
-                fragment.modulus - 2 * fragment.branch_id for fragment in spec.fragments
-            ),
-        ),
-    }
-    mismatches = [
-        f"{name}={actual} (expected {wanted})"
-        for name, (actual, wanted) in expected.items()
-        if actual != wanted
-    ]
-    if mismatches:
-        raise ValueError(
-            f"checkpoint does not match {spec.profile} TP{tp_size}: "
-            + ", ".join(mismatches)
+    for index in range(full_rounds):
+        branch = (
+            tp_rank * full_rounds + index
+            if full_rounds == 2 and tail_branches == 0
+            else index * tp_size + tp_rank
         )
-    return spec
+        append_fragment(branch, 0, branch_width)
+    tail_width = tail_branches * branch_width
+    begin = tail_width * tp_rank // tp_size
+    end = tail_width * (tp_rank + 1) // tp_size
+    while begin < end:
+        tail_branch, feature_begin = divmod(begin, branch_width)
+        width = min(end - begin, branch_width - feature_begin)
+        append_fragment(full_rounds * tp_size + tail_branch, feature_begin, width)
+        begin += width
+    return OverEmbeddingSpec(
+        profile="longcat-configured",
+        tp_size=tp_size,
+        rank=tp_rank,
+        vocab_size=vocab_size,
+        branch_count=branch_count,
+        branch_width=branch_width,
+        hidden_size=hidden_size,
+        max_ngram_order=max_ngram_order,
+        fragments=tuple(fragments),
+    )
 
 
 def _branch_index(weight_name: str, *, projection: bool) -> int | None:
@@ -353,7 +381,7 @@ class LongCatOverEmbedding(nn.Module):
             enable_pdl=True,
         )
         special_projection = None
-        if self.spec.profile == "longcat-lite" and bypass_mask is not None:
+        if bypass_mask is not None:
             # Lite checkpoints retain the learned row-zero OE projection at
             # special positions. Only normalization is bypassed; a zero hash
             # index is not a zero embedding. Sum TP-local contributions below.

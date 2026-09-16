@@ -110,7 +110,7 @@ def test_special_token_row_zero_projection(
         bypass_mask=mask,
         solution="torch",
     )
-    if profile == "longcat-lite" and segment_ignored_tokens:
+    if segment_ignored_tokens:
         # Row zero is a learned, nonzero embedding, NOT a zero activation.
         # The special-token sum bypasses sqrt(1 + branch_count) normalization.
         expected[0].fill_(2.75)  # 1 + (4 * 2 + 2 * 3) * 0.125

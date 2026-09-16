@@ -565,7 +565,7 @@ class LongCatDSAAttention(DeepseekV3AttentionMLA):
         seq_lens = getattr(metadata, "seq_lens_k", None)
         if seq_lens is not None:
             limits.append(max(0, int(seq_lens.shape[0]) - num_extends))
-        block_tables = getattr(metadata, "block_kv_indices", None)
+        block_tables = getattr(metadata, "page_table", None)
         if block_tables is not None:
             limits.append(max(0, int(block_tables.shape[0]) - num_extends))
         return min(limits)
@@ -609,7 +609,7 @@ class LongCatDSAAttention(DeepseekV3AttentionMLA):
         ctx: ForwardContext,
     ) -> LongCatDSADecodeSelection | None:
         metadata = getattr(ctx.attn_backend, "forward_decode_metadata", None)
-        if metadata is None or metadata.block_kv_indices is None:
+        if metadata is None or metadata.page_table is None:
             return None
         num_tokens = int(indexer_output.query.shape[0])
         window = self._resolve_decode_window(ctx, metadata, total_tokens=num_tokens)
@@ -618,9 +618,7 @@ class LongCatDSAAttention(DeepseekV3AttentionMLA):
         self.check_decode_width(window.q_len_per_req)
         num_extends = int(metadata.num_extends or 0)
         seq_lens = metadata.seq_lens_k[num_extends : num_extends + window.num_reqs]
-        page_table = metadata.block_kv_indices[
-            num_extends : num_extends + window.num_reqs
-        ]
+        page_table = metadata.page_table[num_extends : num_extends + window.num_reqs]
         q = indexer_output.query[window.start : window.end]
         weights = indexer_output.weights[window.start : window.end]
         index_k_cache = ctx.token_to_kv_pool.get_index_k_buffer(
@@ -907,7 +905,7 @@ class LongCatDSAAttention(DeepseekV3AttentionMLA):
                 topk_indices,
                 topk_lens,
             )
-        if ctx.accept_lengths is not None:
+        if ctx.draft_narrowing is not None:
             output = output.index_select(0, ctx.gather_ids)
         return self.o_proj(output)[0]
 

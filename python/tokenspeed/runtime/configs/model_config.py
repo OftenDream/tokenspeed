@@ -291,17 +291,6 @@ def configure_glm_attention(model_config) -> None:
     _configure_dsa_geometry(model_config)
 
 
-_LONGCAT_LSA_EXPECTED_GEOMETRY = {
-    "index_topk": 2048,
-    "index_head_dim": 128,
-    "index_n_heads": 32,
-    "index_init_tokens": 16,
-    "index_local_tokens": 1024,
-    "cli_factor": 2,
-    "index_k_norm_type": "rms",
-}
-
-
 def configure_longcat_lsa_attention(model_config) -> None:
     """Configure the supported LongCat-2.0 LSA owner/reuse geometry."""
 
@@ -310,12 +299,50 @@ def configure_longcat_lsa_attention(model_config) -> None:
         if hasattr(model_config.hf_text_config, "kv_lora_rank")
         else model_config.hf_config
     )
-    for field, expected in _LONGCAT_LSA_EXPECTED_GEOMETRY.items():
-        actual = getattr(attention_config, field, None)
-        if actual != expected:
+    # Validate numerical domains, not one checkpoint's geometry. Kernel
+    # selection owns solution-specific head-dimension and top-k support.
+    for field, minimum in (
+        ("index_n_heads", 1),
+        ("index_head_dim", 1),
+        ("index_topk", 1),
+        ("index_init_tokens", 0),
+        ("index_local_tokens", 0),
+        ("cli_factor", 1),
+    ):
+        value = getattr(attention_config, field, None)
+        if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
             raise ValueError(
-                f"Unsupported LongCat LSA {field}: expected {expected}, got {actual}"
+                f"LongCat LSA {field} must be an integer >= {minimum}, got {value!r}"
             )
+    from tokenspeed.runtime.layers.attention.configs.dsa import dsa_index_k_row_bytes
+
+    # The packed Index-K cache stores one FP32 scale per 128 FP8 elements.
+    dsa_index_k_row_bytes(attention_config.index_head_dim)
+    rope_dim = getattr(attention_config, "qk_rope_head_dim", None)
+    if (
+        isinstance(rope_dim, bool)
+        or not isinstance(rope_dim, int)
+        or not 0 < rope_dim <= attention_config.index_head_dim
+        or rope_dim % 2
+    ):
+        raise ValueError(
+            "LongCat LSA qk_rope_head_dim must be a positive even integer "
+            "not exceeding index_head_dim"
+        )
+    # These are implementation contracts, not checkpoint size restrictions:
+    # each decoder block constructs exactly one owner and one consumer.
+    if attention_config.cli_factor != 2:
+        raise ValueError(
+            "LongCat LSA currently implements paired owner/consumer attention; "
+            "cli_factor must be 2"
+        )
+    if getattr(attention_config, "index_k_norm_type", None) != "rms":
+        raise ValueError("LongCat LSA Indexer currently implements RMSNorm only")
+    if (
+        attention_config.index_init_tokens + attention_config.index_local_tokens
+        > attention_config.index_topk
+    ):
+        raise ValueError("LongCat initial/local candidates must fit inside index_topk")
 
     _configure_dsa_geometry(model_config)
     model_config.index_init_tokens = attention_config.index_init_tokens

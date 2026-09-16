@@ -126,6 +126,10 @@ def test_forward_bypass_mask_supports_cuda_graph_replay(monkeypatch) -> None:
         ignored_token_ids=tuple(range(23)),
         segment_ignored_tokens=True,
     ).cuda()
+    with torch.no_grad():
+        layer.projection.zero_()
+        for table in layer.oe_tables:
+            table.zero_()
     history_view = _history_view(
         history_token_ids=torch.zeros((1, 16), dtype=torch.int32, device="cuda"),
         committed_lengths=torch.zeros(1, dtype=torch.int32, device="cuda"),
@@ -150,7 +154,7 @@ def test_forward_bypass_mask_supports_cuda_graph_replay(monkeypatch) -> None:
         bypass_mask,
     ):
         assert scale == layer.normalize_scale
-        return bypass_mask
+        return bypass_mask[:, None].expand(-1, 8).to(torch.bfloat16).clone()
 
     monkeypatch.setattr(over_embedding, "append_packed_lookup_", fake_lookup)
     monkeypatch.setattr(over_embedding, "project_add_word_", return_bypass_mask)
@@ -170,7 +174,7 @@ def test_forward_bypass_mask_supports_cuda_graph_replay(monkeypatch) -> None:
     input_ids.copy_(torch.tensor([21, 29], dtype=torch.int32, device="cuda"))
     graph.replay()
 
-    assert output.cpu().tolist() == [True, False]
+    assert output[:, 0].cpu().tolist() == [1.0, 0.0]
 
 
 def test_forward_uses_runtime_history_and_masks_graph_padding(monkeypatch) -> None:
@@ -308,3 +312,185 @@ def test_forward_splits_dflash_verify_rows_before_graph_padding(monkeypatch) -> 
     )
 
     assert output.shape == (24, 8)
+
+
+@pytest.mark.parametrize("kind,tp", [("pro", 8), ("lite", 4), ("lite", 8)])
+def test_configured_oe_preserves_existing_ownership(kind, tp):
+    from dataclasses import replace
+
+    from tokenspeed_kernel.ops.over_embedding import (
+        longcat_lite_tp4_spec,
+        longcat_lite_tp8_spec,
+        longcat_pro_tp8_spec,
+    )
+
+    factory = (
+        longcat_pro_tp8_spec
+        if kind == "pro"
+        else longcat_lite_tp4_spec if tp == 4 else longcat_lite_tp8_spec
+    )
+    for rank in range(tp):
+        old = factory(rank)
+        generated = resolve_longcat_oe_spec(
+            vocab_size=old.vocab_size,
+            hidden_size=old.hidden_size,
+            max_ngram_order=old.max_ngram_order,
+            hashes_per_order=4,
+            modulus0=16476898 if kind == "pro" else 4718593,
+            tp_size=tp,
+            tp_rank=rank,
+        )
+        assert replace(generated, profile=old.profile) == old
+
+
+@pytest.mark.parametrize(
+    "vocab,hidden,order,hashes,tp",
+    [
+        (131072, 3072, 4, 4, 8),
+        (97, 100, 3, 3, 7),
+        (97, 96, 3, 3, 1),
+        (97, 96, 3, 3, 8),
+        (97, 96, 3, 3, 4),
+    ],
+)
+def test_configured_oe_covers_each_branch_feature_once(
+    vocab, hidden, order, hashes, tp
+):
+    width = hidden // ((order - 1) * hashes)
+    coverage = torch.zeros((order - 1) * hashes, width, dtype=torch.int32)
+    for rank in range(tp):
+        spec = resolve_longcat_oe_spec(
+            vocab_size=vocab,
+            hidden_size=hidden,
+            max_ngram_order=order,
+            hashes_per_order=hashes,
+            modulus0=101,
+            tp_size=tp,
+            tp_rank=rank,
+        )
+        for f in spec.fragments:
+            assert f.ngram_order == f.branch_id // hashes + 2
+            assert f.modulus == 101 + 2 * f.branch_id
+            coverage[f.branch_id, f.feature_begin : f.feature_end] += 1
+    assert torch.all(coverage == 1)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("segment_specials", [False, True])
+def test_configured_oe_tp8_cuda_matches_unsharded_reference(segment_specials):
+    from dataclasses import replace
+
+    from tokenspeed_kernel.ops.over_embedding import append_packed_lookup_
+
+    torch.manual_seed(71)
+    ids = [11, 2, 29, 7, 101, 12]
+    device = "cuda"
+    dtype = torch.bfloat16
+    word = torch.randn(len(ids), 3072, device=device, dtype=dtype) * 0.1
+    tables = [
+        torch.randn(127 + 2 * b, 256, device=device, dtype=dtype) for b in range(12)
+    ]
+    projections = [
+        torch.randn(256, 3072, device=device, dtype=dtype) * 0.01 for _ in range(12)
+    ]
+    rows = []
+    expected = word.float().clone()
+    for branch in range(12):
+        modulus = 127 + 2 * branch
+        order = branch // 4 + 2
+        indices = []
+        for pos, token in enumerate(ids):
+            if token == 7:
+                index = 0 if segment_specials else modulus - 1
+            else:
+                index = token
+                for back in range(1, order):
+                    if (
+                        pos - back < 0
+                        or ids[pos - back] == 2
+                        or (segment_specials and ids[pos - back] == 7)
+                    ):
+                        break
+                    if ids[pos - back] == 7:
+                        index = modulus - 1
+                        break
+                    index += ids[pos - back] * pow(131072, back, modulus)
+                index %= modulus
+            indices.append(index)
+        rows.append(indices)
+        expected += tables[branch][indices].float() @ projections[branch].float()
+    expected /= 13
+    if segment_specials:
+        expected[3] *= 13
+    actual = torch.zeros_like(expected)
+    for rank in range(8):
+        spec = resolve_longcat_oe_spec(
+            vocab_size=131072,
+            hidden_size=3072,
+            max_ngram_order=4,
+            hashes_per_order=4,
+            modulus0=127,
+            tp_size=8,
+            tp_rank=rank,
+        )
+        spec = replace(
+            spec,
+            ignored_token_ids=(7,),
+            eos_token_id=2,
+            segment_ignored_tokens=segment_specials,
+        )
+        local_tables = tuple(
+            tables[f.branch_id][:, f.feature_begin : f.feature_end].contiguous()
+            for f in spec.fragments
+        )
+        projection = torch.cat(
+            [
+                projections[f.branch_id][f.feature_begin : f.feature_end]
+                for f in spec.fragments
+            ]
+        )
+        history = torch.zeros(1, 16, dtype=torch.int32, device=device)
+        pieces = []
+        for begin, end in [(0, 3), (3, 6)]:
+            output = append_packed_lookup_(
+                torch.tensor(ids[begin:end], device=device, dtype=torch.int32),
+                torch.tensor([0, end - begin], device=device, dtype=torch.int32),
+                torch.tensor([0], device=device, dtype=torch.int64),
+                torch.tensor([True], device=device),
+                history,
+                torch.tensor([begin], device=device, dtype=torch.int32),
+                local_tables,
+                spec=spec,
+                solution="cutedsl",
+                enable_pdl=False,
+            )
+            pieces.append(output)
+        activation = torch.cat(pieces)
+        reference_parts = []
+        for f in spec.fragments:
+            part = tables[f.branch_id][
+                rows[f.branch_id], f.feature_begin : f.feature_end
+            ].clone()
+            if segment_specials:
+                part[3].zero_()
+            reference_parts.append(part)
+        torch.testing.assert_close(
+            activation, torch.cat(reference_parts, dim=1), rtol=0, atol=0
+        )
+        mask = (
+            torch.tensor([t == 7 for t in ids], device=device)
+            if segment_specials
+            else None
+        )
+        partial = project_add_word_(
+            word.clone() if rank == 0 else torch.zeros_like(word),
+            activation,
+            projection,
+            scale=13.0,
+            bypass_mask=mask,
+            solution="torch",
+        )
+        if segment_specials:
+            partial[3] += torch.cat([table[0] for table in local_tables]) @ projection
+        actual += partial.float()
+    torch.testing.assert_close(actual, expected, rtol=0.02, atol=0.02)

@@ -672,3 +672,90 @@ def test_flashinfer_dsa_decode_w8_matches_reference(device: str, require) -> Non
     )
     assert out.shape == (tokens, num_heads, kv_lora_rank)
     torch.testing.assert_close(out.float(), ref.float(), rtol=8e-2, atol=8e-2)
+
+
+@pytest.mark.parametrize(
+    "heads,initial,topk,local",
+    [(16, 4, 2048, 1024), (32, 16, 2048, 1024), (16, 4, 512, 128)],
+)
+@pytest.mark.parametrize("mode", ["prefill", "decode"])
+def test_longcat_variable_heads_forced_topk(
+    device, require, heads, initial, topk, local, mode
+):
+    from tokenspeed_kernel.ops.quantization import quantize_fp8_with_scale
+
+    require("attention", f"dsa_{mode}_topk", "deep_gemm", torch.bfloat16, "q")
+    torch.manual_seed(123)
+    tokens, length, page_size = 4, 3072, 64
+    q = torch.randn(tokens, heads, 128, device=device, dtype=torch.bfloat16)
+    weights = torch.randn(tokens, heads, device=device, dtype=torch.float32)
+    packed, keys = _pack_index_k_cache(
+        torch.randn(length, 128, device=device, dtype=torch.bfloat16), page_size
+    )
+    lengths = torch.tensor([2049, 2305, 2817, length], device=device, dtype=torch.int32)
+    scale = (heads * 128) ** -0.5
+    if mode == "decode":
+        tables = torch.arange(length // page_size, device=device, dtype=torch.int32)
+        tables = tables.repeat(tokens, 1).contiguous()
+        lengths_2d = lengths[:, None].contiguous()
+        plan = dsa_plan(
+            page_size=page_size, seq_lens_2d=lengths_2d, solution="deep_gemm"
+        )
+        selected, lens = dsa_decode_topk(
+            q,
+            weights,
+            lengths,
+            tables,
+            page_size=page_size,
+            topk=topk,
+            softmax_scale=scale,
+            index_k_cache=packed,
+            seq_lens_2d=lengths_2d,
+            plan=plan,
+            initial_tokens=initial,
+            local_tokens=local,
+            solution="deep_gemm",
+        )
+    else:
+        selected, lens = dsa_prefill_topk(
+            q,
+            weights,
+            torch.arange(length, device=device, dtype=torch.int32),
+            torch.zeros_like(lengths),
+            lengths,
+            topk=topk,
+            softmax_scale=scale,
+            index_k_cache=packed,
+            page_size=page_size,
+            initial_tokens=initial,
+            local_tokens=local,
+            solution="deep_gemm",
+        )
+    # Match the actual FP8 input representation, then compute scoring in FP32.
+    q8, qs = quantize_fp8_with_scale(
+        q.reshape(-1, 128),
+        granularity="token_group",
+        group_size=128,
+        scale_encoding="float32",
+    )
+    q_ref = (q8.float() * qs.reshape(-1, 1)).reshape_as(q)
+    scores = torch.einsum("thd,sd->ths", q_ref, keys.float()).relu()
+    scores = (scores * weights[:, :, None]).sum(1) * scale
+    for row in range(tokens):
+        end = int(lengths[row])
+        scores[row, end:] = -float("inf")
+        scores[row, :initial] = float("inf")
+        scores[row, end - local : end] = float("inf")
+        expected = set(scores[row].topk(topk).indices.tolist())
+        actual = set(selected[row].tolist())
+        assert int(lens[row]) == topk
+        assert len(actual) == topk
+        assert all(0 <= slot < end for slot in actual)
+        assert set(range(initial)) <= actual
+        assert set(range(end - local, end)) <= actual
+        overlap = len(expected & actual) / topk
+        print(
+            f"{mode} heads={heads} initial={initial} topk={topk} local={local} "
+            f"row={row} topk_overlap={overlap:.6f}"
+        )
+        assert overlap >= 0.99
