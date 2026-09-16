@@ -178,7 +178,7 @@ def kda_recurrent_verify_pool(
     ``h_pool_out[write_indices]`` so the caller can commit the accepted row.
     It returns the attention output ``[B, T, Hv, V]``.
     """
-    from tokenspeed_kernel.thirdparty.triton.fla_kda_recurrent import (
+    from tokenspeed_kernel.ops.attention.kda._triton.recurrent import (
         fused_recurrent_kda_mtp,
     )
 
