@@ -48,7 +48,10 @@ from tokenspeed_kernel.ops.attention.dsa.cute_dsl import (
     has_cute_dsl_decode_topk,
 )
 from tokenspeed_kernel.ops.attention.dsa.deep_gemm import _prepare_logits_for_topk
-from tokenspeed_kernel.ops.attention.dsa.triton import combine_topk_weights
+from tokenspeed_kernel.ops.attention.dsa.triton import (
+    combine_topk_weights,
+    mark_forced_initial_local_logits,
+)
 
 requires_kernel = pytest.mark.skipif(
     not (torch.cuda.is_available() and has_cute_dsl_decode_topk()),
@@ -58,6 +61,22 @@ requires_kernel = pytest.mark.skipif(
 requires_cuda = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="requires CUDA"
 )
+
+
+@requires_cuda
+def test_mark_forced_initial_local_logits_public_export():
+    logits = torch.arange(24, device="cuda", dtype=torch.float32).reshape(3, 8)
+    expected = logits.clone()
+    causal_lens = torch.tensor([0, 3, 7], device="cuda", dtype=torch.int32)
+    expected[1, :3] = float("inf")
+    expected[2, :2] = float("inf")
+    expected[2, 5:7] = float("inf")
+
+    mark_forced_initial_local_logits(
+        logits, causal_lens, initial_tokens=2, local_tokens=2
+    )
+
+    torch.testing.assert_close(logits, expected, rtol=0, atol=0)
 
 
 # ---------------------------------------------------------------------------

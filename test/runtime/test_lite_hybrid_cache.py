@@ -37,17 +37,6 @@ _ARCHITECTURE = "FLASHLocalForCausalLM"
 _STATE_GROUPS = tuple(f"{LINEAR_ATTENTION}_{index}" for index in range(3))
 
 
-class _OperationMetadata:
-    def __init__(self, tables, forward_op):
-        self.tables = tables
-        self.forward_op = forward_op
-
-    def require_table(self, group_id, *, active_forward_op):
-        if active_forward_op is not self.forward_op:
-            raise RuntimeError("stale metadata")
-        return self.tables[group_id]
-
-
 def _lite_recipe(
     tp_size: int,
     *,
@@ -303,6 +292,7 @@ def test_replicated_mla_service_keeps_full_component_geometry() -> None:
     )
     model_config = SimpleNamespace(
         hf_config=text_config,
+        num_attention_layers=text_config.num_hidden_layers,
         context_len=4096,
         dtype=torch.bfloat16,
         num_attention_heads=text_config.num_attention_heads,
@@ -483,8 +473,13 @@ def test_lite_tp8_capacity_accounts_for_history_and_request_state() -> None:
         overlap_schedule_depth=1,
     )
 
-    assert recipe.parents_needed(layout, token_limit) == 9985
-    assert recipe.token_capacity(layout, 9985) == token_limit
+    # MLA: ceil((16384 history + 255 partial + 256 protected) / 2).
+    # Three KDA groups: four state blocks per live request, packing 1.
+    # OE snapshots fit in one additional parent.
+    expected_parents = 8448 + 3 * 1024 + 1
+    assert recipe.parents_needed(layout, token_limit) == expected_parents
+    assert recipe.token_capacity(layout, expected_parents) == token_limit
+    assert recipe.token_capacity(layout, expected_parents - 1) < token_limit
 
 
 def test_lite_pd_manifest_restores_only_the_latest_oe_context() -> None:
@@ -793,17 +788,15 @@ def test_lite_graph_state_indices_refresh_without_reallocation() -> None:
         _STATE_GROUPS[1]: torch.tensor([[5, 6], [7, 8]], dtype=torch.int32),
         _STATE_GROUPS[2]: torch.tensor([[2, 4], [6, 8]], dtype=torch.int32),
     }
-    forward_op = object()
-    metadata = _OperationMetadata(tables, forward_op)
-
-    backend.init_forward_metadata_replay_cuda_graph(
+    backend.refresh_decode_metadata(
         bs=2,
         req_pool_indices=torch.tensor([0, 1], dtype=torch.int32),
         seq_lens=torch.tensor([129, 1], dtype=torch.int32),
         forward_mode=ForwardMode.DECODE,
-        num_padding=1,
-        cache_metadata=metadata,
-        forward_batch=forward_op,
+        actual_bs=1,
+        block_tables=tables,
+        num_extends=0,
+        for_graph_replay=True,
     )
 
     for group_id in _STATE_GROUPS:

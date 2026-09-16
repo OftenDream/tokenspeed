@@ -1344,5 +1344,6 @@ __all__ = [
     "dsa_prefill_topk_fp8",
     "triton_topk_from_logits",
     "local_topk_to_global_slots",
+    "mark_forced_initial_local_logits",
     "workspace_topk_to_global_slots",
 ]

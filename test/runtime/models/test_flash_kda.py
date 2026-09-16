@@ -147,22 +147,49 @@ def test_flash_kda_registers_hybrid_mla_kda_attention() -> None:
 
 
 def test_fgbkda_backend_disables_incompatible_verify_replay(monkeypatch) -> None:
+    import importlib
+    import sys
+
+    # Pool-backed recurrence must import even when optional FLA is unavailable.
+    monkeypatch.setitem(sys.modules, "fla", None)
+    from tokenspeed_kernel.ops.attention.kda._triton import fla as kda_fla
+
+    importlib.reload(kda_fla)
     from tokenspeed.runtime.layers.attention import registry
     from tokenspeed.runtime.layers.attention.backends.state import kda as hybrid_kda
+    from tokenspeed.runtime.layers.attention.configs.base import (
+        AttnConfig,
+        SoftmaxAttnConfig,
+    )
+    from tokenspeed.runtime.layers.attention.configs.linear_attn import LinearAttnConfig
     from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
         LINEAR_ATTENTION,
     )
 
-    config = SimpleNamespace(
-        device=torch.device("cpu"),
-        num_attention_heads=2,
-        num_kv_heads=2,
-        attn_tp_size=1,
+    config = AttnConfig(
+        device="cpu",
         dtype=torch.bfloat16,
-        head_dim=8,
+        kv_cache_dtype=torch.bfloat16,
+        kv_cache_quant_method=None,
+        prefix_granularity=128,
+        context_len=4096,
         is_draft=False,
         speculative_num_draft_tokens=1,
         max_bs=1,
+        components=(
+            SoftmaxAttnConfig(
+                num_attention_heads=2, num_kv_heads=2, head_dim=8, attn_tp_size=1
+            ),
+            LinearAttnConfig(
+                num_k_heads=2,
+                num_v_heads=2,
+                head_k_dim=8,
+                head_v_dim=8,
+                conv_kernel_size=4,
+                layer_ids=(0,),
+                tp_size=1,
+            ),
+        ),
     )
     text_config = SimpleNamespace(
         full_attention_layer_ids=(1,),
@@ -200,6 +227,7 @@ def test_fgbkda_backend_disables_incompatible_verify_replay(monkeypatch) -> None
         is_kda=True,
     )
 
+    assert not backend.linear_attn_backend._enable_verify_replay
     assert not backend.linear_attn_backend._replay_active
 
 

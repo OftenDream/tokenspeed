@@ -24,7 +24,8 @@ KDA's applied decay gate is **per-channel**: a per-head log-decay
 ``A_log[num_heads]`` modulates a per-(head, channel) gate ``g [B, T, HV, K]`` --
 unlike GDN's scalar-per-head decay. ``fla``'s ``chunk_kda`` /
 ``fused_recurrent_kda`` implement the gated-delta scan. The optional dependency
-is imported only when this FLA implementation is selected.
+is imported only inside the FLA prefill and non-pool decode entry points.
+Pool-backed decode and verify use in-tree kernels and do not require FLA.
 
 The gate is computed inside ``fla``'s kernel (``use_gate_in_kernel=True``): we
 pass the raw ``g`` plus ``A_log`` and per-(head, channel) ``dt_bias``, and ``fla``
@@ -36,8 +37,6 @@ checkpoint stores ``A_log`` in a ``[head_dim]``-sized buffer zero-padded past
 from __future__ import annotations
 
 import torch
-from fla.ops.kda import chunk_kda
-from fla.ops.kda.fused_recurrent import fused_recurrent_kda
 from triton.runtime.jit import ConstexprFunction
 
 
@@ -76,6 +75,8 @@ def kda_chunk_prefill(
     stream-synchronizing D2H per KDA layer per chunk); with queued work ahead
     on the stream, that sync stalls the launch thread until the queue drains.
     """
+    from fla.ops.kda import chunk_kda
+
     # ``use_beta_sigmoid_in_kernel`` is a backend-extension kwarg that FLA's
     # native chunk_kda silently swallows via **kwargs — passing raw logits
     # with that flag makes the native path consume the LOGIT as the delta
@@ -222,6 +223,8 @@ def kda_recurrent_decode(
     (not in-place), so the caller must write it back. Same layout as
     :func:`kda_chunk_prefill`; safe gate applied in-kernel.
     """
+    from fla.ops.kda.fused_recurrent import fused_recurrent_kda
+
     # Unlike ``chunk_kda``, ``fused_recurrent_kda`` has no ``safe_gate`` flag: it
     # applies the safe gate whenever ``lower_bound`` is set.
     _ensure_triton_constexpr()
