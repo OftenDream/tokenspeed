@@ -31,6 +31,10 @@ from tokenspeed_kernel.ops.attention.dsv4.triton import (
 from tokenspeed_kernel.ops.kvcache.triton_virtual_blocks import virtual_slots_to_local
 from typing_extensions import override
 
+from tokenspeed.runtime.layers.attention.dcp.metadata import (
+    DCPPageTableMetadata,
+    refresh_dcp_page_table_metadata,
+)
 from tokenspeed.runtime.layers.attention.deepseek_v4_geometry import (
     V4_INDEXER_COMPRESSOR_STATE_GROUP_ID,
     V4_INDEXER_KV_GROUP_ID,
@@ -93,9 +97,11 @@ class DeepseekV4CacheMetadata:
     decode_compressed_slot_mappings: dict[tuple[int, bool, int], torch.Tensor] = field(
         default_factory=dict
     )
-    # Local read tables per compressed group; refreshed in place so CUDA
-    # graphs keep their captured pointers.
-    compressed_page_tables: dict[str, torch.Tensor] = field(default_factory=dict)
+    # Canonical DCP placement per compressed group; refreshed in place so
+    # CUDA graphs keep their captured table and owner-mask pointers.
+    compressed_page_metadata: dict[str, DCPPageTableMetadata] = field(
+        default_factory=dict
+    )
 
     @classmethod
     def from_group_tables(
@@ -155,9 +161,9 @@ class DeepseekV4CacheMetadata:
             dcp_rank=self.dcp_rank,
             runtime_contract=self.runtime_contract,
         )
-        sliced.compressed_page_tables = {
-            group_id: table[start:end]
-            for group_id, table in self.compressed_page_tables.items()
+        sliced.compressed_page_metadata = {
+            group_id: metadata.slice_requests(start, end)
+            for group_id, metadata in self.compressed_page_metadata.items()
         }
         return sliced
 
@@ -171,33 +177,22 @@ class DeepseekV4CacheMetadata:
         for group_id, table in self.block_tables.items():
             if parse_v4_compressed_kv_group_id(group_id) is None:
                 continue
-            out = self.compressed_page_tables.get(group_id)
-            if out is not None and (
-                out.shape != table.shape
-                or out.dtype != table.dtype
-                or out.device != table.device
-            ):
-                out = None
-            if out is None:
-                # Replay setup may run outside the warmup inference context.
-                with torch.inference_mode(False):
-                    out = torch.empty_like(table, memory_format=torch.contiguous_format)
-            local, owned = virtual_slots_to_local(
-                table,
-                rows_per_page=1,
+            metadata = refresh_dcp_page_table_metadata(
+                page_table=table,
                 virtual_block_count=self.runtime_contract.virtual_block_counts[
                     group_id
                 ],
                 degree=self.dcp_size,
                 rank=self.dcp_rank,
-                out=out,
+                previous=self.compressed_page_metadata.get(group_id),
             )
-            local.masked_fill_(~owned, -1)
-            self.compressed_page_tables[group_id] = local
+            self.compressed_page_metadata[group_id] = metadata
 
     def compressed_page_table(self, compress_ratio: int) -> torch.Tensor:
         """The local read table :meth:`refresh_page_tables` prepared."""
-        return self.compressed_page_tables[v4_compressed_kv_group_id(compress_ratio)]
+        return self.compressed_page_metadata[
+            v4_compressed_kv_group_id(compress_ratio)
+        ].local_page_table
 
     def compressed_block_table(self, compress_ratio: int) -> torch.Tensor:
         """The scheduler's virtual table for one compressed KV group."""

@@ -35,7 +35,9 @@ from tokenspeed.runtime.configs.model_config import AttentionArch
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention import registry
-from tokenspeed.runtime.layers.attention.backends.paged import ascend as ascend_backend
+from tokenspeed.runtime.layers.attention.backends.paged import (
+    ascend_dsa as ascend_backend,
+)
 from tokenspeed.runtime.layers.attention.backends.paged import dsa as dsa_backend
 from tokenspeed.runtime.layers.attention.backends.paged import mla as mla_backend
 from tokenspeed.runtime.layers.attention.configs.dsa import DSAConfig
@@ -534,9 +536,24 @@ def test_ascend_backend_owns_projection_branch_scheduling(indexed_backend, monke
 
 def test_ascend_dsa_isolated_from_common_backend():
     assert not hasattr(dsa_backend, "ascend_dsa_kernels")
+    assert not hasattr(dsa_backend.DSABackend, "_init_context_parallel")
+    assert not hasattr(dsa_backend.DSABackend, "_refresh_dcp_metadata")
     assert not hasattr(dsa_backend.DSABackend, "_select_indexed")
     assert not hasattr(dsa_backend.DSABackend, "_run_indexed_sparse_attention")
     assert issubclass(ascend_backend.AscendDSABackend, dsa_backend.DSABackend)
+
+
+def test_ascend_dsa_rejects_unimplemented_forward_variants(indexed_backend):
+    backend, _, _, _ = indexed_backend
+    unsupported = (
+        "forward_extend_chunked",
+        "forward_sparse_prefill",
+        "forward_sparse_decode",
+    )
+    for name in unsupported:
+        assert name in ascend_backend.AscendDSABackend.__dict__
+        with pytest.raises(NotImplementedError, match="Ascend DSA does not"):
+            getattr(backend, name)()
 
 
 def test_longcat_dcp_reuses_one_auxiliary_communicator(indexed_backend, monkeypatch):
@@ -552,29 +569,29 @@ def test_longcat_dcp_reuses_one_auxiliary_communicator(indexed_backend, monkeypa
     auxiliary_group = object()
     created = []
 
-    monkeypatch.setattr(dsa_backend.dist, "is_initialized", lambda: True)
-    monkeypatch.setattr(dsa_backend.dist, "get_world_size", lambda: 16)
+    monkeypatch.setattr(ascend_backend.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(ascend_backend.dist, "get_world_size", lambda: 16)
 
     def get_dedicated_device_group(group, namespace):
         created.append((group, namespace))
         return auxiliary_group
 
     monkeypatch.setattr(
-        dsa_backend.pg_manager,
+        ascend_backend.pg_manager,
         "get_dedicated_device_group",
         get_dedicated_device_group,
     )
     monkeypatch.setattr(
-        dsa_backend.pg_manager,
+        ascend_backend.pg_manager,
         "get_device_process_group",
         lambda group: primary_group,
     )
 
     backend = ascend_backend.AscendDSABackend(config, spec, kernel_page_size=128)
 
-    assert created == [(dcp_group, "longcat_dsa_aux")]
-    assert backend._dcp_process_group is primary_group
-    assert backend._dcp_aux_process_group is auxiliary_group
+    assert created == [(dcp_group, "dsa_cp_aux")]
+    assert backend._dcp.primary_process_group is primary_group
+    assert backend._dcp.auxiliary_process_group is auxiliary_group
     assert not hasattr(backend, "_dcp_query_process_group")
     assert not hasattr(backend, "_dcp_lse_process_group")
 
@@ -601,7 +618,7 @@ def test_bf16_dsa_refresh_is_pointer_stable_without_fp8_plan(indexed_backend, bs
         assert not hasattr(metadata, "_dsa_plan")
 
 
-@pytest.mark.parametrize("rank", [0, 1])
+@pytest.mark.parametrize("rank", [0, 1, 2])
 def test_longcat_dcp_metadata_is_owned_by_backend(indexed_backend, rank):
     _, config, spec, kernels = indexed_backend
     config = dataclasses.replace(
@@ -612,6 +629,7 @@ def test_longcat_dcp_metadata_is_owned_by_backend(indexed_backend, rank):
         dcp_group=tuple(range(8)),
     )
     backend = ascend_backend.AscendDSABackend(config, spec, kernel_page_size=128)
+    backend._dcp.bind_virtual_block_count(64)
     backend.init_cuda_graph_state(2)
     table = torch.zeros(2, backend.max_num_pages, dtype=torch.int32)
     table[0, :2] = torch.tensor([1, 2])
@@ -620,13 +638,23 @@ def test_longcat_dcp_metadata_is_owned_by_backend(indexed_backend, rank):
 
     backend.refresh_decode_metadata(2, 2, lengths, table)
     metadata = backend.forward_decode_metadata
-    expected_lengths = [129, 129] if rank == 0 else [0, 128]
-    assert backend._dcp_seq_lens.tolist() == expected_lengths
+    expected = {
+        0: ([128, 128], [[1], [9]], [4, 4], [128, 128]),
+        1: ([1, 128], [[2], [10]], [0, 0], [1, 128]),
+        2: ([0, 1], [[], [11]], [0, 0], [0, 1]),
+    }
+    expected_lengths, expected_pages, expected_init, expected_local = expected[rank]
+    assert backend._dcp.seq_lens.tolist() == expected_lengths
+    for row, pages in zip(backend._dcp.page_table, expected_pages):
+        assert row[: len(pages)].tolist() == pages
+        assert not row[len(pages) :].any()
+    assert backend._dcp.init_counts.tolist() == expected_init
+    assert backend._dcp.local_counts.tolist() == expected_local
     dcp_pointers = (
-        backend._dcp_page_table.data_ptr(),
-        backend._dcp_seq_lens.data_ptr(),
-        backend._dcp_init_counts.data_ptr(),
-        backend._dcp_local_counts.data_ptr(),
+        backend._dcp.page_table.data_ptr(),
+        backend._dcp.seq_lens.data_ptr(),
+        backend._dcp.init_counts.data_ptr(),
+        backend._dcp.local_counts.data_ptr(),
     )
     pointers = metadata.seq_lens.data_ptr(), metadata.page_table.data_ptr()
     backend.refresh_decode_metadata(2, 2, lengths, table, for_graph_replay=True)
@@ -635,10 +663,10 @@ def test_longcat_dcp_metadata_is_owned_by_backend(indexed_backend, rank):
         metadata.page_table.data_ptr(),
     )
     assert dcp_pointers == (
-        backend._dcp_page_table.data_ptr(),
-        backend._dcp_seq_lens.data_ptr(),
-        backend._dcp_init_counts.data_ptr(),
-        backend._dcp_local_counts.data_ptr(),
+        backend._dcp.page_table.data_ptr(),
+        backend._dcp.seq_lens.data_ptr(),
+        backend._dcp.init_counts.data_ptr(),
+        backend._dcp.local_counts.data_ptr(),
     )
 
 

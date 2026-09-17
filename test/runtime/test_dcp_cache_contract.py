@@ -40,10 +40,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from ci_system.ci_register import register_cuda_ci
 
 from tokenspeed.runtime.distributed.mapping import AttentionLayerMapping
+from tokenspeed.runtime.layers.attention.backends.paged.ascend_dsa import (
+    _AscendDSAContextParallel,
+)
 from tokenspeed.runtime.layers.attention.configs import base as configs_base
 from tokenspeed.runtime.layers.attention.configs.base import (
     AttnConfig,
     SoftmaxAttnConfig,
+)
+from tokenspeed.runtime.layers.attention.dcp.metadata import (
+    refresh_dcp_page_table_metadata,
 )
 from tokenspeed.runtime.layers.attention.deepseek_v4_geometry import (
     V4_INDEXER_KV_GROUP_ID,
@@ -75,6 +81,154 @@ register_cuda_ci(
     disabled_on_runners=None,
     disabled_on_runners_reason=None,
 )
+
+
+class SharedDCPPageTableMetadataTest(unittest.TestCase):
+    def test_v4_placement_drives_dsa_compaction_and_window_counts(self):
+        table = torch.zeros((2, 4), dtype=torch.int32)
+        table[0, :2] = torch.tensor([1, 2])
+        table[1, :3] = torch.tensor([9, 10, 11])
+        lengths = torch.tensor([129, 257], dtype=torch.int32)
+        expected = {
+            0: ([128, 128], [[1], [9]], [4, 4], [128, 128]),
+            1: ([1, 128], [[2], [10]], [0, 0], [1, 128]),
+            2: ([0, 1], [[], [11]], [0, 0], [0, 1]),
+        }
+
+        for rank, values in expected.items():
+            with self.subTest(rank=rank):
+                runtime = _AscendDSAContextParallel(
+                    degree=8,
+                    rank=rank,
+                    ranks=tuple(range(8)),
+                    auxiliary_namespace="test_dsa_cp_aux",
+                    virtual_block_count=33,
+                )
+                runtime.refresh_metadata(
+                    seq_lens=lengths,
+                    page_table=table,
+                    page_size=128,
+                    init_tokens=4,
+                    local_tokens=1024,
+                )
+                placement = runtime.page_placement
+                assert placement is not None
+                metadata = runtime.metadata(start=0, end=2)
+                seq_lens, pages, prefix_counts, suffix_counts = values
+                self.assertEqual(metadata.seq_lens.tolist(), seq_lens)
+                for row, expected_pages in zip(metadata.page_table, pages):
+                    self.assertEqual(
+                        row[: len(expected_pages)].tolist(), expected_pages
+                    )
+                    self.assertFalse(row[len(expected_pages) :].any())
+                self.assertEqual(metadata.init_counts.tolist(), prefix_counts)
+                self.assertEqual(metadata.local_counts.tolist(), suffix_counts)
+
+                expected_local = torch.where(
+                    placement.owner_mask,
+                    (table.to(torch.int64) - 1) // 8 + 1,
+                    torch.full_like(table, -1, dtype=torch.int64),
+                )
+                self.assertTrue(
+                    torch.equal(placement.local_page_table.long(), expected_local)
+                )
+
+    def test_rejects_invalid_geometry(self):
+        lengths = torch.ones(1, dtype=torch.int32)
+        table = torch.ones((1, 1), dtype=torch.int32)
+        cases = ({"degree": 0, "rank": 0}, {"degree": 2, "rank": 2})
+        for geometry in cases:
+            with self.subTest(**geometry), self.assertRaises(ValueError):
+                refresh_dcp_page_table_metadata(
+                    page_table=table,
+                    virtual_block_count=4,
+                    degree=geometry["degree"],
+                    rank=geometry["rank"],
+                    previous=None,
+                )
+
+
+class AscendDSAContextParallelTest(unittest.TestCase):
+    def test_metadata_buffers_are_pointer_stable_and_degree_one_is_local(self):
+        runtime = _AscendDSAContextParallel(
+            degree=1,
+            rank=0,
+            ranks=(0,),
+            auxiliary_namespace="test_dsa_cp_aux",
+            virtual_block_count=4,
+        )
+        lengths = torch.tensor([129], dtype=torch.int32)
+        table = torch.tensor([[1, 2, 0]], dtype=torch.int32)
+        runtime.refresh_metadata(
+            seq_lens=lengths,
+            page_table=table,
+            page_size=128,
+            init_tokens=4,
+            local_tokens=128,
+        )
+        pointers = (
+            runtime.page_table.data_ptr(),
+            runtime.seq_lens.data_ptr(),
+            runtime.init_counts.data_ptr(),
+            runtime.local_counts.data_ptr(),
+        )
+        placement = runtime.page_placement
+        assert placement is not None
+        placement_pointers = (
+            placement.local_page_table.data_ptr(),
+            placement.owner_mask.data_ptr(),
+        )
+
+        lengths.add_(1)
+        runtime.refresh_metadata(
+            seq_lens=lengths,
+            page_table=table,
+            page_size=128,
+            init_tokens=4,
+            local_tokens=128,
+        )
+        self.assertEqual(
+            pointers,
+            (
+                runtime.page_table.data_ptr(),
+                runtime.seq_lens.data_ptr(),
+                runtime.init_counts.data_ptr(),
+                runtime.local_counts.data_ptr(),
+            ),
+        )
+        placement = runtime.page_placement
+        assert placement is not None
+        self.assertEqual(
+            placement_pointers,
+            (
+                placement.local_page_table.data_ptr(),
+                placement.owner_mask.data_ptr(),
+            ),
+        )
+        batch = runtime.metadata(start=0, end=1)
+        self.assertEqual(batch.seq_lens.tolist(), [130])
+
+        source = torch.tensor([1, 2], dtype=torch.int32)
+        output = torch.empty_like(source)
+        self.assertIs(runtime.all_gather(source, auxiliary=True), source)
+        runtime.all_to_all(output, source, auxiliary=False)
+        self.assertTrue(torch.equal(output, source))
+
+    def test_rejects_invalid_topology(self):
+        cases = (
+            {"degree": 0, "rank": 0, "ranks": ()},
+            {"degree": 2, "rank": 0, "ranks": (0,)},
+            {"degree": 2, "rank": 2, "ranks": (0, 1)},
+        )
+        for topology in cases:
+            with self.subTest(**topology), self.assertRaises(ValueError):
+                _AscendDSAContextParallel(
+                    degree=topology["degree"],
+                    rank=topology["rank"],
+                    ranks=topology["ranks"],
+                    auxiliary_namespace="test_dsa_cp_aux",
+                    virtual_block_count=None,
+                )
 
 
 def _full_history_spec(group_id: str, *, shard_count: int) -> CacheGroupSpec:
@@ -263,6 +417,41 @@ def _metadata(*, dcp_size: int, dcp_rank: int, table: torch.Tensor):
 
 
 class CacheMetadataTranslationTest(unittest.TestCase):
+    def test_v4_and_dsa_share_the_same_page_placement(self):
+        table = torch.tensor([[1, 2, 3, 4], [5, 6, 7, 8]], dtype=torch.int32)
+        v4 = _metadata(dcp_size=2, dcp_rank=1, table=table)
+        v4.refresh_page_tables()
+        runtime = _AscendDSAContextParallel(
+            degree=2,
+            rank=1,
+            ranks=(0, 1),
+            auxiliary_namespace="test_dsa_cp_aux",
+            virtual_block_count=9,
+        )
+        runtime.refresh_metadata(
+            seq_lens=torch.tensor([256, 256], dtype=torch.int32),
+            page_table=table,
+            page_size=64,
+            init_tokens=4,
+            local_tokens=128,
+        )
+        placement = runtime.page_placement
+        assert placement is not None
+        group_id = v4_compressed_kv_group_id(4)
+        v4_placement = v4.compressed_page_metadata[group_id]
+        self.assertTrue(
+            torch.equal(
+                placement.local_page_table,
+                v4_placement.local_page_table,
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                placement.owner_mask,
+                v4_placement.owner_mask,
+            )
+        )
+
     def test_read_tables_mark_null_and_foreign_pages_and_refresh_in_place(self):
         table = torch.tensor(
             [[1, 2, 3, 4], [5, 6, 7, 8], [0, 0, 0, 0]], dtype=torch.int32
@@ -273,6 +462,10 @@ class CacheMetadataTranslationTest(unittest.TestCase):
                     metadata = _metadata(dcp_size=dcp_size, dcp_rank=rank, table=table)
                     metadata.refresh_page_tables()
                     read = metadata.compressed_page_table(4)
+                    placement = metadata.compressed_page_metadata[
+                        v4_compressed_kv_group_id(4)
+                    ]
+                    owners = placement.owner_mask
                     virtual = table.long()
                     owned = (virtual > 0) & ((virtual - 1) % dcp_size == rank)
                     expected = torch.where(
@@ -284,7 +477,7 @@ class CacheMetadataTranslationTest(unittest.TestCase):
                     # Only compressed groups get a read view; the indexer reads
                     # its replicated table directly.
                     self.assertEqual(
-                        set(metadata.compressed_page_tables),
+                        set(metadata.compressed_page_metadata),
                         {v4_compressed_kv_group_id(4)},
                     )
                     table[0, 0] = 2
@@ -293,6 +486,12 @@ class CacheMetadataTranslationTest(unittest.TestCase):
                         metadata.compressed_page_table(4).data_ptr(),
                         read.data_ptr(),
                         "graph-captured read tables must be refreshed, not replaced",
+                    )
+                    self.assertEqual(
+                        metadata.compressed_page_metadata[
+                            v4_compressed_kv_group_id(4)
+                        ].owner_mask.data_ptr(),
+                        owners.data_ptr(),
                     )
                     table[0, 0] = 1
 

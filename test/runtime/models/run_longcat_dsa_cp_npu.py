@@ -14,6 +14,10 @@ import torch.distributed as dist
 import torch_npu  # noqa: F401
 from tokenspeed_kernel_npu.ops.longcat_dsa import AscendDSAKernels
 
+from tokenspeed.runtime.layers.attention.dcp.metadata import (
+    refresh_dcp_page_table_metadata,
+)
+
 DEGREE = 8
 HEADS = 64
 HEADS_PER_RANK = HEADS // DEGREE
@@ -31,29 +35,21 @@ def _all_gather(tensor: torch.Tensor) -> torch.Tensor:
 
 
 def _owned_metadata(rank: int, table: torch.Tensor):
-    table_cpu = table.cpu()
-    local_table = torch.zeros_like(table_cpu)
-    local_lengths = torch.zeros(TOKENS, dtype=torch.int32)
-    init_counts = torch.zeros(TOKENS, dtype=torch.int32)
-    local_counts = torch.zeros(TOKENS, dtype=torch.int32)
-    for request in range(TOKENS):
-        owned_columns = []
-        for column, page in enumerate(table_cpu[request].tolist()):
-            owner = 0 if column == PAGES_PER_REQUEST - 1 else (page - 1) % DEGREE
-            if owner == rank:
-                owned_columns.append(column)
-        pages = table_cpu[request, owned_columns]
-        local_table[request, : pages.numel()] = pages
-        local_lengths[request] = pages.numel() * PAGE_SIZE
-        init_counts[request] = sum(column == 0 for column in owned_columns) * 4
-        local_counts[request] = (
-            sum(column >= PAGES_PER_REQUEST - 8 for column in owned_columns) * PAGE_SIZE
-        )
+    placement = refresh_dcp_page_table_metadata(
+        page_table=table,
+        virtual_block_count=1 + TOKENS * PAGES_PER_REQUEST,
+        degree=DEGREE,
+        rank=rank,
+        previous=None,
+    )
+    owned = placement.owner_mask
+    mapped = torch.where(owned, table, 0)
+    permutation = (~owned).to(torch.int32).argsort(dim=1, stable=True)
     return (
-        local_table.npu(),
-        local_lengths.npu(),
-        init_counts.npu(),
-        local_counts.npu(),
+        mapped.gather(1, permutation),
+        owned.sum(dim=1, dtype=torch.int32) * PAGE_SIZE,
+        owned[:, :1].sum(dim=1, dtype=torch.int32) * 4,
+        owned[:, -8:].sum(dim=1, dtype=torch.int32) * PAGE_SIZE,
     )
 
 
@@ -130,7 +126,7 @@ def main() -> None:
             TOPK,
             init_counts,
             local_counts,
-            sparse_mode=3 if rank == 0 else 0,
+            sparse_mode=3,
         )
 
         received_values = torch.empty_like(local_values.squeeze(1).reshape(-1))
@@ -162,7 +158,7 @@ def main() -> None:
             local_lengths,
             local_table,
             192**-0.5,
-            sparse_mode=3 if rank == 0 else 0,
+            sparse_mode=3,
         )
 
         output_send = partial.view(DEGREE, HEADS_PER_RANK, TOKENS, 512).contiguous()

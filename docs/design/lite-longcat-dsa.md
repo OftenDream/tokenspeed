@@ -15,7 +15,7 @@ and DCP-partial contracts while their defaults preserve the packed GPU path.
 Execution keeps the existing `DSABackend` contract and graph lifecycle. The
 common/CUDA implementation remains in
 `backends/paged/dsa.py`; the Ascend implementation is the
-`AscendDSABackend` subclass in `backends/paged/ascend.py`. The canonical
+`AscendDSABackend` subclass in `backends/paged/ascend_dsa.py`. The canonical
 backend name is `dsa`; `longcat_dsa` remains a compatibility alias selected by
 the same registry.
 
@@ -62,13 +62,18 @@ Runtime calls the `tokenspeed-kernel` facade. As with `dsa/cuda.py`,
 `dsa/ascend.py` registers the Ascend solutions and adapts the optional NPU
 extension. The NPU package owns only device primitives: cache scatter,
 LightningIndexer, local-index selection, SparseFlashAttention and partial
-merge. Common `DSABackend` code owns CP page compaction and
-communication-group state. `AscendDSABackend` owns the Ascend A2A/AG, global
-TopK, O/LSE exchange and stream overlap that consume those primitives. It
-also owns the auxiliary stream, graph/capture checks, and per-stream core
-budgets for overlapping Indexer and MLA projections. The model submits two
-logical projection callables through the backend contract and carries no
-device scheduling state. The existing
+merge. The model-independent `attention/dcp` package owns cyclic page
+placement and virtual-to-local translation. DeepSeek V4 and DSA call the same
+`refresh_dcp_page_table_metadata` constructor; V4 consumes its local physical
+table, while DSA derives LightningIndexer's compact replicated-cache ABI from
+the constructor's owner mask. Neither backend computes page ownership itself.
+The common `DSABackend` remains free of device-specific CP scheduling. The
+Ascend backend owns its pointer-stable compact indexer metadata, collective
+state, A2A/AG, global TopK, O/LSE exchange and stream overlap. It also owns
+the auxiliary stream, graph/capture checks, and per-stream core budgets for
+overlapping Indexer and MLA projections. The model submits two logical
+projection callables through the backend contract and carries no device
+scheduling state. The existing
 `forward_sparse_prefill` and `forward_sparse_decode` interfaces are unchanged;
 the independent Ascend path enters its private CP scheduler directly instead
 of adding an opaque selection argument to either interface. Missing operator
@@ -76,10 +81,20 @@ bindings fail at construction. A matching Python extension and custom OPP
 vendor containing both operators must be installed; finding a Python schema
 alone does not verify the vendor binaries.
 
+Decode CP preserves the scheduler page's natural cyclic owner; it does not
+move every live tail page to rank 0. The current independent Ascend path admits
+one query token per request, so every local partial uses causal mode 3: at
+`q_len == 1` its visible length is the complete rank-local KV length. A future
+multi-token draft path must represent the per-request tail owner explicitly
+instead of introducing a rank-0 convention.
+
 The common backend continues to receive global-slot TopK indices and use the
 existing `forward_sparse_prefill` / `forward_sparse_decode` path. The Ascend
 subclass receives LongCat indexer projections, selects request-local indices,
-and reuses the same dense-leaf metadata contract. Only the original FP8
+and exposes only its native `forward_extend` / `forward_decode` execution.
+Inherited chunked-prefill and externally selected sparse entry points fail
+explicitly instead of falling back to a common dense or GPU implementation.
+The Ascend subclass reuses the same dense-leaf metadata contract. Only the original FP8
 indexer requires `dsa_plan`; the BF16 Ascend indexer consumes lengths and page
 tables directly. Prefill retains the full-history table even with an empty
 prefix. NVIDIA/AMD dense delegates and precomputed-TopK execution are
@@ -109,8 +124,8 @@ contracts. Backend regressions also cover the shared DSA leaf's registration,
 pointer-stable decode metadata, mixed-batch request offsets, no-prefix and
 cached-prefill tables, and the unchanged GPU indexer-plan contract.
 `tokenspeed-kernel-npu/test/test_longcat_dsa.py` separately validates the
-device-only adapter. Runtime tests validate CP page compaction and
-pointer-stable buffers because those are scheduler state, not device kernels.
+device-only adapter. Runtime tests validate the Ascend backend's CP page
+compaction and pointer-stable buffers separately from device kernels.
 
 On an allocated NPU with matching operator bindings and vendor binaries:
 

@@ -24,7 +24,6 @@ import dataclasses
 from typing import TYPE_CHECKING
 
 import torch
-import torch.distributed as dist
 from tokenspeed_kernel.ops.attention.dsa import (
     dsa_decode,
     dsa_plan,
@@ -36,9 +35,6 @@ from tokenspeed_kernel.ops.attention.dsa.triton import (
 from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.configs.model_config import AttentionArch
-from tokenspeed.runtime.distributed.process_group_manager import (
-    process_group_manager as pg_manager,
-)
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.backends.paged.base import (
     PagedAttentionBackend,
@@ -402,128 +398,6 @@ class DSABackend(PagedAttentionBackend):
     # ------------------------------------------------------------------
     # Forward
     # ------------------------------------------------------------------
-
-    def _init_context_parallel(self, config, spec, kernels) -> None:
-        """Initialize the shared DSA context-parallel communication state."""
-        self.dcp_size = int(config.dcp_size)
-        self.dcp_rank = int(config.dcp_rank)
-        self.dcp_group = tuple(config.dcp_group)
-        self._dcp_process_group = None
-        self._dcp_aux_process_group = None
-        self._dcp_page_table = None
-        self._dcp_seq_lens = None
-        self._dcp_init_counts = None
-        self._dcp_local_counts = None
-        if self.dcp_size == 1:
-            return
-        kernels.require_context_parallel()
-        if len(self.dcp_group) != self.dcp_size:
-            raise ValueError("DSA DCP group size does not match dcp_size")
-        if not 0 <= self.dcp_rank < self.dcp_size:
-            raise ValueError("DSA DCP rank is outside its group")
-        if spec.attn_tp_size != self.dcp_size:
-            raise ValueError(
-                "DSA requires DCP to span the complete head-TP group, got "
-                f"dcp={self.dcp_size}, head_tp={spec.attn_tp_size}"
-            )
-        if self.num_local_heads * self.dcp_size != spec.num_attention_heads:
-            raise ValueError("DSA DCP does not reconstruct all query heads")
-        if dist.is_initialized() and dist.get_world_size() > max(self.dcp_group):
-            self._dcp_process_group = pg_manager.get_device_process_group(
-                self.dcp_group
-            )
-            self._dcp_aux_process_group = pg_manager.get_dedicated_device_group(
-                self.dcp_group, "longcat_dsa_aux"
-            )
-
-    def _replace_dcp_buffer(self, name, value):
-        target = getattr(self, name)
-        if (
-            target is None
-            or target.shape != value.shape
-            or target.dtype != value.dtype
-            or target.device != value.device
-        ):
-            target = torch.empty_like(value)
-            setattr(self, name, target)
-        target.copy_(value)
-
-    def _refresh_dcp_metadata(
-        self,
-        *,
-        lengths,
-        table,
-        page_size,
-        initial_tokens,
-        local_tokens,
-    ):
-        """Refresh pointer-stable page metadata owned by the CP scheduler."""
-        columns = torch.arange(table.shape[1], device=table.device)
-        lengths_i64 = lengths.to(torch.int64)
-        valid_columns = columns.unsqueeze(0) < (
-            (lengths_i64.unsqueeze(1) + page_size - 1) // page_size
-        )
-        page_owners = (table.to(torch.int64) - 1) % self.dcp_size
-        last_columns = ((lengths_i64 + page_size - 1) // page_size - 1).clamp_min(0)
-        current_pages = columns.unsqueeze(0) == last_columns.unsqueeze(1)
-        page_owners = torch.where(
-            current_pages, torch.zeros_like(page_owners), page_owners
-        )
-        owned = valid_columns & (table > 0) & (page_owners == self.dcp_rank)
-        mapped = torch.where(owned, table, 0)
-        permutation = (~owned).to(torch.int32).argsort(dim=1, stable=True)
-        compact = mapped.gather(1, permutation)
-        page_tokens = (
-            lengths_i64.unsqueeze(1) - columns.to(torch.int64).unsqueeze(0) * page_size
-        ).clamp(min=0, max=page_size)
-        local_lengths = (page_tokens * owned).sum(dim=1).to(torch.int32)
-
-        batch = lengths_i64.shape[0]
-        init_positions = (
-            torch.arange(initial_tokens, device=table.device, dtype=torch.int64)
-            .unsqueeze(0)
-            .expand(batch, -1)
-        )
-        init_valid = init_positions < lengths_i64.unsqueeze(1)
-        init_columns = (init_positions // page_size).clamp_max(table.shape[1] - 1)
-        init_pages = table.gather(1, init_columns)
-        init_owners = page_owners.gather(1, init_columns)
-        init_counts = (
-            init_valid & (init_pages > 0) & (init_owners == self.dcp_rank)
-        ).sum(dim=1, dtype=torch.int32)
-
-        local_offsets = (
-            torch.arange(local_tokens, device=table.device, dtype=torch.int64)
-            .unsqueeze(0)
-            .expand(batch, -1)
-        )
-        local_starts = (lengths_i64 - local_tokens).clamp_min(0).unsqueeze(1)
-        local_positions = local_starts + local_offsets
-        local_valid = local_positions < lengths_i64.unsqueeze(1)
-        local_columns = (local_positions // page_size).clamp_max(table.shape[1] - 1)
-        local_pages = table.gather(1, local_columns)
-        local_owners = page_owners.gather(1, local_columns)
-        local_counts = (
-            local_valid & (local_pages > 0) & (local_owners == self.dcp_rank)
-        ).sum(dim=1, dtype=torch.int32)
-
-        self._replace_dcp_buffer("_dcp_page_table", compact)
-        self._replace_dcp_buffer("_dcp_seq_lens", local_lengths)
-        self._replace_dcp_buffer("_dcp_init_counts", init_counts)
-        self._replace_dcp_buffer("_dcp_local_counts", local_counts)
-
-    def _dcp_all_gather(self, tensor, process_group):
-        output = torch.empty(
-            (self.dcp_size * tensor.shape[0],) + tensor.shape[1:],
-            dtype=tensor.dtype,
-            device=tensor.device,
-        )
-        dist.all_gather_into_tensor(output, tensor, group=process_group)
-        return output
-
-    @staticmethod
-    def _dcp_all_to_all(output, input_tensor, process_group):
-        dist.all_to_all_single(output, input_tensor, group=process_group)
 
     def forward_extend(
         self,
