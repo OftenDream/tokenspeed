@@ -40,7 +40,7 @@ _CAPABILITIES = {
     [
         ("cuda", "auto", ("device", "runtime-full-history")),
         ("cuda", "device", ("device", "runtime-full-history")),
-        ("npu", "auto", ("host", "runtime-full-history")),
+        ("npu", "auto", ("device", "runtime-full-history")),
         ("npu", "host", ("host", "runtime-full-history")),
         ("npu", "device", ("device", "runtime-full-history")),
     ],
@@ -134,6 +134,6 @@ def test_model_loader_resolves_and_passes_class_declared_plan(monkeypatch) -> No
 
     model = loader._initialize_model(model_config, SimpleNamespace())
 
-    assert model_config.oe_table_placement == "host"
+    assert model_config.oe_table_placement == "device"
     assert model_config.oe_state_provider == "runtime-full-history"
-    assert model.kwargs["oe_table_placement"] == "host"
+    assert model.kwargs["oe_table_placement"] == "device"
