@@ -39,12 +39,18 @@ installs the core backend file before compiling. Third-party dependencies are
 installed by the outer package installer from the generated metadata. They are
 not optional despite being kept in a separate file.
 
+The opt-in cu129 installer supplies CUDA 12 dependencies before the build.
+TOKENSPEED_KERNEL_CUDA_VARIANT=cu129 adjusts the CuTe runtime metadata,
+omits CUDA-13-only KDA AOT, and skips the nested dependency installation.
+
 Kernel compilation
 ==================
 
 Compiles .cu files into shared libraries (.so) loaded via tvm_ffi.load_module().
 On systems without an NVIDIA CUDA build target, the build is skipped and the
 package installs as a pure-Python stub.
+The cu129 installer rebuilds native kernels even when checkout artifacts are
+newer than their sources, so an earlier CUDA 13 build cannot be reused.
 """
 
 import ctypes
@@ -254,6 +260,20 @@ def _selected_install_requires() -> list[str]:
         _read_requirements(REQUIREMENTS_DIR / f"{backend}-thirdparty.txt")
     )
 
+    # Opt-in source-install recipe for Hopper/cu129. Keep the existing CUDA
+    # pins, substituting the CuTe runtime and omitting CUDA-13-only KDA AOT.
+    if (
+        backend == "cuda"
+        and os.environ.get("TOKENSPEED_KERNEL_CUDA_VARIANT") == "cu129"
+    ):
+        requirements = [
+            requirement.replace(
+                "nvidia-cutlass-dsl[cu13]", "nvidia-cutlass-dsl"
+            ).replace("nvidia-cutlass-dsl-libs-cu13", "nvidia-cutlass-dsl-libs-cu12")
+            for requirement in requirements
+            if not requirement.startswith("tokenspeed-cutedsl-kda==")
+        ]
+
     deduped = []
     seen = set()
     for requirement in requirements:
@@ -287,8 +307,15 @@ def _refresh_python_install_paths() -> None:
     importlib.invalidate_caches()
 
 
-def _install_backend_build_requirements(verbose=False) -> None:
+def _install_backend_build_requirements(verbose) -> None:
     backend = _selected_backend()
+    if (
+        backend == "cuda"
+        and os.environ.get("TOKENSPEED_KERNEL_CUDA_VARIANT") == "cu129"
+    ):
+        # The cu129 recipe installs dependencies before building; nested pip
+        # would reinstall the default CUDA 13 requirements here.
+        return
     print(f"Installing {backend} build requirements before native build")
     subprocess.check_call(
         [
@@ -818,8 +845,13 @@ class CudaKernelBuilder:
             out_dir = CUDA_OBJS_DIR / name
             out_dir.mkdir(parents=True, exist_ok=True)
             so_path = out_dir / f"{name}.so"
-            if so_path.exists() and all(
-                so_path.stat().st_mtime > src.stat().st_mtime for src in sources
+            # A cu129 install must not reuse CUDA 13 objects from this checkout.
+            if (
+                os.environ.get("TOKENSPEED_KERNEL_CUDA_VARIANT") != "cu129"
+                and so_path.exists()
+                and all(
+                    so_path.stat().st_mtime > src.stat().st_mtime for src in sources
+                )
             ):
                 skipped_groups += 1
                 continue

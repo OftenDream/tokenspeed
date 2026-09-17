@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import os
 import runpy
 import shutil
 import tarfile
 from collections import Counter
 from pathlib import Path
 
+import pytest
 import setuptools
 from packaging.requirements import Requirement
 from packaging.utils import canonicalize_name
@@ -71,6 +73,104 @@ def test_cuda_install_requires_include_runtime_dependencies(monkeypatch) -> None
     assert "tokenspeed-triton-kernels" not in requirements
     assert requirements["nvidia-cutlass-dsl"].extras == {"cu13"}
     assert str(requirements["nvidia-cudnn-frontend"].specifier) == "==1.26.0"
+
+
+def test_opt_in_cu129_metadata_preserves_other_cuda_pins(monkeypatch) -> None:
+    monkeypatch.setenv("TOKENSPEED_KERNEL_CUDA_VARIANT", "cu129")
+    actual = _requirements_by_name(_capture_install_requires(monkeypatch, "cuda"))
+    expected = _requirements_by_name(_expected_install_requires("cuda"))
+    expected["nvidia-cutlass-dsl"] = Requirement("nvidia-cutlass-dsl==4.7.1")
+    expected.pop("nvidia-cutlass-dsl-libs-cu13")
+    expected["nvidia-cutlass-dsl-libs-cu12"] = Requirement(
+        "nvidia-cutlass-dsl-libs-cu12==4.7.1"
+    )
+    expected.pop("tokenspeed-cutedsl-kda")
+
+    assert actual == expected
+
+
+@pytest.mark.parametrize("variant", ["", "cu129"])
+def test_cu129_variant_preserves_rocm_metadata(monkeypatch, variant: str) -> None:
+    monkeypatch.setenv("TOKENSPEED_KERNEL_CUDA_VARIANT", variant)
+
+    assert _capture_install_requires(monkeypatch, "rocm") == _expected_install_requires(
+        "rocm"
+    )
+
+
+@pytest.mark.parametrize(
+    ("backend", "variant", "installs_requirements"),
+    [("cuda", "", True), ("rocm", "cu129", True), ("cuda", "cu129", False)],
+)
+def test_only_cu129_recipe_skips_nested_pip(
+    monkeypatch, backend: str, variant: str, installs_requirements: bool
+) -> None:
+    monkeypatch.setenv("TOKENSPEED_KERNEL_BACKEND", backend)
+    monkeypatch.setenv("TOKENSPEED_KERNEL_CUDA_VARIANT", variant)
+    monkeypatch.setattr(setuptools, "setup", lambda **_kwargs: None)
+    namespace = runpy.run_path(str(SETUP_PY))
+    install = namespace["_install_backend_build_requirements"]
+    calls = []
+    monkeypatch.setattr(namespace["subprocess"], "check_call", calls.append)
+    monkeypatch.setitem(
+        install.__globals__, "_refresh_python_install_paths", lambda: None
+    )
+
+    install(False)
+
+    assert bool(calls) == installs_requirements
+    if calls:
+        assert calls[0][1:4] == ["-m", "pip", "install"]
+        assert str(REQUIREMENTS_DIR / f"{backend}.txt") in calls[0]
+
+
+@pytest.mark.parametrize(
+    ("variant", "source_newer", "rebuilds"),
+    [
+        ("", False, False),
+        ("cu130", False, False),
+        ("cu129", False, True),
+        ("", True, True),
+    ],
+)
+def test_cu129_rebuilds_cached_cuda_kernels(
+    tmp_path, monkeypatch, variant: str, source_newer: bool, rebuilds: bool
+) -> None:
+    monkeypatch.setenv("TOKENSPEED_KERNEL_BACKEND", "cuda")
+    monkeypatch.setenv("TOKENSPEED_KERNEL_CUDA_VARIANT", variant)
+    monkeypatch.setenv("TOKENSPEED_CUDA_ARCH", "90")
+    monkeypatch.delenv("FLASHINFER_CUDA_ARCH_LIST", raising=False)
+    monkeypatch.setenv("MAX_JOBS", "1")
+    monkeypatch.setattr(setuptools, "setup", lambda **_kwargs: None)
+    namespace = runpy.run_path(str(SETUP_PY))
+
+    source = tmp_path / "cached.cu"
+    source.touch()
+    output_dir = tmp_path / "objs"
+    library = output_dir / "cached" / "cached.so"
+    library.parent.mkdir(parents=True)
+    library.touch()
+    source_mtime = 3000 if source_newer else 1000
+    os.utime(source, (source_mtime, source_mtime))
+    os.utime(library, (2000, 2000))
+
+    builder = namespace["CudaKernelBuilder"]([("cached", [source], [])], verbose=False)
+    monkeypatch.setitem(builder.run.__globals__, "CUDA_OBJS_DIR", output_dir)
+    monkeypatch.setattr(builder, "_prepare_cuda_toolchain_env", lambda: None)
+    monkeypatch.setattr(builder, "_resolve_include_dirs", lambda: [])
+    monkeypatch.setattr(builder, "_resolve_cuda_lib_flags", lambda: [])
+    calls = []
+    monkeypatch.setattr(namespace["subprocess"], "check_call", calls.append)
+
+    builder.run()
+
+    if rebuilds:
+        assert len(calls) == 2
+        assert "-gencode=arch=compute_90a,code=sm_90a" in calls[0]
+        assert calls[0][-4:-2] == ["-c", str(source)]
+        assert calls[1][-2:] == ["-o", str(library)]
+    else:
+        assert not calls
 
 
 def test_cuda_thirdparty_requirements_are_exactly_pinned() -> None:
