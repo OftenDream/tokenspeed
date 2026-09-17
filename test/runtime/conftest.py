@@ -7,6 +7,9 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
+from tokenspeed_kernel.ops.over_embedding import OverEmbeddingSpec, TableFragmentSpec
+
+import tokenspeed.runtime.layers.over_embedding as over_embedding
 
 requires_cuda = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="requires CUDA"
@@ -245,3 +248,47 @@ def full_attention_metadata_for(pool, full_table_np, device):
         {"full_attention": np.asarray(full_table_np, dtype=np.int32)},
         device,
     )
+
+
+@pytest.fixture(autouse=True)
+def support_tiny_oe_profile(monkeypatch):
+    """Keep Flash-Lite tests small while preserving production TP ownership."""
+    production_resolver = over_embedding.resolve_longcat_oe_spec
+
+    def resolve(**kwargs):
+        if (kwargs["vocab_size"], kwargs["hidden_size"]) != (120, 96):
+            return production_resolver(**kwargs)
+        tp_size = kwargs["tp_size"]
+        rank = kwargs["tp_rank"]
+        branch_count = (kwargs["max_ngram_order"] - 1) * kwargs["hashes_per_order"]
+        branch_width = kwargs["hidden_size"] // branch_count
+        modulus0 = kwargs["modulus0"]
+
+        def fragment(branch_id, begin=0, width=branch_width):
+            return TableFragmentSpec(
+                branch_id,
+                branch_id // kwargs["hashes_per_order"] + 2,
+                modulus0 + 2 * branch_id,
+                begin,
+                width,
+            )
+
+        if tp_size == 1:
+            fragments = tuple(fragment(branch_id) for branch_id in range(branch_count))
+        elif tp_size == 8:
+            fragments = (fragment(rank), fragment(rank + 8))
+        else:
+            raise ValueError(f"unsupported tiny-test TP size {tp_size}")
+        return OverEmbeddingSpec(
+            profile="tiny-longcat-lite",
+            tp_size=tp_size,
+            rank=rank,
+            vocab_size=kwargs["vocab_size"],
+            branch_count=branch_count,
+            branch_width=branch_width,
+            hidden_size=kwargs["hidden_size"],
+            max_ngram_order=kwargs["max_ngram_order"],
+            fragments=fragments,
+        )
+
+    monkeypatch.setattr(over_embedding, "resolve_longcat_oe_spec", resolve)

@@ -68,6 +68,14 @@ public checkout when the build host has no network access.
 The optimized Lite causal-conv path is supplied separately by the `flash_ops`
 run package and wheel built from `flash-npu-kernel`. If that package or its
 schemas are unavailable, TokenSpeed keeps the existing Torch fallback.
+For real cache arenas, the wheel must expose
+`flash_ops.CAUSAL_CONV1D_STATE_SLOT_STRIDE` and be paired with its matching OPP.
+Both Prefill (including one request) and Decode consume state
+`[slots, width - 1, channels]` with strides `[S, channels, 1]`, allowing
+`S >= (width - 1) * channels`, and independent read/write slots.
+An explicit `solution="public_kda"` fails if this capability is absent; automatic
+selection falls back to the reference composition. See the
+[causal-conv contract](../docs/design/lite-npu-phase-04b-causal-conv.md#12-prefill-checkpoint-ownership).
 
 Run the operator correctness suite on a visible NPU with:
 

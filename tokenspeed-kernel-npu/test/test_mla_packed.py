@@ -30,9 +30,13 @@ from tokenspeed_kernel_npu.ops import mla_packed as adapter
 
 @pytest.fixture(autouse=True)
 def reset_loader():
-    adapter._packed_op.cache_clear()
+    loader = adapter._packed_op
+    prefill_loader = adapter._packed_prefill_op
+    loader.cache_clear()
+    prefill_loader.cache_clear()
     yield
-    adapter._packed_op.cache_clear()
+    loader.cache_clear()
+    prefill_loader.cache_clear()
 
 
 def geometry(batch, heads, page_size):
@@ -341,3 +345,137 @@ def test_fused_prolog_to_packed_graph(
             native.setattr(adapter, "_packed_op", lambda: None)
             reference = invoke(lengths)
         torch.testing.assert_close(saved, reference, rtol=0.01, atol=0.001)
+
+
+@pytest.mark.parametrize("queries,page_size", [(1, 64), (7, 128), (4096, 64)])
+def test_prefill_capability_geometry(monkeypatch, queries, page_size):
+    q, cache, table = geometry(2, 32, page_size)
+    q.shape, q.ndim = (queries * 2, 32, 576), 3
+    op = Mock()
+    monkeypatch.setattr(adapter, "_packed_prefill_op", lambda: op)
+    assert adapter.packed_mla_prefill_op(q, cache, table, queries, 65536) is op
+
+
+@pytest.mark.parametrize(
+    "case", ["explicit", "page", "stride", "query_bound", "kv_bound", "dtype"]
+)
+def test_prefill_unsupported_geometry_falls_back(monkeypatch, case):
+    q, cache, table = geometry(2, 32, 64)
+    q.shape, q.ndim = (8192, 32, 576), 3
+    queries, context = 4096, 65536
+    if case == "explicit":
+        q.shape = (8192, 32, 192)
+    elif case == "page":
+        cache.shape = (64, 16, 1, 576)
+    elif case == "stride":
+        cache.is_contiguous = lambda: False
+    elif case == "query_bound":
+        queries = 4097
+    elif case == "kv_bound":
+        context = 1048577
+    else:
+        q.dtype = torch.float16
+    loader = Mock()
+    monkeypatch.setattr(adapter, "_packed_prefill_op", loader)
+    assert adapter.packed_mla_prefill_op(q, cache, table, queries, context) is None
+    loader.assert_not_called()
+
+
+def test_prefill_missing_package(monkeypatch):
+    monkeypatch.setattr(
+        adapter.importlib,
+        "import_module",
+        Mock(side_effect=ModuleNotFoundError("missing", name="flash_ops")),
+    )
+    assert adapter._packed_prefill_op() is None
+
+
+def test_prefill_broken_dependency_propagates(monkeypatch):
+    monkeypatch.setattr(
+        adapter.importlib,
+        "import_module",
+        Mock(side_effect=ModuleNotFoundError("missing", name="dependency")),
+    )
+    with pytest.raises(ModuleNotFoundError):
+        adapter._packed_prefill_op()
+
+
+@pytest.mark.parametrize("capability", ["operator", "out", "lengths", "supported"])
+def test_prefill_package_capability(monkeypatch, capability):
+    op = Mock()
+    op._schema = SimpleNamespace(
+        arguments=[SimpleNamespace(type="Tensor") for _ in range(12)]
+    )
+    for i in (4, 5):
+        op._schema.arguments[i].type = (
+            "Tensor" if capability == "lengths" else "List[int]"
+        )
+    packet = None if capability == "operator" else SimpleNamespace()
+    if packet is not None and capability != "out":
+        packet.out = op
+    monkeypatch.setattr(
+        adapter.torch,
+        "ops",
+        SimpleNamespace(custom=SimpleNamespace(npu_mla_fia_packed_prefill=packet)),
+    )
+    monkeypatch.setattr(adapter.importlib, "import_module", lambda name: object())
+    assert adapter._packed_prefill_op() is (op if capability == "supported" else None)
+
+
+@pytest.mark.skipif(
+    not hasattr(torch, "npu") or not torch.npu.is_available(), reason="requires NPU"
+)
+@torch.inference_mode()
+def test_packed_graph_service_geometry(monkeypatch):
+    from tokenspeed_kernel_npu.ops.mla import mla_decode_with_kvcache
+
+    assert adapter._packed_op() is not None
+    torch.manual_seed(1730)
+    batch, heads, page, maximum = 32, 32, 64, 81920
+    pages_per_request = maximum // page
+    q = torch.randn(batch, 1, heads, 576, dtype=torch.bfloat16, device="npu") * 0.1
+    backing = torch.empty(
+        batch * pages_per_request + 4, page, 1, 576, dtype=q.dtype, device=q.device
+    )
+    backing.normal_(0, 0.1)
+    cache = backing[2:-2]
+    table = torch.randperm(
+        batch * pages_per_request, dtype=torch.int32, device=q.device
+    ).view(batch, pages_per_request)
+    lengths = [65536 - b for b in range(batch)]
+
+    def invoke(live):
+        return mla_decode_with_kvcache(
+            q, cache, table, live, maximum, 128, 512, 64, 192**-0.5, 0.0, True, None
+        )
+
+    stream = torch.npu.Stream()
+    stream.wait_stream(torch.npu.current_stream())
+    with torch.npu.stream(stream):
+        for _ in range(3):
+            invoke(lengths)
+    stream.synchronize()
+    graph = torch.npu.NPUGraph()
+    with torch.npu.graph(graph, stream=stream, auto_dispatch_capture=True):
+        output, lse = invoke(lengths)
+    records = graph.graph_dispatch_mode.graph_dispatch_records
+    assert len(records) == 1
+    assert "npu_mla_fia_packed" in records[0].op_cache_entry.__name__
+    addresses = output.data_ptr(), lse.data_ptr()
+    guards = backing[[0, 1, -2, -1]].clone()
+    for base in (65537, 65473, 65599):
+        lengths = [base - b for b in range(batch)]
+        q.add_(0.01)
+        cache[:32].add_(0.01)
+        table.copy_(table.roll(1, 1))
+        graph.update(cpu_update_input=[{"actual_seq_lengths_kv": lengths}])
+        graph.replay()
+        torch.npu.synchronize()
+        saved = output.clone(), lse.clone()
+        with monkeypatch.context() as native:
+            native.setattr(adapter, "_packed_op", lambda: None)
+            expected = invoke(lengths)
+        for a, b in zip(saved, expected):
+            torch.testing.assert_close(a, b, rtol=0.01, atol=0.0015)
+        assert (output.data_ptr(), lse.data_ptr()) == addresses
+        assert torch.equal(backing[[0, 1, -2, -1]], guards)

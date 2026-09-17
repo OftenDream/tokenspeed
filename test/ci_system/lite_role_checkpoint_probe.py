@@ -36,19 +36,18 @@ from types import SimpleNamespace
 from typing import Any
 
 import torch
-from lite_oe_checkpoint_probe import (
-    _normalize_file_mappings,
-    _touch_tables,
+from lite_host_table_probe import (
     mapping_metrics,
+    normalize_file_mappings,
     rollup_metrics,
+    touch_tables,
 )
 
 ROLE_WORLD_SIZE = 8
 EXPECTED_PARAMETER_BYTES = {
-    "prefill": 18_505_133_648,
-    "decode": 14_431_415_888,
+    "prefill": 17_607_814_736,
+    "decode": 14_414_900_816,
 }
-EXPECTED_HOST_OE_BYTES = 28_991_102_976
 _CROSS_ROLE_CATEGORIES = ("kda", "mla", "moe_experts", "oe_projection")
 
 
@@ -86,7 +85,7 @@ def role_mapping_kwargs(role: str) -> dict[str, int]:
 
 
 def _parameter_category(name: str, config: Any) -> str:
-    if name == "model.ngram_embeddings.projection":
+    if name == "model.embed_tokens.projection":
         return "oe_projection"
     if ".self_attn." in name:
         layer_id = int(name.split(".layers.", 1)[1].split(".", 1)[0])
@@ -95,7 +94,7 @@ def _parameter_category(name: str, config: Any) -> str:
         return "moe_experts"
     if ".moe." in name:
         return "grouped_moe"
-    if ".ngram_embeddings.embedders." in name:
+    if ".embed_tokens.oe_tables." in name:
         return "host_oe"
     return "outer"
 
@@ -314,10 +313,10 @@ def _run_worker(args: argparse.Namespace) -> None:
     )
     finite_failure = first_nonfinite_parameter(model) if args.check_finite else None
 
-    tables = model.model.ngram_embeddings.embedders
-    table_pointers = [table.weight.data_ptr() for table in tables]
-    _normalize_file_mappings(table_pointers)
-    checksum = _touch_tables(model.model.ngram_embeddings, args.touch_mib)
+    tables = tuple(model.model.embed_tokens.oe_tables)
+    table_pointers = [table.data_ptr() for table in tables]
+    normalize_file_mappings(table_pointers)
+    checksum = touch_tables(tables, args.touch_mib)
     ready = Path(args.barrier_root) / f"ready-{args.role}-{rank}"
     ready.touch()
     _wait_for(Path(args.barrier_root) / "measure", args.timeout)
@@ -325,10 +324,14 @@ def _run_worker(args: argparse.Namespace) -> None:
     process_rollup = rollup_metrics(os.getpid())
     result_path = Path(args.output_root) / f"{args.role}-rank-{rank}.json"
     expected_parameters = EXPECTED_PARAMETER_BYTES[args.role]
+    expected_host_oe_bytes = sum(
+        fragment.modulus * fragment.feature_width * 2
+        for fragment in model.model.embed_tokens.spec.fragments
+    )
     checks = {
         "parameter_bytes": ledger["npu_parameter_bytes"] == expected_parameters,
         "derived_bytes": derived_bytes == expected_derived_bytes,
-        "host_oe_bytes": ledger["host_oe_bytes"] == EXPECTED_HOST_OE_BYTES,
+        "host_oe_bytes": ledger["host_oe_bytes"] == expected_host_oe_bytes,
         "parameter_residency": all(
             entry["devices"] == (["cpu"] if category == "host_oe" else ["npu"])
             for category, entry in ledger["by_category"].items()

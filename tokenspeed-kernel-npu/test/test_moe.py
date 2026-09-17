@@ -68,13 +68,14 @@ def _requires_npu():
     torch.npu.set_device(0)
 
 
-def _plan(weights: _Weights) -> dict:
+def _plan(weights: _Weights, *, num_zero_experts: int = 0) -> dict:
     plan = tokenspeed_kernel.moe_plan(
         "unquant",
         input_dtype=torch.bfloat16,
         activation="silu",
         routing_mode="precomputed_topk",
         ep_size=weights.ep_size,
+        num_zero_experts=num_zero_experts,
         ispp=weights.intermediate_size,
     )
     assert plan["apply_kernel_name"] == "ascend_bf16_precomputed_moe_apply"
@@ -174,6 +175,7 @@ def test_ascend_local_expert_matches_fp32_oracle(routing: str):
             local,
         )
         route_ids[0, -1] = 385
+        route_ids[1, -1] = -1
     elif routing == "none":
         route_ids = local + 48
     else:
@@ -200,6 +202,50 @@ def test_ascend_flattened_192_local_experts():
     actual = _apply(plan, weights, hidden, route_weights, route_ids)
     expected = _oracle(weights, hidden, route_weights, route_ids)
     _assert_close(actual, expected)
+
+
+def test_ascend_ep1_zeros_model_side_special_routes():
+    torch.manual_seed(6350)
+    weights = _Weights(32, 32)
+    plan = _plan(weights, num_zero_experts=8)
+    hidden = torch.randn(4, 768, device="npu:0", dtype=torch.bfloat16)
+    route_weights = torch.rand(4, 4, device="npu:0", dtype=torch.float32)
+    route_ids = torch.tensor(
+        [[0, 1, 32, 33], [2, 34, 3, 35], [36, 4, 5, 37], [6, 7, 38, 39]],
+        device="npu:0",
+        dtype=torch.int32,
+    )
+
+    actual = _apply(plan, weights, hidden, route_weights, route_ids)
+    expected = _oracle(weights, hidden, route_weights, route_ids)
+    _assert_close(actual, expected)
+
+
+def test_ascend_ep1_zero_ids_are_outside_active_expert_range():
+    hidden = torch.randn(2, 128, device="npu:0", dtype=torch.bfloat16)
+    route_ids = torch.tensor(
+        [[0, 1, 32, 33], [2, 34, 3, 35]],
+        device="npu:0",
+        dtype=torch.int32,
+    )
+
+    _, _, expert_counts, _ = torch_npu.npu_moe_init_routing_v2(
+        hidden,
+        route_ids,
+        scale=None,
+        active_num=route_ids.numel(),
+        expert_num=40,
+        quant_mode=-1,
+        active_expert_range=[0, 32],
+        expert_tokens_num_type=1,
+        expert_tokens_num_flag=True,
+        row_idx_type=0,
+        drop_pad_mode=0,
+    )
+
+    assert tuple(expert_counts.shape) == (32,)
+    assert expert_counts.dtype == torch.int64
+    assert int(expert_counts.sum().cpu()) == 4
 
 
 @pytest.mark.parametrize("batch_size", [1, 2])

@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import torch
 
+from tokenspeed.runtime.execution.queued_cache_lengths import QueuedCacheLengths
 from tokenspeed.runtime.execution.request_token_history import RequestTokenHistoryView
 
 
@@ -46,6 +47,9 @@ class RuntimeStates:
         self.ngram_accepted_tokens: torch.Tensor | None = None
         self.ngram_needs_seed: torch.Tensor | None = None
         self.ngram_request_ids: list[str | None] = []
+        self.queued_cache_lengths = (
+            QueuedCacheLengths() if torch.device(device).type == "npu" else None
+        )
 
         self.valid_cache_lengths = torch.zeros(
             req_pool_size + 1, dtype=torch.int32, device=device

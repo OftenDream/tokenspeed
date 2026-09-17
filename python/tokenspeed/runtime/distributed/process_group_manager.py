@@ -48,6 +48,7 @@ class ProcessGroupManager:
         self._process_groups: dict[str, dict[Group, dist.ProcessGroup]] = {}
         self._pg_timeout: timedelta | None = None
         self._device_backend = "nccl"
+        self._dedicated_groups: dict[tuple[str, Group], dist.ProcessGroup] = {}
 
     def init_distributed(
         self,
@@ -119,6 +120,23 @@ class ProcessGroupManager:
                 pg = dist.new_group(g, backend=backend, timeout=self._pg_timeout)
                 if g == group:
                     self.register_process_group(backend, g, pg)
+
+    def get_dedicated_device_group(self, group: Group, namespace: str):
+        """Create/cache an isolated collective domain in deterministic global order.
+
+        All ranks must call with the same namespace and group pattern. These
+        groups are never returned by get_device_process_group, so custom kernel
+        windows cannot be reused by ordinary framework collectives.
+        """
+        key = (namespace, group)
+        if key not in self._dedicated_groups:
+            for ranks in _make_all_groups(group):
+                pg = dist.new_group(
+                    ranks, backend=self._device_backend, timeout=self._pg_timeout
+                )
+                if ranks == group:
+                    self._dedicated_groups[key] = pg
+        return self._dedicated_groups[key]
 
 
 process_group_manager = ProcessGroupManager()

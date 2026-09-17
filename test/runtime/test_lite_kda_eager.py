@@ -585,8 +585,8 @@ def test_lite_kda_production_shape_prefill_matches_continuous_decode():
     backend.kda_recurrent_layout = "k_major"
     boundaries = torch.tensor([0, 1, 4], dtype=torch.int32, device="npu")
     pages = torch.tensor([2, 3], dtype=torch.int32, device="npu")
-    prefill_conv_pool = torch.zeros(4, channels, 3, dtype=torch.bfloat16, device="npu")
-    prefill_conv_pool[2:4].copy_(initial_conv)
+    prefill_conv_pool = torch.zeros(4, 3, channels, dtype=torch.bfloat16, device="npu")
+    prefill_conv_pool[2:4].copy_(initial_conv.transpose(1, 2))
     backend.forward_metadata = SimpleNamespace(query_start_loc=boundaries)
     conv_output = backend._causal_conv_prefill(
         projected,
@@ -594,6 +594,7 @@ def test_lite_kda_production_shape_prefill_matches_continuous_decode():
         weight,
         None,
         "silu",
+        pages,
         pages,
         boundaries,
         torch.ones(2, dtype=torch.bool, device="npu"),
@@ -660,8 +661,8 @@ def test_lite_kda_production_shape_prefill_matches_continuous_decode():
 
     decode_conv_pool = torch.cat(
         (
-            initial_conv.clone(),
-            torch.full((1, channels, 3), 7, dtype=torch.bfloat16, device="npu"),
+            initial_conv.transpose(1, 2).contiguous(),
+            torch.full((1, 3, channels), 7, dtype=torch.bfloat16, device="npu"),
         )
     )
     decode_state_pool = torch.cat(

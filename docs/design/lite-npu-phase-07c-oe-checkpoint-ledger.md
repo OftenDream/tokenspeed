@@ -1,5 +1,8 @@
 # Lite NPU 阶段 7C：Exact OE Checkpoint 与 8P8D 内存账本设计
 
+> 历史设计：checkpointed-tail 生产路径已删除，仅保留测试用 CPU 精度 oracle；
+> 当前实现与约束见 `lite-npu-oe-device-hash-host-table.md`。
+
 ## 1. 目标与边界
 
 阶段 7C 对 Phase 7A/7B 已完成的 OE 数学、mmap adoption、12-byte state 和 fixed graph staging 做真实

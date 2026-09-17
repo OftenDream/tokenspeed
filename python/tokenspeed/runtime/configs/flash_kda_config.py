@@ -373,6 +373,11 @@ class FLASHLocalConfig(PretrainedConfig):
         moe_switch_token_num: int = 1024,
         moe_impl: str = "mix",
         # Group-MoE extras
+        gmoe_strategy: str = "global_expert_id",
+        gmoe_pre_solution: str | None = None,
+        gmoe_expert_solution: str | None = None,
+        gmoe_post_solution: str | None = None,
+        gmoe_exchange_options: dict | None = None,
         moe_group_size: int = 4,
         grouped_moe_norm_scale: int = 2,
         zero_expert_num: int = 32,
@@ -498,6 +503,16 @@ class FLASHLocalConfig(PretrainedConfig):
         self.moe_impl = moe_impl
 
         # Group-MoE extras
+        if gmoe_strategy not in {"global_expert_id", "gmoe_aware"}:
+            raise ValueError(
+                "gmoe_strategy must be 'global_expert_id' or 'gmoe_aware'; "
+                f"got {gmoe_strategy!r}"
+            )
+        self.gmoe_strategy = gmoe_strategy
+        self.gmoe_pre_solution = gmoe_pre_solution
+        self.gmoe_expert_solution = gmoe_expert_solution
+        self.gmoe_post_solution = gmoe_post_solution
+        self.gmoe_exchange_options = dict(gmoe_exchange_options or {})
         self.moe_group_size = moe_group_size
         self.grouped_moe_norm_scale = grouped_moe_norm_scale
         self.zero_expert_num = zero_expert_num
@@ -697,6 +712,47 @@ class FLASHLocalConfig(PretrainedConfig):
                 "Flash-Lite checkpoint scaling and OE switches must be enabled."
             )
         self.special_token_ids
+        if self.is_longcat_dsa:
+            required = (
+                "cli_factor",
+                "index_dtype",
+                "index_k_norm_type",
+                "index_head_dim",
+                "index_topk",
+                "index_init_tokens",
+                "index_local_tokens",
+            )
+            missing = [name for name in required if getattr(self, name, None) is None]
+            if missing:
+                raise ValueError(f"Lite LongCatDSA config is incomplete: {missing}")
+            if self.cli_factor != 1:
+                raise ValueError("Lite LongCatDSA currently requires CLI=1")
+            if self.index_dtype != "bf16" or self.index_k_norm_type != "rms":
+                raise ValueError("Lite LongCatDSA requires BF16 index keys and RMSNorm")
+            if self.index_head_dim != 128 or self.index_n_heads != 16:
+                raise ValueError(
+                    "Lite LongCatDSA currently requires 16 index heads of width 128"
+                )
+            if self.index_topk != 2048:
+                raise ValueError("Lite LongCatDSA currently requires index_topk=2048")
+            if self.index_init_tokens < 0 or self.index_local_tokens < 0:
+                raise ValueError(
+                    "LongCatDSA initial/local token counts must be nonnegative"
+                )
+            if self.index_init_tokens + self.index_local_tokens > self.index_topk:
+                raise ValueError(
+                    "LongCatDSA initial/local candidates exceed index_topk"
+                )
+
+    @property
+    def is_longcat_dsa(self) -> bool:
+        """Sparse LongCat attention is selected by checkpoint indexer fields."""
+        return getattr(self, "index_n_heads", None) is not None
+
+    @property
+    def uses_independent_dsa_selection(self) -> bool:
+        """Whether every physical attention layer owns its own Indexer."""
+        return self.is_longcat_dsa and self.cli_factor == 1
 
     # ----- helpers -----
 

@@ -41,9 +41,35 @@ def silu_and_mul(
 ) -> torch.Tensor:
     """Apply SwiGLU through the platform implementation.
 
-    Positive ``limit`` values use the portable Triton implementation because
-    the CUDA implementation does not expose the checkpoint's clamp semantics.
+    ``x`` contains concatenated gate/up values on the last dimension. Return
+    ``SiLU(gate) * up`` in the input dtype, writing ``out`` when provided.
+    Positive ``limit`` clamps gate from above and up on both sides before SiLU.
+    CPU and clamped Ascend calls preserve the FP32 native calculation; ordinary
+    Ascend calls use fused SwiGLU. CUDA/AMD selection is unchanged.
     """
+    if x.ndim == 0 or x.shape[-1] % 2:
+        raise ValueError("SwiGLU expects an even [gate, up] width")
+    if out is not None:
+        if out.shape != x.shape[:-1] + (x.shape[-1] // 2,):
+            raise ValueError("out shape must match the SwiGLU output")
+        if out.dtype != x.dtype or out.device != x.device:
+            raise ValueError("out dtype and device must match x")
+    if limit is not None and limit <= 0:
+        limit = None
+    if x.device.type == "cpu" or (current_platform().is_npu and limit is not None):
+        gate, up = x.float().chunk(2, dim=-1)
+        if limit is not None:
+            gate = gate.clamp_max(limit)
+            up = up.clamp(-limit, limit)
+        result = (torch.nn.functional.silu(gate) * up).to(x.dtype)
+        if out is not None:
+            out.copy_(result)
+            return out
+        return result
+    if current_platform().is_npu:
+        from tokenspeed_kernel.ops.activation.ascend import silu_and_mul
+
+        return silu_and_mul(x, out)
     if (
         limit is not None
         or current_platform().is_amd
@@ -51,6 +77,51 @@ def silu_and_mul(
     ):
         return triton_silu_and_mul(x, out, enable_pdl=pdl_enabled(), limit=limit)
     return flashinfer_silu_and_mul(x, out, enable_pdl=pdl_enabled())
+
+
+def silu_and_mul_quant(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return INT8 SwiGLU values and FP32 per-row dequantization scales.
+
+    ``x`` is floating [gate,up], with at least two dimensions and an even last
+    dimension of at most 8192. Reconstruct with ``values.float() * scale[...,None]``.
+    This entry currently supports Ascend; INT32 matmul accumulators instead use
+    :func:`dequant_silu_and_mul_quant` with weight and activation scales.
+    """
+    if x.ndim < 2 or x.shape[-1] % 2 or x.shape[-1] > 8192:
+        raise ValueError("Quantized SwiGLU requires even-width rows of at most 8192")
+    if x.dtype not in (torch.bfloat16, torch.float16, torch.float32):
+        raise ValueError("SwiGLU quantization requires floating input")
+    if not current_platform().is_npu or x.device.type == "cpu":
+        raise NotImplementedError("INT8-output SwiGLU currently requires Ascend")
+    from tokenspeed_kernel.ops.activation.ascend import silu_and_mul_quant
+
+    return silu_and_mul_quant(x)
+
+
+def dequant_silu_and_mul_quant(
+    x: torch.Tensor, weight_scale: torch.Tensor, activation_scale: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply SwiGLU to scaled INT32 accumulators and return INT8 rows + scales.
+
+    ``x`` stores [gate,up] in its last dimension. ``weight_scale`` is FP32
+    with one value per column; ``activation_scale`` is FP32 per input row.
+    Output scales have shape ``x.shape[:-1]`` and reconstruct values as
+    ``quantized.float() * scales.unsqueeze(-1)``. Currently supported on Ascend.
+    """
+    if x.ndim < 2 or x.shape[-1] % 2 or x.dtype != torch.int32:
+        raise ValueError("Quantized SwiGLU requires even-width INT32 [gate,up] rows")
+    if weight_scale.shape != (x.shape[-1],) or activation_scale.shape != x.shape[:-1]:
+        raise ValueError("SwiGLU scales must match input columns and rows")
+    if any(
+        s.dtype != torch.float32 or s.device != x.device
+        for s in (weight_scale, activation_scale)
+    ):
+        raise ValueError("SwiGLU scales must be FP32 on the input device")
+    if not current_platform().is_npu or x.device.type == "cpu":
+        raise NotImplementedError("INT8-output SwiGLU currently requires Ascend")
+    from tokenspeed_kernel.ops.activation.ascend import dequant_silu_and_mul_quant
+
+    return dequant_silu_and_mul_quant(x, weight_scale, activation_scale)
 
 
 def sigmoid_mul(x: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
@@ -132,8 +203,10 @@ def situ_and_mul(
 
 __all__ = [
     "add3",
+    "dequant_silu_and_mul_quant",
     "prepare_fp8_linear_activation",
     "sigmoid_mul",
     "silu_and_mul",
+    "silu_and_mul_quant",
     "situ_and_mul",
 ]

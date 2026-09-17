@@ -42,6 +42,7 @@ from transformers import PretrainedConfig as _PretrainedConfig
 from tokenspeed.runtime.configs.flash_kda_config import FLASHLocalConfig
 from tokenspeed.runtime.configs.utils import get_rope_theta as _get_rope_theta
 from tokenspeed.runtime.distributed.comm_manager import CommManager as _CommManager
+from tokenspeed.runtime.distributed.comm_ops import all_reduce
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.forward_step import (
@@ -62,7 +63,6 @@ from tokenspeed.runtime.layers.moe.expert import MoELayer
 from tokenspeed.runtime.layers.moe.topk import StandardTopKOutput
 from tokenspeed.runtime.layers.moe.utils import RoutingMethodType
 from tokenspeed.runtime.layers.over_embedding import (
-    HostLongCatOverEmbedding,
     LongCatOverEmbedding,
     resolve_longcat_oe_hyperparameters,
 )
@@ -90,15 +90,12 @@ from tokenspeed.runtime.models.flash_local_checkpoint import (
     FLASHLocalCheckpointLayout,
 )
 from tokenspeed.runtime.models.flash_local_moe import (
-    PackedFLASHLocalMoE,
-    flash_local_prefers_packed_moe,
-)
-from tokenspeed.runtime.models.flash_local_moe import (
-    grouped_moe_topk as _grouped_moe_topk_local,
+    GroupAwareFlashLocalMoE,
 )
 from tokenspeed.runtime.models.kimi_k3 import (
     KimiLinearMLAAttention,
 )
+from tokenspeed.runtime.models.longcat_dsa import LongCatDSAAttention
 from tokenspeed.runtime.moe.distribution_recorder import (
     get_global_expert_distribution_recorder,
 )
@@ -107,6 +104,7 @@ from tokenspeed.runtime.moe.expert_location import (
 )
 from tokenspeed.runtime.utils import LazyValue, add_prefix, get_colorful_logger
 from tokenspeed.runtime.utils.cuda_stream import StreamFork as _StreamFork
+from tokenspeed.runtime.utils.cuda_stream import new_device_stream as _new_device_stream
 from tokenspeed.runtime.utils.env import global_server_args_dict
 
 logger = get_colorful_logger(__name__)
@@ -253,7 +251,7 @@ def _parse_flash_kda_router_name(name: str) -> tuple[int, str] | None:
 
 
 def _load_flash_kda_router_correction_bias(
-    moe: "FLASHLocalMoE | PackedFLASHLocalMoE",
+    moe: "FLASHLocalMoE | GroupAwareFlashLocalMoE",
     loaded_weight: torch.Tensor,
 ) -> None:
     """Load a full-width or shared per-group router correction bias."""
@@ -270,7 +268,7 @@ def _load_flash_kda_router_correction_bias(
             f"{loaded_shape}, expected {(logits_per_group,)} (shared per group) "
             f"or {full_shape} (full width)."
         )
-    if isinstance(moe, PackedFLASHLocalMoE):
+    if isinstance(moe, GroupAwareFlashLocalMoE):
         for group_id, group_weight in enumerate(
             loaded_weight.view(groups, logits_per_group)
         ):
@@ -412,15 +410,27 @@ def _group_moe_topk(
 ) -> StandardTopKOutput:
     """Select experts independently per Flash group and globalize their ids."""
 
+    import tokenspeed_kernel
+
     num_experts_per_group = router_logits.shape[-1]
     num_real_experts_per_group = num_experts_per_group - zero_expert_num
-    weights, local_ids = _grouped_moe_topk_local(
-        router_logits.float().view(moe_group_size, -1, num_experts_per_group),
-        correction_bias,
-        top_k=top_k,
-        renormalize=renormalize,
-        routed_scaling_factor=routed_scaling_factor,
+    grouped_logits = router_logits.float().view(
+        moe_group_size, -1, num_experts_per_group
     )
+    grouped_bias = correction_bias.view(moe_group_size, num_experts_per_group)
+    routed = [
+        tokenspeed_kernel.moe_softmax_bias_topk(
+            grouped_logits[group_id],
+            grouped_bias[group_id],
+            top_k,
+            routed_scaling_factor=routed_scaling_factor,
+        )
+        for group_id in range(moe_group_size)
+    ]
+    weights = torch.stack([result[0] for result in routed])
+    local_ids = torch.stack([result[1] for result in routed]).to(torch.int32)
+    if renormalize:
+        weights = weights / weights.sum(dim=-1, keepdim=True) * routed_scaling_factor
 
     group_offsets = torch.arange(
         moe_group_size, device=router_logits.device, dtype=local_ids.dtype
@@ -613,8 +623,10 @@ class FLASHLocalMoE(nn.Module):
         )
         # Fused MoE kernels still read every selected expert id while building
         # the dispatch plan, so zero-expert slots must keep a valid id.
-        topk_output.topk_ids[zero_expert_mask] = 0
-        topk_output.topk_weights[zero_expert_mask] = 0.0
+        # Boolean indexing lowers to dynamic NonZero on NPU and cannot be
+        # captured. Masked fills retain the buffers and their static shapes.
+        topk_output.topk_ids.masked_fill_(zero_expert_mask, 0)
+        topk_output.topk_weights.masked_fill_(zero_expert_mask, 0.0)
 
         if self.zero_expert_type in ("identity", "copy"):
             zero_weight = zero_expert_weights.sum(dim=-1, keepdim=True).to(
@@ -1080,6 +1092,31 @@ class FLASHLocalDecoderLayer(nn.Module):
                 self.self_attn = SeperateFLASHLocal(
                     config, mapping, layer_id, quant_config, attn_prefix
                 )
+        elif config.is_longcat_dsa:
+            self.self_attn = LongCatDSAAttention(
+                config=config,
+                mapping=mapping,
+                hidden_size=config.hidden_size,
+                num_heads=config.num_attention_heads,
+                qk_nope_head_dim=config.qk_nope_head_dim,
+                qk_rope_head_dim=config.qk_rope_head_dim,
+                v_head_dim=config.v_head_dim,
+                q_lora_rank=config.q_lora_rank,
+                kv_lora_rank=config.kv_lora_rank,
+                rope_theta=rope_theta,
+                rope_scaling=rope_scaling,
+                max_position_embeddings=max_position_embeddings,
+                quant_config=None,
+                layer_id=layer_id,
+                prefix=attn_prefix,
+                reduce_attn_results=False,
+                alt_stream=alt_stream,
+                computes_selection=True,
+                selection_owner_layer_id=layer_id,
+                lora_norm_eps=config.rms_norm_eps,
+                component_mapping=mapping.mla_weight,
+                separate_mla_projections=flash_local_prefers_packed_projections(),
+            )
         else:
             # reduce_attn_results=False: the o_proj returns a TP partial and
             # CommManager.post_attn_reduce_norm owns the all-reduce / RSAG,
@@ -1140,12 +1177,21 @@ class FLASHLocalDecoderLayer(nn.Module):
                 "Flash-KDA requires EveryLayer-MoE (first_k_dense_replace=0); "
                 f"got layer {layer_id} not flagged as MoE."
             )
-        # Both leaves implement the same four-group routing math. ``packed``
-        # denotes Ascend's group-major EP-local w13/w2 runtime storage; CUDA
-        # retains the existing MoELayer layout and kernels.
+        # Strategy selection is explicit and independent of accelerator type.
+        # Both leaves consume the same checkpoint expert IDs; group-aware mode
+        # owns the group-first communication and routing schedule.
         self.moe = (
-            PackedFLASHLocalMoE(config, mapping)
-            if flash_local_prefers_packed_moe()
+            GroupAwareFlashLocalMoE(
+                config,
+                mapping,
+                quant_config=_get_flash_kda_moe_quant_config(
+                    config,
+                    quant_config,
+                    add_prefix("moe", prefix),
+                ),
+                prefix=add_prefix("moe", prefix),
+            )
+            if config.gmoe_strategy == "gmoe_aware"
             else FLASHLocalMoE(
                 config=config,
                 mapping=mapping,
@@ -1168,13 +1214,13 @@ class FLASHLocalDecoderLayer(nn.Module):
             self.input_layernorm.to(dtype=torch.bfloat16)
             self.post_attention_layernorm.to(dtype=torch.bfloat16)
 
-        # CommManager: plain pre-attn / post-attn / pre-mlp / post-mlp fusion.
-        # The MoE block uses its own CommManager scope (is_moe=True) for the
-        # routed expert all-reduce.
+        # Group-aware MoE owns its expert exchange and returns complete output
+        # rows. Keep the surrounding dense/attention token layout; its EP size
+        # must not cause an extra generic pre-MoE ReduceScatter.
         self.moe_comm = _CommManager(
             mapping=mapping,
             layer_id=self.layer_id,
-            is_moe=True,
+            is_moe=not isinstance(self.moe, GroupAwareFlashLocalMoE),
             prev_is_moe=False,
             input_layernorm=self.input_layernorm,
             post_attn_layernorm=self.post_attention_layernorm,
@@ -1207,7 +1253,12 @@ class FLASHLocalDecoderLayer(nn.Module):
         max_num_tokens_per_gpu: int,
     ) -> torch.Tensor:
         """MoE forward (routed + shared + zero) with pre-mlp comm fusion."""
-        hidden_states = self.moe_comm.pre_mlp_comm(hidden_states, ctx)
+        # GroupAwareFlashLocalMoE owns both sides of its token/expert exchange.
+        # Running CommManager's generic pre-MoE AllGather first would duplicate
+        # the DP ranks' distinct decode tokens and violate its [W,T,H] input
+        # contract. Its prefill path likewise performs its own token gather.
+        if not isinstance(self.moe, GroupAwareFlashLocalMoE):
+            hidden_states = self.moe_comm.pre_mlp_comm(hidden_states, ctx)
         return self.moe(
             hidden_states,
             num_global_tokens=num_global_tokens,
@@ -1222,6 +1273,16 @@ class FLASHLocalDecoderLayer(nn.Module):
         ctx: ForwardContext,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if isinstance(self.self_attn, SeparateProjectionKimiLinearMLAAttention):
+            component = self.self_attn.component_mapping
+            if component.tp_size > 1:
+                # Keep projection partials and the head sum in FP32, then
+                # restore the residual dtype exactly once before normalization.
+                hidden_states = all_reduce(
+                    hidden_states.float(),
+                    component.tp_group,
+                    backend=None,
+                    op=torch.distributed.ReduceOp.SUM,
+                ).to(residual.dtype)
             return self.post_attention_layernorm(hidden_states, residual)
         return self.moe_comm.post_attn_reduce_norm(hidden_states, residual, ctx)
 
@@ -1231,7 +1292,7 @@ class FLASHLocalDecoderLayer(nn.Module):
         residual: torch.Tensor,
         ctx: ForwardContext,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if isinstance(self.moe, PackedFLASHLocalMoE):
+        if isinstance(self.moe, GroupAwareFlashLocalMoE):
             return hidden_states, residual
         return self.moe_comm.post_mlp_fused(hidden_states, residual, ctx)
 
@@ -1301,13 +1362,12 @@ class FLASHLocalModel(nn.Module):
         self.padding_id = getattr(config, "pad_token_id", None)
         self.vocab_size = config.vocab_size
 
-        self.ngram_embeddings: HostLongCatOverEmbedding | None = None
         self.embed_tokens = self._build_embed_tokens(
             config,
             quant_config,
             oe_table_placement,
         )
-        self.alt_stream = torch.cuda.Stream() if torch.cuda.is_available() else None
+        self.alt_stream = _new_device_stream()
 
         def get_layer(idx: int, prefix: str):
             return FLASHLocalDecoderLayer(
@@ -1348,17 +1408,7 @@ class FLASHLocalModel(nn.Module):
                 tp_group=self.mapping.attn.tp_group,
             )
 
-        if oe_table_placement == "host":
-            self.ngram_embeddings = HostLongCatOverEmbedding(config)
-            return VocabParallelEmbedding(
-                config.vocab_size,
-                config.hidden_size,
-                params_dtype=torch.bfloat16,
-                tp_rank=self.mapping.dense.tp_rank,
-                tp_size=self.mapping.dense.tp_size,
-                tp_group=self.mapping.dense.tp_group,
-            )
-        if oe_table_placement != "device":
+        if oe_table_placement not in ("device", "host"):
             raise ValueError(
                 "OE checkpoints require a resolved host or device table placement."
             )
@@ -1374,15 +1424,17 @@ class FLASHLocalModel(nn.Module):
             over_embedding_m=config.over_embedding_m,
             hashes_per_order=hashes_per_order,
             max_ngram_order=max_ngram_order,
-            tp_rank=self.mapping.attn.tp_rank,
-            tp_size=self.mapping.attn.tp_size,
-            tp_group=self.mapping.attn.tp_group,
+            tp_rank=self.mapping.linear_attn.tp_rank,
+            tp_size=self.mapping.linear_attn.tp_size,
+            tp_group=self.mapping.linear_attn.tp_group,
+            params_dtype=torch.bfloat16,
             ignored_token_ids=(
                 tuple(config.oe_ignore_tokens) if exclude_special_tokens else ()
             ),
             eos_token_id=getattr(config, "eos_token_id", None),
             segment_ignored_tokens=exclude_special_tokens,
             fix_normalize_factor=getattr(config, "ngram_fix_normalize_factor", False),
+            table_placement=oe_table_placement,
         )
 
     def forward(
@@ -1398,12 +1450,6 @@ class FLASHLocalModel(nn.Module):
             hidden_states = self.embed_tokens(input_ids, ctx)
         else:
             hidden_states = self.embed_tokens(input_ids)
-            if self.ngram_embeddings is not None:
-                hidden_states = self.ngram_embeddings.project_and_merge(
-                    hidden_states,
-                    self.ngram_embeddings.prepared_raw_oe(input_ids.numel()),
-                    input_ids,
-                )
 
         residual = None
         aux_hidden_states = [] if self.layers_to_capture else None
@@ -1448,7 +1494,10 @@ class FLASHLocalForCausalLM(BaseCausalLM):
     supports_oe_table_placement = True
     oe_runtime_capabilities = {
         "cuda": {"device": "runtime-full-history"},
-        "npu": {"host": "cache-checkpointed-tail"},
+        "npu": {
+            "device": "runtime-full-history",
+            "host": "runtime-full-history",
+        },
     }
 
     def __init__(
@@ -1462,8 +1511,31 @@ class FLASHLocalForCausalLM(BaseCausalLM):
     ) -> None:
         self._model_override = model
         self.oe_table_placement = oe_table_placement
+        moe_quant_config = _get_flash_kda_moe_quant_config(
+            config,
+            quant_config,
+            add_prefix("model.layers.0.moe", prefix),
+        )
+        moe_quant_kind = (
+            "unquant"
+            if moe_quant_config is None
+            else moe_quant_config.moe_weight_dtype(
+                add_prefix("model.layers.0.moe", prefix)
+            )
+        )
+        moe_quant_settings = getattr(moe_quant_config, "config", None) or {}
         self.checkpoint_layout = (
-            FLASHLocalCheckpointLayout(config)
+            FLASHLocalCheckpointLayout(
+                config,
+                shared_quant_kind="unquant",
+                moe_quant_kind=moe_quant_kind,
+                moe_smooth_quant=bool(
+                    moe_quant_settings.get(
+                        "moe_enable_smooth_quant",
+                        moe_quant_settings.get("enable_smooth_quant", False),
+                    )
+                ),
+            )
             if getattr(config, "strict_checkpoint_layout", False)
             else None
         )
@@ -1473,6 +1545,18 @@ class FLASHLocalForCausalLM(BaseCausalLM):
             quant_config=quant_config,
             prefix=prefix,
         )
+
+        if self.checkpoint_layout is not None:
+            shared_dtypes = {
+                layer.moe.shared_experts.gate_up_proj.weight.dtype
+                for layer in self.model.layers
+                if hasattr(layer, "moe")
+            }
+            if len(shared_dtypes) > 1:
+                raise ValueError("Flash-Lite requires uniform shared expert dtypes.")
+            self.checkpoint_layout.shared_quant_kind = (
+                "int8" if shared_dtypes == {torch.int8} else "unquant"
+            )
 
     def resolve_model(
         self,
@@ -1492,15 +1576,7 @@ class FLASHLocalForCausalLM(BaseCausalLM):
         )
 
     def resolve_lm_head(self, config, quant_config, prefix):
-        """Construct the head in the domain that owns the final hidden state.
-
-        The migrated Host-OE/NPU leaf follows the dense TP/DP domain used by the
-        former Lite entry. Device-OE/GPU keeps BaseCausalLM's existing attention
-        domain. Process-group initialization cannot own this choice because it
-        has no model, vocabulary, quantization, or layer-construction context.
-        """
-        if self.oe_table_placement != "host":
-            return super().resolve_lm_head(config, quant_config, prefix)
+        """Build the Flash-Lite vocabulary head in its dense TP domain."""
         if self.mapping.dense.has_dp:
             return ReplicatedLinear(
                 config.hidden_size,
@@ -1521,8 +1597,6 @@ class FLASHLocalForCausalLM(BaseCausalLM):
         )
 
     def resolve_logits_processor(self, config):
-        if self.oe_table_placement != "host":
-            return super().resolve_logits_processor(config)
         return LogitsProcessor(
             config,
             skip_all_gather=self.mapping.dense.has_dp,
@@ -1531,47 +1605,20 @@ class FLASHLocalForCausalLM(BaseCausalLM):
             tp_group=self.mapping.dense.tp_group,
         )
 
-    def initialize_external_inputs(
-        self,
-        *,
-        token_to_kv_pool,
-        max_request_slots: int,
-        max_graph_tokens: int,
-        device: str,
-    ) -> None:
-        host_oe = getattr(self.model, "ngram_embeddings", None)
-        if host_oe is None:
+    def initialize_host_runtime(self) -> None:
+        embed = getattr(self.model, "embed_tokens", None)
+        if not isinstance(embed, LongCatOverEmbedding) or (
+            embed.table_placement != "host"
+        ):
             return
-        host_oe.initialize_runtime(
-            context_pages=token_to_kv_pool.arena.field("layer.0.lite.oe.context"),
-            checkpoint_granularity=token_to_kv_pool.arena.plan.prefix_granularity,
-            max_request_slots=max_request_slots,
-            max_graph_tokens=max_graph_tokens,
-            device=device,
-        )
-
-    def prepare_external_inputs(
-        self,
-        forward_op,
-        *,
-        resolved_input_ids: torch.Tensor,
-        graph_tokens: int | None,
-    ) -> torch.Tensor | None:
-        host_oe = getattr(self.model, "ngram_embeddings", None)
-        if host_oe is None:
-            return None
-        return host_oe.prepare_forward_op(
-            forward_op,
-            resolved_input_ids=resolved_input_ids,
-            graph_tokens=graph_tokens,
-        )
+        embed.initialize_host_runtime()
 
     def post_init(self) -> None:
         self._routed_experts_weights_of_layer = LazyValue(
             lambda: {
                 layer_id: layer.moe.get_moe_routed_weights()
                 for layer_id, layer in enumerate(self.model.layers)
-                if isinstance(layer.moe, (FLASHLocalMoE, PackedFLASHLocalMoE))
+                if isinstance(layer.moe, (FLASHLocalMoE, GroupAwareFlashLocalMoE))
             }
         )
 
@@ -1616,11 +1663,11 @@ class FLASHLocalForCausalLM(BaseCausalLM):
         fuse_qkv_a_proj = config.q_lora_rank is not None
 
         params_dict = dict(self.named_parameters())
-        packed_moe = next(
+        group_aware_moe = next(
             (
                 layer.moe
                 for layer in self.model.layers
-                if isinstance(getattr(layer, "moe", None), PackedFLASHLocalMoE)
+                if isinstance(getattr(layer, "moe", None), GroupAwareFlashLocalMoE)
             ),
             None,
         )
@@ -1635,7 +1682,9 @@ class FLASHLocalForCausalLM(BaseCausalLM):
             ep_rank=self.mapping.moe.ep_rank,
             ep_size=self.mapping.moe.ep_size,
             local_expert_ids=(
-                packed_moe.local_expert_ids if packed_moe is not None else None
+                group_aware_moe.local_expert_ids
+                if group_aware_moe is not None
+                else None
             ),
         )
 
@@ -1735,9 +1784,29 @@ class FLASHLocalForCausalLM(BaseCausalLM):
                 and ".self_attn." in source_name
                 and isinstance(
                     self.model.layers[layer_id].self_attn,
-                    SeparateProjectionKimiLinearMLAAttention,
+                    (SeparateProjectionKimiLinearMLAAttention, LongCatDSAAttention),
                 )
             ):
+                attention = self.model.layers[layer_id].self_attn
+                if isinstance(attention, LongCatDSAAttention) and hasattr(
+                    attention, "fused_qkv_a_proj_with_mqa"
+                ):
+                    # Reuse LongCat's packed Q/KV down projection, while the
+                    # strict checkpoint ledger keeps the two source tensors.
+                    if source_name.endswith(
+                        (".q_a_proj.weight", ".kv_a_proj_with_mqa.weight")
+                    ):
+                        offset = (
+                            0
+                            if source_name.endswith(".q_a_proj.weight")
+                            else config.q_lora_rank
+                        )
+                        target = attention.fused_qkv_a_proj_with_mqa.weight
+                        default_weight_loader(
+                            target.narrow(0, offset, loaded_weight.shape[0]),
+                            loaded_weight,
+                        )
+                        continue
                 param = params_dict.get(checkpoint_spec.target_name)
                 if param is None:
                     raise ValueError(
@@ -1767,6 +1836,11 @@ class FLASHLocalForCausalLM(BaseCausalLM):
                     continue
                 if field == "classifier.weight":
                     param = moe.router.classifier.weight
+                    if isinstance(moe, GroupAwareFlashLocalMoE):
+                        start = moe.topology.group_id * moe.group_hidden
+                        loaded_weight = loaded_weight[
+                            :, start : start + moe.group_hidden
+                        ]
                     if param.shape == loaded_weight.shape:
                         with torch.no_grad():
                             param.copy_(loaded_weight)
@@ -1795,15 +1869,6 @@ class FLASHLocalForCausalLM(BaseCausalLM):
             #   * ``model.ngram_embeddings.post_projs.{N}.weight``    -> oe_projection
             #     (longcat-flash-lite open naming — the canonical Flash-KDA ckpt)
             embed = getattr(self.model, "embed_tokens", None)
-            host_oe = getattr(self.model, "ngram_embeddings", None)
-            if isinstance(host_oe, HostLongCatOverEmbedding) and (
-                ".oe_embed_tokens" in name
-                or ".oe_embed_proj" in name
-                or ".ngram_embeddings" in name
-            ):
-                if not host_oe.load_weight(name, loaded_weight):
-                    raise ValueError(f"Unexpected Host OE weight {name!r}.")
-                continue
             if isinstance(embed, LongCatOverEmbedding) and (
                 ".embed_tokens" in name
                 or ".oe_embed_tokens" in name
@@ -1918,14 +1983,23 @@ class FLASHLocalForCausalLM(BaseCausalLM):
                         f"{tuple(loaded_weight.shape)}"
                     ) from exc
 
-        if expected_sources is not None and seen_sources != expected_sources:
-            missing = expected_sources - seen_sources
-            unexpected = seen_sources - expected_sources
-            raise ValueError(
-                "Flash-Lite checkpoint stream mismatch: "
-                f"missing {len(missing)} source(s), "
-                f"unexpected {len(unexpected)} source(s)."
-            )
+        if expected_sources is not None:
+            # The shard iterator may omit non-local OE-only files, or still
+            # yield those weights from mixed shards. They are optional, not
+            # unexpected; every local source remains mandatory.
+            seen_local_sources = {
+                name
+                for name in seen_sources
+                if self.checkpoint_weight_name_filter(name)
+            }
+            missing = expected_sources - seen_local_sources
+            unexpected = seen_local_sources - expected_sources
+            if missing or unexpected:
+                raise ValueError(
+                    "Flash-Lite checkpoint stream mismatch: "
+                    f"missing {len(missing)} source(s), "
+                    f"unexpected {len(unexpected)} source(s)."
+                )
         self.post_load_weights()
 
     def post_load_weights(self):
@@ -1942,13 +2016,12 @@ class FLASHLocalForCausalLM(BaseCausalLM):
         embed = getattr(self.model, "embed_tokens", None)
         if isinstance(embed, LongCatOverEmbedding):
             embed.validate_loaded_weights()
-        host_oe = getattr(self.model, "ngram_embeddings", None)
-        if isinstance(host_oe, HostLongCatOverEmbedding):
-            host_oe.validate_loaded_weights()
-
         for layer in self.model.layers:
             self_attn = layer.self_attn
-            if isinstance(self_attn, SeparateProjectionKimiLinearMLAAttention):
+            if isinstance(
+                self_attn,
+                (SeparateProjectionKimiLinearMLAAttention, LongCatDSAAttention),
+            ):
                 self_attn.process_weights_after_loading()
             elif isinstance(self_attn, KimiLinearMLAAttention):
                 self_attn.w_kc, self_attn.w_vc = _prepare_mla_kv_b_proj_weights(
@@ -1968,7 +2041,7 @@ class FLASHLocalForCausalLM(BaseCausalLM):
                 self_attn.process_weights_after_loading()
             elif isinstance(self_attn, SeperateFLASHLocal):
                 self_attn.fuse_conv_weights()
-            if isinstance(layer.moe, PackedFLASHLocalMoE):
+            if isinstance(layer.moe, GroupAwareFlashLocalMoE):
                 layer.moe.process_weights_after_loading()
 
     def load_kv_cache_scales(self, quantization_param_path: str) -> None:

@@ -19,15 +19,57 @@
 # SOFTWARE.
 
 from test.runtime.test_lite_model_loader import lite_config_dict, mapping
+from types import SimpleNamespace
 from unittest import mock
 
-import torch
-import torch.nn.functional as F
+import pytest
 
 from tokenspeed.runtime.configs.flash_kda_config import FLASHLocalConfig
 from tokenspeed.runtime.models.flash_kda import FLASHLocalForCausalLM
 from tokenspeed.runtime.models.flash_local_attention import WeightNZReplicatedLinear
-from tokenspeed.runtime.models.flash_local_moe import PackedWeight as _Weight
+
+
+@pytest.mark.parametrize(
+    ("role", "prefill_safe", "expected"),
+    [
+        ("decode", False, True),
+        ("decode", True, True),
+        ("prefill", False, False),
+        ("prefill", True, True),
+        ("null", False, False),
+        ("null", True, True),
+    ],
+)
+def test_weight_nz_role_admission(role, prefill_safe, expected):
+    import tokenspeed_kernel
+
+    from tokenspeed.runtime.utils.env import global_server_args_dict
+
+    original = object()
+    weight = SimpleNamespace(device=SimpleNamespace(type="npu"), data=original)
+    layer = SimpleNamespace(
+        _weight_nz_prepared=False,
+        _weight_nz_transposed=False,
+        weight=weight,
+        weight_nz="transposed",
+        prefill_weight_nz=prefill_safe,
+    )
+    snapshot = dict(global_server_args_dict)
+    try:
+        global_server_args_dict.update(
+            npu_enable_weight_nz=True, disaggregation_mode=role
+        )
+        with mock.patch.object(
+            tokenspeed_kernel, "prepare_weight_nz", return_value="prepared"
+        ) as prepare:
+            WeightNZReplicatedLinear.process_weights_after_loading(layer)
+        assert prepare.called is expected
+        assert layer._weight_nz_prepared is expected
+        assert layer._weight_nz_transposed is expected
+        assert weight.data == ("prepared" if expected else original)
+    finally:
+        global_server_args_dict.clear()
+        global_server_args_dict.update(snapshot)
 
 
 def test_weight_nz_server_arg_defaults_off_and_propagates_decode_role():
@@ -69,14 +111,11 @@ def test_lite_weight_nz_whitelist_is_exact():
     marked = {
         name: module.weight_nz
         for name, module in model.named_modules()
-        if isinstance(module, (_Weight, WeightNZReplicatedLinear))
-        and module.weight_nz is not None
+        if isinstance(module, WeightNZReplicatedLinear) and module.weight_nz is not None
     }
     expected = {}
     for layer_id in range(4):
         prefix = f"model.layers.{layer_id}"
-        expected[f"{prefix}.moe.proj_output"] = "standard"
-        expected[f"{prefix}.moe.shared_experts.down_proj"] = "standard"
         if layer_id < 3:
             expected[f"{prefix}.self_attn.o_proj"] = "standard"
         else:
@@ -99,16 +138,21 @@ def test_lite_weight_nz_whitelist_is_exact():
     )
 
 
-def test_weight_nz_cpu_path_preserves_canonical_linear():
-    module = _Weight((3, 4), torch.bfloat16, weight_nz="transposed")
-    module.weight.data.copy_(
-        torch.arange(12, dtype=torch.bfloat16).reshape_as(module.weight)
+def test_prefill_weight_nz_is_limited_to_mla_prolog_inputs():
+    config = FLASHLocalConfig.from_dict(lite_config_dict())
+    model = FLASHLocalForCausalLM(
+        config,
+        mapping(8, rank=0, role="prefill"),
+        oe_table_placement="host",
     )
-    source = module.weight.detach().clone()
-    hidden = torch.randn(2, 4, dtype=torch.bfloat16)
-    module.process_weights_after_loading()
-
-    assert not module._weight_nz_prepared
-    assert not module._weight_nz_transposed
-    assert torch.equal(module.weight, source)
-    torch.testing.assert_close(module(hidden), F.linear(hidden, source), rtol=0, atol=0)
+    marked = {
+        name
+        for name, module in model.named_modules()
+        if isinstance(module, WeightNZReplicatedLinear) and module.prefill_weight_nz
+    }
+    prefix = "model.layers.3.self_attn"
+    assert marked == {
+        f"{prefix}.q_a_proj",
+        f"{prefix}.kv_a_proj_with_mqa",
+        f"{prefix}.q_b_proj",
+    }

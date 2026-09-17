@@ -20,7 +20,6 @@
 
 import importlib
 import json
-from dataclasses import replace
 from types import SimpleNamespace
 from unittest import mock
 
@@ -70,8 +69,9 @@ def lite_config_dict(**overrides):
         "moe_topk": 2,
         "moe_switch_token_num": 16,
         "moe_impl": "mix",
+        "gmoe_strategy": "gmoe_aware",
         "ngram_vocab_size_ratio": 0.1,
-        "emb_neighbor_num": 4,
+        "emb_neighbor_num": 5,
         "emb_split_num": 4,
         "ngram_exclude_sp_token": True,
         "special_token_scope": "0:4,36:55",
@@ -114,7 +114,7 @@ def mapping(world_size=1, rank=0, role="prefill"):
         linear_attn=SimpleNamespace(tp_size=size, tp_rank=rank, tp_group=world_group),
         mla_weight=SimpleNamespace(tp_size=1, tp_rank=0, tp_group=(rank,)),
         moe=SimpleNamespace(
-            tp_size=1, ep_size=size, ep_rank=rank, ep_group=world_group
+            tp_size=1, tp_rank=0, ep_size=size, ep_rank=rank, ep_group=world_group
         ),
         attn=SimpleNamespace(
             tp_size=size if replicated else 1,
@@ -159,11 +159,42 @@ def test_lite_config_derives_hybrid_and_oe_geometry():
         "linear_attention",
         "attention",
     ]
-    assert config.oe_component_count == 12
-    assert config.oe_hidden_size == 8
+    assert config.oe_component_count == 16
+    assert config.oe_hidden_size == 6
     assert config.oe_table_rows(0) == 13
-    assert config.oe_table_rows(11) == 35
+    assert config.oe_table_rows(15) == 43
     assert config.special_token_ids == tuple(range(4)) + tuple(range(36, 55))
+
+
+def test_lite_strict_layout_describes_w8a8_expert_sidecars():
+    config = FLASHLocalConfig.from_dict(lite_config_dict())
+    layout = FLASHLocalCheckpointLayout(
+        config,
+        shared_quant_kind="unquant",
+        moe_quant_kind="int8",
+        moe_smooth_quant=True,
+    )
+    prefix = "model.layers.0.mlp.experts.0"
+    names = set(layout.iter_source_names())
+
+    assert f"{prefix}.gate_proj.weight_scale" in names
+    assert f"{prefix}.down_proj.smooth_scale" in names
+    gate = layout.spec(f"{prefix}.gate_proj.weight")
+    gate_scale = layout.spec(f"{prefix}.gate_proj.weight_scale")
+    gate_smooth = layout.spec(f"{prefix}.gate_proj.smooth_scale")
+    down_scale = layout.spec(f"{prefix}.down_proj.weight_scale")
+    down_smooth = layout.spec(f"{prefix}.down_proj.smooth_scale")
+
+    assert gate.shape == (16, 24)
+    assert gate.dtype == torch.int8
+    assert gate_scale.shape == (16, 1)
+    assert gate_scale.target_name.endswith("experts.w13_weight_scale")
+    assert gate_smooth.shape == (24,)
+    assert gate_smooth.target_name.endswith("experts.w13_smooth_scale")
+    assert down_scale.shape == (24, 1)
+    assert down_scale.target_name.endswith("experts.w2_weight_scale")
+    assert down_smooth.shape == (16,)
+    assert down_smooth.target_name.endswith("experts.w2_smooth_scale")
 
 
 def test_lite_config_exposes_linear_tp_cache_geometry():
@@ -181,6 +212,82 @@ def test_lite_config_exposes_linear_tp_cache_geometry():
     assert conv_dtype == torch.bfloat16
     assert state_dtype == torch.float32
     assert layer_ids == config.linear_layer_ids
+
+
+@pytest.mark.parametrize("kind", ["unquant", "int8"])
+def test_lite_shared_checkpoint_weights_and_scales(kind):
+    config = FLASHLocalConfig.from_dict(lite_config_dict())
+    layout = FLASHLocalCheckpointLayout(config, shared_quant_kind=kind)
+    names = set(layout.iter_source_names())
+    prefix = "model.layers.0.mlp.shared_experts"
+    for projection in ("gate", "up", "down"):
+        name = f"{prefix}.{projection}_proj.weight"
+        assert layout.spec(name).dtype == (
+            torch.int8 if kind == "int8" else torch.bfloat16
+        )
+        scale = name + "_scale"
+        if kind == "int8":
+            assert scale in names
+            assert layout.spec(scale).dtype == torch.float32
+            assert layout.spec(scale).shape == (96, 1)
+        else:
+            assert scale not in names
+            with pytest.raises(ValueError, match="Unexpected Lite checkpoint"):
+                layout.spec(scale)
+
+
+def test_lite_strict_shared_int8_loads_weight_and_channel_scales():
+    from tokenspeed.runtime.layers.quantization.compressed_tensors.compressed_tensors import (
+        CompressedTensorsConfig,
+    )
+
+    quant = CompressedTensorsConfig.from_config(
+        {
+            "format": "int-quantized",
+            "quant_method": "compressed-tensors",
+            "moe_enable_smooth_quant": True,
+            "ignore": ["lm_head", "re:.*self_attn.*", "re:.*embed_tokens.*"],
+            "config_groups": {
+                "group_0": {
+                    "targets": ["Linear"],
+                    "weights": {
+                        "num_bits": 8,
+                        "type": "int",
+                        "strategy": "channel",
+                        "symmetric": True,
+                        "dynamic": False,
+                    },
+                    "input_activations": {
+                        "num_bits": 8,
+                        "type": "int",
+                        "strategy": "token",
+                        "symmetric": True,
+                        "dynamic": True,
+                    },
+                }
+            },
+        }
+    )
+    config = FLASHLocalConfig.from_dict(lite_config_dict())
+    model = FLASHLocalForCausalLM(
+        config, mapping(8, rank=1), quant_config=quant, oe_table_placement="host"
+    )
+    assert model.checkpoint_layout.shared_quant_kind == "int8"
+    assert model.checkpoint_layout.moe_smooth_quant
+    assert hasattr(model.model.layers[0].moe.experts, "w13_smooth_scale")
+    assert hasattr(model.model.layers[0].moe.experts, "w2_smooth_scale")
+
+    def values(_index, name, tensor):
+        if ".shared_experts." in name:
+            return tensor.fill_(0.125 if name.endswith("weight_scale") else 3)
+        return tensor
+
+    model.load_weights(weights(model.checkpoint_layout, values))
+    shared = model.model.layers[0].moe.shared_experts
+    for layer in (shared.gate_up_proj, shared.down_proj):
+        assert layer.weight.dtype == torch.int8
+        assert torch.all(layer.weight == 3)
+        assert torch.all(layer.weight_scale == 0.125)
 
 
 def test_lite_config_fails_closed_on_raw_checkpoint_fields():
@@ -234,7 +341,7 @@ def test_real_layout_has_exact_source_count_and_shapes():
     config = FLASHLocalConfig.from_dict(
         lite_config_dict(
             vocab_size=163840,
-            hidden_size=3072,
+            hidden_size=4096,
             ffn_hidden_size=3072,
             expert_ffn_hidden_size=512,
             num_layers=28,
@@ -247,16 +354,16 @@ def test_real_layout_has_exact_source_count_and_shapes():
             n_routed_experts=384,
             zero_expert_num=32,
             moe_topk=12,
-            linear_hidden_size=3072,
+            linear_hidden_size=4096,
             linear_head_dim=128,
             linear_num_heads=32,
-            ngram_vocab_size_ratio=28.8,
+            ngram_vocab_size_ratio=59.604,
         )
     )
-    layout = FLASHLocalCheckpointLayout(config)
+    layout = FLASHLocalCheckpointLayout(config, shared_quant_kind="unquant")
     names = list(layout.iter_source_names())
 
-    assert len(names) == len(set(names)) == 129_870
+    assert len(names) == len(set(names)) == 129_878
     assert layout.spec(
         "model.layers.0.self_attn.linear_core.b_proj.1.weight"
     ).shape == (
@@ -284,11 +391,11 @@ def test_real_layout_has_exact_source_count_and_shapes():
         512,
     )
     assert layout.spec("model.layers.0.mlp.experts.1535.down_proj.weight").shape == (
-        768,
+        1024,
         512,
     )
     assert layout.spec("model.ngram_embeddings.embedders.11.weight").shape == (
-        4_718_615,
+        9_765_542,
         256,
     )
     assert (
@@ -319,18 +426,13 @@ def test_model_skeleton_uses_kda_tp8_moe_ep8_and_replicated_mla(role):
     assert model.model.layers[3].self_attn.q_b_proj.weight.shape == (48, 24)
     assert model.model.layers[0].moe.experts.w13_weight.shape == (4, 32, 24)
     assert model.model.layers[0].moe.experts.w2_weight.shape == (4, 24, 16)
-    expected_dense = 96 if role == "prefill" else 12
-    assert model.model.layers[0].moe.proj_input.weight.shape == (expected_dense, 96)
-    assert model.model.layers[0].moe.proj_output.weight.shape == (96, expected_dense)
-    assert model.model.layers[0].moe.expert_groups[
-        0
-    ].router.classifier.weight.shape == (
-        12,
-        24,
-    )
-    assert model.model.ngram_embeddings.embedders[0].weight.numel() == 0
-    assert model.model.ngram_embeddings.embedders[0].weight.device.type == "cpu"
-    assert model.model.ngram_embeddings.projection.shape == (12, 8, 96)
+    assert model.model.layers[0].moe.proj_input.weight.shape == (96, 96)
+    assert model.model.layers[0].moe.proj_output.weight.shape == (96, 96)
+    assert model.model.layers[0].moe.router.classifier.weight.shape == (12, 24)
+    assert len(model.model.embed_tokens.oe_tables) == 2
+    assert model.model.embed_tokens.oe_tables[0].numel() == 0
+    assert model.model.embed_tokens.oe_tables[0].device.type == "cpu"
+    assert model.model.embed_tokens.projection.shape == (12, 96)
 
 
 @pytest.mark.parametrize(("is_npu", "expected"), [(False, False), (True, True)])
@@ -426,7 +528,7 @@ def test_model_accepts_bounded_replicated_mla_topology():
     assert model.mapping.attn.tp_size == 8
     assert model.model.layers[3].self_attn.component_mapping.tp_size == 1
     assert model.model.layers[3].self_attn.q_b_proj.weight.shape == (48, 24)
-    assert model.model.layers[0].moe.proj_input.weight.shape == (12, 96)
+    assert model.model.layers[0].moe.proj_input.weight.shape == (96, 96)
     assert model.model.embed_tokens.weight.shape == (16, 96)
 
 
@@ -447,7 +549,7 @@ def test_strict_loader_covers_rename_shards_experts_and_host_oe():
         }
         if name in packed_values:
             return torch.full_like(tensor, packed_values[name])
-        if name == "model.ngram_embeddings.post_projs.3.weight":
+        if name == "model.ngram_embeddings.post_projs.1.weight":
             return torch.arange(tensor.numel(), dtype=tensor.dtype).view(tensor.shape)
         mla_values = {
             "model.layers.3.self_attn.q_a_proj.weight": 7,
@@ -491,16 +593,14 @@ def test_strict_loader_covers_rename_shards_experts_and_host_oe():
     )
     assert torch.equal(experts.w2_weight[0], torch.full_like(experts.w2_weight[0], 3))
     assert model.model.layers[0].moe.local_expert_ids == (1, 9, 17, 25)
-    assert model.model.ngram_embeddings.embedders[0].weight.device.type == "cpu"
-    assert model.model.ngram_embeddings.embedders[0].weight.shape == (13, 8)
+    assert model.model.embed_tokens.oe_tables[0].device.type == "cpu"
+    assert model.model.embed_tokens.oe_tables[0].shape == (15, 6)
     projection_source = sentinel(
         0,
-        "model.ngram_embeddings.post_projs.3.weight",
-        torch.empty((96, 8), dtype=torch.bfloat16),
+        "model.ngram_embeddings.post_projs.1.weight",
+        torch.empty((96, 6), dtype=torch.bfloat16),
     )
-    assert torch.equal(
-        model.model.ngram_embeddings.projection[3], projection_source.t()
-    )
+    assert torch.equal(model.model.embed_tokens.projection[:6], projection_source.t())
     mla = model.model.layers[3].self_attn
     for parameter, value in (
         (mla.q_a_proj.weight, 7),
@@ -558,7 +658,9 @@ def test_lite_grouped_expert_placement_is_a_bijection() -> None:
     ],
 )
 def test_strict_loader_rejects_incomplete_or_ambiguous_stream(case, message):
-    config = FLASHLocalConfig.from_dict(lite_config_dict())
+    config = FLASHLocalConfig.from_dict(
+        lite_config_dict(gmoe_strategy="global_expert_id")
+    )
     model = FLASHLocalForCausalLM(config, mapping(), oe_table_placement="host")
     checkpoint = list(weights(model.checkpoint_layout))
     if case == "missing":
@@ -573,3 +675,38 @@ def test_strict_loader_rejects_incomplete_or_ambiguous_stream(case, message):
 
     with pytest.raises(ValueError, match=message):
         model.load_weights(checkpoint)
+
+
+@pytest.mark.parametrize("filtered", [False, True])
+@pytest.mark.parametrize("missing_local", [False, True])
+def test_strict_loader_allows_only_nonlocal_oe_sources_to_be_omitted(
+    filtered, missing_local
+):
+    config = FLASHLocalConfig.from_dict(lite_config_dict())
+    model = FLASHLocalForCausalLM(
+        config, mapping(8, rank=0, role="replicated"), oe_table_placement="host"
+    )
+    checkpoint = list(weights(model.checkpoint_layout))
+    nonlocal_names = {
+        name for name, _ in checkpoint if not model.checkpoint_weight_name_filter(name)
+    }
+    assert nonlocal_names
+    if filtered:
+        checkpoint = [
+            (name, value) for name, value in checkpoint if name not in nonlocal_names
+        ]
+    if missing_local:
+        local_oe = next(
+            name
+            for name, _ in checkpoint
+            if ".embedders." in name and name not in nonlocal_names
+        )
+        checkpoint = [(name, value) for name, value in checkpoint if name != local_oe]
+    with mock.patch.object(model, "post_load_weights") as post_load:
+        if missing_local:
+            with pytest.raises(ValueError, match="missing 1 source"):
+                model.load_weights(checkpoint)
+            post_load.assert_not_called()
+        else:
+            model.load_weights(checkpoint)
+            post_load.assert_called_once_with()

@@ -29,9 +29,9 @@ past the table route to slot 0, the zero-initialized dummy page that never
 aliases a live request.
 
 Every function takes the stacked ``[G, max_bs, max_num_pages]`` table the
-router fills (``group_tables.GroupTableStacks``) so all groups' locations
-come from one launch. CUDA tensors run the triton kernels; CPU tensors take the torch path
-(unit tests), which is the reference the kernels are pinned against.
+router fills (``group_tables.GroupTableStacks``). CUDA runs the Triton kernels;
+NPU also uses the fused decode kernel, which reads page sizes on device and
+avoids a host scalar read in metadata preparation. CPU uses the torch reference.
 
 The token-shaped sibling — arbitrary positions over one group's raw table,
 failing closed to the ``-1`` sentinel (V4's SWA / compressor-state /
@@ -176,7 +176,7 @@ def decode_write_locations(
             f"decode write-location buffer holds {out.shape[1]} slots per group, "
             f"need {num_tokens} (bs={bs}, tokens_per_req={n})"
         )
-    if tables.is_cuda:
+    if tables.device.type in {"cuda", "npu"}:
         block = 128
         grid = (tables.shape[0], triton.cdiv(num_tokens, block))
         _decode_locs_kernel[grid](

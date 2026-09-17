@@ -1,5 +1,8 @@
 # Lite NPU 阶段 7：OE 正确性与 Host Residency
 
+> 历史设计：checkpointed-tail 生产路径已删除，仅保留测试用 CPU 精度 oracle；
+> 当前实现与约束见 `lite-npu-oe-device-hash-host-table.md`。
+
 ## 1. 目标与阶段边界
 
 本阶段实现 Lite 的 Over Embedding（OE）最小完整闭环：严格加载目标 checkpoint 的 12 张 BF16

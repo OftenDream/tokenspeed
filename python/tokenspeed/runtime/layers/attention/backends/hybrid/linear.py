@@ -76,6 +76,10 @@ class HybridLinearAttnBackend(AttentionBackend):
         return self.full_attn_backend.chunked_prefill_metadata
 
     @property
+    def dsa_selection_policy(self) -> tuple[int, int]:
+        return self.full_attn_backend.dsa_selection_policy
+
+    @property
     def data_type(self):
         return self.full_attn_backend.data_type
 
@@ -120,6 +124,11 @@ class HybridLinearAttnBackend(AttentionBackend):
     def write_locations(self, layer, forward_mode):
         return self._backend_for_layer(layer.layer_id).write_locations(
             layer, forward_mode
+        )
+
+    def run_projection_branches(self, layer, primary, secondary):
+        return self._backend_for_layer(layer.layer_id).run_projection_branches(
+            layer, primary, secondary
         )
 
     @property

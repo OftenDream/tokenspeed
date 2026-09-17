@@ -1041,23 +1041,18 @@ def test_prefill_state_inputs_zero_fresh_rows_without_reading_null_page() -> Non
     ssm_states = torch.full((5, 2, 4, 4), float("nan"))
     ssm_states[0] = 0.0
     ssm_states[2] = 7.0
-    conv_states = torch.arange(5, dtype=torch.float32).view(5, 1, 1).expand(5, 3, 2)
-    conv_states = conv_states.clone()
     state_in = torch.tensor([0, 2, 0], dtype=torch.int32)
     state_out = torch.tensor([1, 3, 4], dtype=torch.int64)
 
-    recurrent_state, has_initial_state = _prepare_cache_prefill_state_inputs(
-        conv_states, ssm_states, state_in, state_out
+    recurrent_state, has_initial_state, conv_reads = (
+        _prepare_cache_prefill_state_inputs(ssm_states, state_in, state_out)
     )
 
     assert has_initial_state.tolist() == [False, True, False]
     assert (recurrent_state[0] == 0).all() and (recurrent_state[2] == 0).all()
     assert (recurrent_state[1] == 7.0).all()
-    # The resumed row copies its snapshot's conv page into its working page;
-    # fresh rows keep their own working page and never touch page 0.
-    assert (conv_states[3] == 2.0).all()
-    assert (conv_states[1] == 1.0).all() and (conv_states[4] == 4.0).all()
-    assert (conv_states[0] == 0.0).all()
+    # Convolution consumes the original checkpoint independently of its write slot.
+    assert conv_reads.tolist() == [1, 2, 4]
 
 
 @requires_cuda

@@ -138,7 +138,9 @@ def create_cache_pool(
             rank=rank,
             field_layer_offset=field_layer_offset,
         )
-    if isinstance(softmax_attn, DSAConfig):
+    if isinstance(softmax_attn, DSAConfig) and not (
+        softmax_attn.uses_separate_bf16_index_cache
+    ):
         from tokenspeed.runtime.layers.attention.kv_cache.dsa import (
             DSATokenToKVPool,
         )

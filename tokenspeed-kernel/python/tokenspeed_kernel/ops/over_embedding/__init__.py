@@ -76,7 +76,10 @@ def append_packed_lookup_(
             for graph padding.
         committed_lengths: Contiguous int32 publication pointers
             ``[slot_count]``. This kernel never modifies them.
-        oe_tables: Compact BF16 OE fragment tables in ``spec.fragments`` order.
+        oe_tables: BF16 OE fragment tables in ``spec.fragments`` order. An
+            implementation may accept them either as compact Device tensors or
+            row-contiguous CPU mmap views; all fragments in one call use the
+            same placement.
         spec: Static profile, TP rank, and fragment ownership contract.
         out: Optional caller-owned contiguous BF16
             ``[M, spec.local_width]`` destination.
@@ -147,6 +150,33 @@ def append_packed_lookup_(
             enable_pdl=enable_pdl,
         )
     return out
+
+
+def register_host_tables_(
+    oe_tables: tuple[_torch.Tensor, ...],
+    *,
+    device: _torch.device | str | int,
+    solution: str | None = None,
+) -> None:
+    """Register Host OE storage once before inference starts.
+
+    The selected accelerator implementation maps the backing Host pages into
+    its device-visible address space. Lookup launches then reuse those pointers.
+    """
+    if not oe_tables or any(table.device.type != "cpu" for table in oe_tables):
+        raise ValueError("register_host_tables_ requires non-empty CPU OE tables")
+    signature = format_signature(table=dense_tensor_format(oe_tables[0].dtype))
+    kernel = select_kernel(
+        "over_embedding",
+        "register_host_tables",
+        signature,
+        traits={
+            "fragment_count": len(oe_tables),
+            "fragment_widths": tuple(table.shape[1] for table in oe_tables),
+        },
+        solution=solution,
+    )
+    kernel(oe_tables=oe_tables, device=device)
 
 
 def project_add_word_(
@@ -244,9 +274,11 @@ __all__ = [
     "longcat_lite_tp8_spec",
     "longcat_pro_tp8_spec",
     "append_packed_lookup_",
+    "register_host_tables_",
     "project_add_word_",
 ]
 
 
+import tokenspeed_kernel.ops.over_embedding.ascend  # noqa: E402,F401
 import tokenspeed_kernel.ops.over_embedding.cute_dsl  # noqa: E402,F401
 import tokenspeed_kernel.ops.over_embedding.torch  # noqa: E402,F401

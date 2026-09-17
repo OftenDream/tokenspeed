@@ -18,6 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -70,20 +71,67 @@ def _history_view(
     )
 
 
-def test_flash_lite_profile_matches_checkpoint_geometry() -> None:
+@pytest.mark.parametrize(
+    (
+        "hidden_size",
+        "max_ngram_order",
+        "modulus0",
+        "tp_size",
+        "expected_width",
+        "expected_moduli",
+    ),
+    (
+        (8192, 5, 16476898, 8, 1024, [16476898, 16476900]),
+        (3072, 4, 4718593, 4, 768, [4718593, 4718601, 4718609]),
+        (3072, 4, 4718593, 8, 384, [4718593, 4718609]),
+        (4096, 5, 9765520, 8, 512, [9765520, 9765536]),
+        (4096, 5, 5008098, 8, 512, [5008098, 5008114]),
+        (4096, 5, 5008098, 16, 256, [5008098]),
+    ),
+)
+def test_oe_configuration_registry_matches_checkpoint_geometry(
+    hidden_size: int,
+    max_ngram_order: int,
+    modulus0: int,
+    tp_size: int,
+    expected_width: int,
+    expected_moduli: list[int],
+) -> None:
     spec = resolve_longcat_oe_spec(
         vocab_size=163840,
-        hidden_size=3072,
-        max_ngram_order=4,
+        hidden_size=hidden_size,
+        max_ngram_order=max_ngram_order,
         hashes_per_order=4,
-        modulus0=4718593,
-        tp_size=8,
+        modulus0=modulus0,
+        tp_size=tp_size,
         tp_rank=0,
     )
 
-    assert spec.branch_count == 12
-    assert spec.local_width == 384
-    assert [fragment.modulus for fragment in spec.fragments] == [4718593, 4718609]
+    assert spec.branch_count == (max_ngram_order - 1) * 4
+    assert spec.local_width == expected_width
+    assert [fragment.modulus for fragment in spec.fragments] == expected_moduli
+
+
+@pytest.mark.parametrize("tp_size", (8, 16))
+def test_lite_4096_ratio_30567_oe_ownership_covers_all_branches(tp_size: int) -> None:
+    owned = []
+    for rank in range(tp_size):
+        spec = resolve_longcat_oe_spec(
+            vocab_size=163840,
+            hidden_size=4096,
+            max_ngram_order=5,
+            hashes_per_order=4,
+            modulus0=5008098,
+            tp_size=tp_size,
+            tp_rank=rank,
+        )
+        assert spec.local_width == 4096 // tp_size
+        for fragment in spec.fragments:
+            assert fragment.feature_begin == 0
+            assert fragment.feature_width == 256
+            assert fragment.modulus == 5008098 + 2 * fragment.branch_id
+            owned.append(fragment.branch_id)
+    assert sorted(owned) == list(range(16))
 
 
 def test_projection_preserves_word_embedding_for_bypassed_tokens() -> None:
@@ -177,7 +225,10 @@ def test_forward_bypass_mask_supports_cuda_graph_replay(monkeypatch) -> None:
     assert output[:, 0].cpu().tolist() == [1.0, 0.0]
 
 
-def test_forward_uses_runtime_history_and_masks_graph_padding(monkeypatch) -> None:
+@pytest.mark.parametrize("table_placement", ["device", "host"])
+def test_forward_uses_runtime_history_and_masks_graph_padding(
+    monkeypatch, table_placement
+) -> None:
     monkeypatch.setattr(
         over_embedding, "resolve_longcat_oe_spec", lambda **_: _small_spec()
     )
@@ -192,6 +243,7 @@ def test_forward_uses_runtime_history_and_masks_graph_padding(monkeypatch) -> No
         tp_group=(0,),
         params_dtype=torch.bfloat16,
         fix_normalize_factor=True,
+        table_placement=table_placement,
     )
     assert layer.normalize_scale == pytest.approx(3**0.5)
     history_token_ids = torch.zeros((3, 16), dtype=torch.int32)
@@ -221,6 +273,8 @@ def test_forward_uses_runtime_history_and_masks_graph_padding(monkeypatch) -> No
         history_token_ids,
         committed_lengths,
         oe_tables,
+        *,
+        enable_pdl,
         **_,
     ):
         assert input_start_offsets.tolist() == [0, 2, 3]
@@ -229,6 +283,7 @@ def test_forward_uses_runtime_history_and_masks_graph_padding(monkeypatch) -> No
         assert history_token_ids is history_token_ids_runtime
         assert committed_lengths is committed_lengths_runtime
         assert committed_lengths[0].item() == 3
+        assert enable_pdl == (table_placement == "device")
         assert history_token_ids[0, 1:3].tolist() == [6, 7]
         history_token_ids[0, 3:5].copy_(input_ids[:2])
         return torch.zeros((3, 6), dtype=torch.bfloat16)
@@ -494,3 +549,252 @@ def test_configured_oe_tp8_cuda_matches_unsharded_reference(segment_specials):
             partial[3] += torch.cat([table[0] for table in local_tables]) @ projection
         actual += partial.float()
     torch.testing.assert_close(actual, expected, rtol=0.02, atol=0.02)
+
+
+def test_host_tables_keep_row_contiguous_checkpoint_views(monkeypatch) -> None:
+    monkeypatch.setattr(
+        over_embedding, "resolve_longcat_oe_spec", lambda **_: _small_spec()
+    )
+    layer = LongCatOverEmbedding(
+        num_embeddings=31,
+        embedding_dim=8,
+        over_embedding_m=6,
+        hashes_per_order=1,
+        max_ngram_order=3,
+        tp_rank=0,
+        tp_size=1,
+        tp_group=(0,),
+        params_dtype=torch.bfloat16,
+        table_placement="host",
+    )
+    checkpoint_table = torch.arange(36, dtype=torch.bfloat16).reshape(9, 4)
+
+    assert layer.load_weight(
+        "model.ngram_embeddings.embedders.1.weight", checkpoint_table
+    )
+
+    local_table = layer.oe_tables[1]
+    assert local_table.shape == (9, 2)
+    assert local_table.stride() == (4, 1)
+    assert local_table.storage_offset() == 2
+    assert (
+        local_table.untyped_storage().data_ptr()
+        == checkpoint_table.untyped_storage().data_ptr()
+    )
+
+
+def test_loader_validates_non_local_table_against_oe_hyperparameters(
+    monkeypatch,
+) -> None:
+    spec = _small_spec()
+    non_local_spec = OverEmbeddingSpec(
+        profile=spec.profile,
+        tp_size=spec.tp_size,
+        rank=spec.rank,
+        vocab_size=spec.vocab_size,
+        branch_count=spec.branch_count,
+        branch_width=spec.branch_width,
+        hidden_size=spec.hidden_size,
+        max_ngram_order=spec.max_ngram_order,
+        fragments=(spec.fragments[0],),
+    )
+    monkeypatch.setattr(
+        over_embedding, "resolve_longcat_oe_spec", lambda **_: non_local_spec
+    )
+    layer = LongCatOverEmbedding(
+        num_embeddings=31,
+        embedding_dim=8,
+        over_embedding_m=6,
+        hashes_per_order=1,
+        max_ngram_order=3,
+        tp_rank=0,
+        tp_size=1,
+        tp_group=(0,),
+        params_dtype=torch.bfloat16,
+        table_placement="host",
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=r"branch 1.*expected \(9, 4\).*configured OE modulus",
+    ):
+        layer.load_weight(
+            "model.ngram_embeddings.embedders.1.weight",
+            torch.empty((8, 4), dtype=torch.bfloat16),
+        )
+
+
+@pytest.mark.parametrize(
+    ("weight_name", "weight"),
+    (
+        (
+            "model.ngram_embeddings.embedders.0.weight",
+            torch.empty((7, 4), dtype=torch.float32),
+        ),
+        (
+            "model.ngram_embeddings.post_projs.0.weight",
+            torch.empty((8, 4), dtype=torch.float32),
+        ),
+    ),
+)
+def test_loader_rejects_oe_weight_dtype_mismatch(
+    monkeypatch, weight_name, weight
+) -> None:
+    monkeypatch.setattr(
+        over_embedding, "resolve_longcat_oe_spec", lambda **_: _small_spec()
+    )
+    layer = LongCatOverEmbedding(
+        num_embeddings=31,
+        embedding_dim=8,
+        over_embedding_m=6,
+        hashes_per_order=1,
+        max_ngram_order=3,
+        tp_rank=0,
+        tp_size=1,
+        tp_group=(0,),
+        params_dtype=torch.bfloat16,
+    )
+
+    with pytest.raises(ValueError, match=r"torch\.float32.*expected.*torch\.bfloat16"):
+        layer.load_weight(weight_name, weight)
+
+
+def test_host_registration_delegates_backend_selection(monkeypatch) -> None:
+    monkeypatch.setattr(
+        over_embedding, "resolve_longcat_oe_spec", lambda **_: _small_spec()
+    )
+    layer = LongCatOverEmbedding(
+        num_embeddings=31,
+        embedding_dim=8,
+        over_embedding_m=6,
+        hashes_per_order=1,
+        max_ngram_order=3,
+        tp_rank=0,
+        tp_size=1,
+        tp_group=(0,),
+        params_dtype=torch.bfloat16,
+        table_placement="host",
+    )
+    calls = []
+
+    def register(tables, *, device):
+        calls.append((tables, device))
+
+    monkeypatch.setattr(over_embedding, "register_host_tables_", register)
+
+    layer.initialize_host_runtime()
+    layer.initialize_host_runtime()
+
+    assert len(calls) == 1
+    assert all(
+        actual is expected
+        for actual, expected in zip(calls[0][0], layer.oe_tables, strict=True)
+    )
+    assert calls[0][1] == layer.projection.device
+
+
+@pytest.mark.parametrize("device", ["cpu", "npu"])
+def test_host_special_tokens_use_device_row_zero_cache(monkeypatch, device):
+    if device == "npu":
+        pytest.importorskip("torch_npu")
+        if not torch.npu.is_available():
+            pytest.skip("requires an Ascend NPU")
+    spec = replace(_small_spec(), profile="longcat-lite")
+    monkeypatch.setattr(over_embedding, "resolve_longcat_oe_spec", lambda **_: spec)
+    layer = LongCatOverEmbedding(
+        num_embeddings=31,
+        embedding_dim=8,
+        over_embedding_m=6,
+        hashes_per_order=1,
+        max_ngram_order=3,
+        tp_rank=0,
+        tp_size=1,
+        tp_group=(0,),
+        params_dtype=torch.bfloat16,
+        ignored_token_ids=(3,),
+        eos_token_id=2,
+        segment_ignored_tokens=True,
+        fix_normalize_factor=True,
+        table_placement="host",
+    )
+    for index, fragment in enumerate(spec.fragments):
+        layer.oe_tables[index] = torch.nn.Parameter(
+            torch.full(
+                (fragment.modulus, fragment.feature_width),
+                index + 1,
+                dtype=torch.bfloat16,
+            ),
+            requires_grad=False,
+        )
+    layer.projection.data = torch.ones_like(layer.projection, device=device)
+    layer._ignored_token_ids = layer._ignored_token_ids.to(device)
+    pointers = [table.data_ptr() for table in layer.oe_tables]
+    registrations = []
+    monkeypatch.setattr(
+        over_embedding,
+        "register_host_tables_",
+        lambda tables, *, device: registrations.append(device),
+    )
+    layer.initialize_host_runtime()
+    cache = layer._host_zero_lookup
+    layer.initialize_host_runtime()
+    assert len(registrations) == 1
+    assert cache is layer._host_zero_lookup
+    assert cache.device == layer.projection.device
+    assert cache.shape == (1, spec.local_width)
+    assert "_host_zero_lookup" not in layer.state_dict()
+    assert all(table.device.type == "cpu" for table in layer.oe_tables)
+    assert pointers == [table.data_ptr() for table in layer.oe_tables]
+    expected_row = torch.tensor([[1, 1, 1, 1, 2, 2]], dtype=torch.bfloat16)
+    torch.testing.assert_close(cache.cpu(), expected_row, rtol=0, atol=0)
+    # The forward must not consult Host row zero again, even during capture.
+    for table in layer.oe_tables:
+        table.data[0].fill_(99)
+    monkeypatch.setattr(
+        layer.word_embedding,
+        "forward",
+        lambda ids, *, reduce_results: torch.ones(
+            (ids.numel(), 8), device=ids.device, dtype=torch.bfloat16
+        ),
+    )
+    monkeypatch.setattr(
+        over_embedding,
+        "append_packed_lookup_",
+        lambda ids, *args, **kwargs: torch.zeros(
+            (ids.numel(), spec.local_width), device=ids.device, dtype=torch.bfloat16
+        ),
+    )
+    monkeypatch.setattr(
+        over_embedding,
+        "project_add_word_",
+        lambda word, activation, projection, *, scale, bypass_mask: torch.where(
+            bypass_mask[:, None], word, word / scale
+        ),
+    )
+    ids = torch.tensor([3, 5], dtype=torch.int32, device=device)
+    view = SimpleNamespace(
+        **{
+            key: None
+            for key in (
+                "input_start_offsets",
+                "req_pool_indices",
+                "active_request_mask",
+                "history_token_ids",
+                "committed_lengths",
+            )
+        }
+    )
+    ctx = SimpleNamespace(request_token_history=view)
+    expected = torch.ones(2, 8, dtype=torch.bfloat16)
+    expected[0].fill_(9)  # unscaled word + learned row-zero projection
+    expected[1] /= layer.normalize_scale
+    torch.testing.assert_close(layer(ids, ctx).cpu(), expected, rtol=0, atol=0)
+    if device == "npu":
+        graph = torch.npu.NPUGraph()
+        with torch.npu.graph(graph):
+            captured = layer(ids, ctx)
+        ids.copy_(torch.tensor([5, 3], device=device, dtype=ids.dtype))
+        graph.replay()
+        torch.npu.synchronize()
+        torch.testing.assert_close(captured.cpu(), expected.flip(0), rtol=0, atol=0)
+        assert layer._host_zero_lookup.data_ptr() == cache.data_ptr()

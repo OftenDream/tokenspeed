@@ -1,5 +1,15 @@
 # Lite NPU 阶段 8C：Decode 官方 Dispatch/Combine 准入设计
 
+> Follow-up: the repository also retains an experimental V2 adapter for
+> the global-expert (scheme 2) layout.  It gives every logical expert a global
+> ID, maps identity experts to V2 copy experts, and internally chunks expert
+> groups to respect the A2 limit of 1024 real experts per invocation.  Direct
+> A2 validation accepted the small shape, rejected 3072 real experts during
+> tiling, and did not complete the larger 768-expert full-mesh case.  Therefore
+> this adapter is preserved as experimental code and is not the production
+> decode path.  The next production candidate is the group-first (scheme 1)
+> layout: an inter-group AllToAll followed by an EP-local MoE invocation.
+
 ## 1. 目标与结论边界
 
 Lite Decode 的当前正确性基线是四个 Grouped MoE local leaf 加一次 EP8

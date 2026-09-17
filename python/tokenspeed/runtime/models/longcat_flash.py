@@ -430,8 +430,6 @@ class _RuntimeLongcatDecoderLayer(nn.Module):
                         {
                             "computes_selection": branch_id == 0,
                             "selection_owner_layer_id": layer_id * 2,
-                            "initial_tokens": config.index_init_tokens,
-                            "local_tokens": config.index_local_tokens,
                             "lora_norm_eps": config.rms_norm_eps,
                         }
                         if self.uses_lsa

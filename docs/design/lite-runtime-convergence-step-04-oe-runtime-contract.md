@@ -2,13 +2,15 @@
 
 ## Scope
 
-This step removes architecture-name decisions from OE cache, graph, and request
-history setup. It preserves the two validated physical implementations:
+This document described the original convergence step. The active Ascend
+contract has since been superseded by
+`lite-npu-oe-device-hash-host-table.md`. The checkpointed-tail runtime was
+subsequently removed; only its CPU math remains as a test oracle.
 
 | Runtime plan | Table lookup | Context owner |
 | --- | --- | --- |
 | `device` + `runtime-full-history` | existing Device OE kernel | `RuntimeStates` request-token history |
-| `host` + `cache-checkpointed-tail` | existing CPU table lookup and Device activation staging | cache recipe three-token snapshot |
+| `host` + `runtime-full-history` | CPU mmap table lookup and Device activation staging | `RuntimeStates` request-token history |
 
 Table placement and context ownership remain separate resolved fields. Only the
 two rows above are admitted in this step; unimplemented cross-products fail at

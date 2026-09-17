@@ -30,6 +30,11 @@ FLASH_MLA_PAGE_SIZE = 64
 # (block-split FP8 payload + FP32 scales).
 DSA_SPARSE_PAGE_SIZE = 64
 
+# Ascend SparseFlashAttentionDecode consumes 128-token PA_BSND pages. Keep
+# this separate from the generic FP8 DSA page geometry above: it is a kernel
+# ABI constraint, not a model-family property.
+ASCEND_SFAD_PAGE_SIZE = 128
+
 # DeepSeek V4 kernels consume compressed-KV pages spanning this many raw
 # tokens (256 / compress_ratio rows per page). The V4 cache spec and the
 # model's default prefix granularity both derive from it.

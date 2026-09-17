@@ -1537,6 +1537,7 @@ class ServerArgs:
         attention_backend_choices = [
             "mha",
             "mla",
+            "longcat_dsa",
             "fa3",
             "fa4",
             "triton",
@@ -1847,7 +1848,7 @@ class ServerArgs:
         parser.add_argument(
             "--npu-enable-weight-nz",
             action="store_true",
-            help="Prepare selected Lite Decode weights in Ascend FRACTAL_NZ format.",
+            help="Prepare selected Lite weights in Ascend FRACTAL_NZ format; Prefill selects only MLA prolog inputs.",
         )
         parser.add_argument(
             "--oe-table-placement",

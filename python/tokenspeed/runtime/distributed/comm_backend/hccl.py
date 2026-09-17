@@ -83,7 +83,7 @@ class HcclBackend(CommBackend):
         if len(group) == 1:
             output.copy_(input)
             return
-        dist.all_gather_single(output, input, group=self._process_group(group))
+        dist.all_gather_into_tensor(output, input, group=self._process_group(group))
 
     def reduce_scatter(self, tensor: torch.Tensor, group: Group) -> torch.Tensor:
         if len(group) == 1:
@@ -93,7 +93,7 @@ class HcclBackend(CommBackend):
             dtype=tensor.dtype,
             device=tensor.device,
         )
-        dist.reduce_scatter_single(output, tensor, group=self._process_group(group))
+        dist.reduce_scatter_tensor(output, tensor, group=self._process_group(group))
         return output
 
     def all_to_all_single(
@@ -135,6 +135,15 @@ class HcclBackend(CommBackend):
         scattered_num_tokens: list[int],
     ) -> torch.Tensor:
         max_tokens = max(scattered_num_tokens)
+        if (
+            len(group) > 1
+            and len(scattered_num_tokens) == len(group)
+            and all(tokens == max_tokens for tokens in scattered_num_tokens)
+            and tensor.shape[0] == len(group) * max_tokens
+        ):
+            # Equal splits are already laid out for ReduceScatter. Only make
+            # noncontiguous inputs contiguous; do not zero/copy another buffer.
+            return self.reduce_scatter(tensor.contiguous(), group)
         padded = tensor.new_zeros(
             len(group) * max_tokens,
             tensor.shape[-1],
@@ -150,7 +159,7 @@ class HcclBackend(CommBackend):
         if len(group) == 1:
             output.copy_(padded)
         else:
-            dist.reduce_scatter_single(
+            dist.reduce_scatter_tensor(
                 output,
                 padded.contiguous(),
                 group=self._process_group(group),

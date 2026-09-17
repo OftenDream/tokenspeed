@@ -59,8 +59,9 @@ Runtime 只调用统一 kernel facade。`torch_npu` 和 NPU weight layout 只存
 
 ### 2.3 明确拒绝
 
-- 不复制参考实现中的私有 `custom::mlp_split_swiglu`；目标环境没有该注册，直接用公开
-  `torch_npu.npu_swiglu`；
+- BF16 expert 激活使用目标 Torch-NPU 已公开注册的
+  `torch_npu.mlp_split_swiglu`，按 `expert_counts` 只处理有效 route 前缀；不直接依赖
+  `custom::` namespace；
 - 不使用 `npu_moe_distribute_dispatch_v2/combine_v2`。目标为 `1536/EP8=192` experts/rank，超过
   A2 常规 MC2 每 rank 24 expert 的已知约束；
 - 不把四组 router 合成一次全局 TopK。模型语义要求每个 token 在每组独立选 12 条 route；

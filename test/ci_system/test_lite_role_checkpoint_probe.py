@@ -21,7 +21,7 @@
 import argparse
 import socket
 import sys
-from test.runtime.test_lite_model_loader import lite_config_dict, mapping
+from test.runtime.test_lite_model_loader import mapping
 
 import pytest
 import torch
@@ -72,7 +72,7 @@ def test_role_mapping_and_exact_static_parameter_bytes(role) -> None:
     assert ledger["host_oe_bytes"] == 0
     assert ledger["by_category"]["kda"]["bytes"] == 369_143_376
     assert ledger["by_category"]["mla"]["bytes"] == 634_023_936
-    assert ledger["by_category"]["oe_projection"]["bytes"] == 18_874_368
+    assert ledger["by_category"]["oe_projection"]["bytes"] == 2_359_296
     assert ledger["by_category"]["moe_experts"]["bytes"] == 12_683_575_296
     assert ledger["by_category"]["moe_experts"]["bytes"] + ledger["by_category"][
         "grouped_moe"
@@ -81,16 +81,20 @@ def test_role_mapping_and_exact_static_parameter_bytes(role) -> None:
 
 
 def test_tiny_host_oe_is_excluded_from_accelerator_parameter_total() -> None:
-    config = FLASHLocalConfig.from_dict(lite_config_dict())
+    config = _real_config()
     with torch.device("meta"):
-        model = FLASHLocalForCausalLM(config, mapping(), oe_table_placement="host")
-    model.model.ngram_embeddings.embedders[0].weight.data = torch.empty(
-        (13, 8), dtype=torch.bfloat16
+        model = FLASHLocalForCausalLM(
+            config,
+            mapping(8, role="prefill"),
+            oe_table_placement="host",
+        )
+    model.model.embed_tokens.oe_tables[0].data = torch.empty(
+        (13, 256), dtype=torch.bfloat16
     )
 
     ledger = parameter_ledger(model)
 
-    assert ledger["host_oe_bytes"] == 13 * 8 * 2
+    assert ledger["host_oe_bytes"] == 13 * 256 * 2
     assert ledger["by_category"]["host_oe"]["devices"] == ["cpu"]
 
 

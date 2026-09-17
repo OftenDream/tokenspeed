@@ -1,4 +1,4 @@
-# Lite NPU MLA Decode prolog
+# Lite NPU MLA prolog
 
 ## Fusion and package boundary
 
@@ -28,12 +28,12 @@ KR-cache argument receives a small placeholder, never another managed cache.
 
 ## Runtime ownership and fallback
 
-The model retains only orchestration: pure-Decode eligibility, communication
+The model retains only orchestration: absorbed-query eligibility, communication
 ordering, existing cache storage and backend-owned write locations. This follows
 the existing model-side MLA prewrite boundary exposed by
 `AttentionBackend.write_locations`; it does not introduce a cache manager.
-The adapter owns hardware-specific constraints: BF16, hidden/heads 3072/32 or
-4096/64, ranks 1536/512, head dimensions 128/64, NZ projection weights, and
+The adapter owns hardware-specific constraints: BF16, hidden width 3072 or 4096, local head counts 4/8/16/32/64,
+ranks 1536/512, head dimensions 128/64, NZ projection weights, and
 contiguous packed cache `[pages, page_size, 1, 576]`.
 
 Backend-owned write locations may be int32 or int64. The V3 operator requires
@@ -43,18 +43,26 @@ replay uses the refreshed locations. Its cost is included in performance tests.
 
 Replicated MLA weights may run with attention TP8. A prolog that writes cache
 cannot bypass a required pre-attention token AllGather, so that case preserves
-the primitive projection/communication path. Prefill, mixed/speculative/empty
-batches, unsupported inputs and an absent or incompatible package also fall
-back. Admission returns `None` before any cache write; execution errors from
-an eligible op propagate rather than retrying after a possible mutation.
+the primitive projection/communication path. Pure Prefill batches are eligible
+only when the backend already selects `use_absorbed_cached_extend`. The first
+chunk keeps explicit Q/K/V Prefill: V3's absorbed query is not a substitute for
+that algorithm. Query rows, live token count, metadata lengths and the backend's
+EXTEND write span must agree; mixed/speculative/empty batches, padded query
+rows, unsupported inputs and an absent or incompatible package fall back.
+Admission returns `None` before any cache write; execution errors from an
+eligible op propagate rather than retrying after a possible mutation.
 
 ## Weight orientation and normalization fallback
 
 The prolog requires logical `[in, out]` NZ projection weights. Q-A/KV-A already
 use this orientation; Q-B changes from `[out, in]` to `[in, out]`. Both
 orientations are NZ; this is not a new Weight-NZ switch. Conversion happens
-once during weight loading under the existing Decode Weight-NZ configuration,
-not every forward.
+once during weight loading under `--npu-enable-weight-nz`, not every forward.
+Decode retains its existing weight selection. In a Prefill role the flag prepares
+only MLA Q-A, KV-A and Q-B, enabling the same prolog for cached continuation;
+KDA/output weights retain their existing preparation policy. The bounded PD
+launcher does not enable the Prefill flag automatically. The first chunk uses
+the transposed primitive fallback, with the same RMSNorm scales and NoPE tail.
 
 When the prolog is ineligible but Q-B was prepared transposed, the primitive
 path normalizes the Q/KV latents and calls the transposed linear projection.
@@ -72,8 +80,52 @@ package and hardware.
 
 NPU golden/replay tests cover both Lite geometries, including BS32 with the
 backend's int32 indices and updated cross-page write locations on replay.
-These tests require the installed Lite-capable device binary. End-to-end
+Prefill admission tests cover 4096-token chunks, explicit first chunks, mixed
+batches, required AllGather, storage offsets and unchanged backend indices.
+The Prefill output gate remains after attention/value projection even when a
+backend advertises projected-value Decode support. This does not physically
+fuse the NPU value BMM, sigmoid or multiplication.
+`test_lite_mla_prolog_sequence.py` runs an explicit first chunk and 15 cached
+4096-token continuations with the real CacheArena view. It checks the complete
+layer output and cache against the primitive path, non-monotonic read pages,
+backend write indices, unchanged history/unrelated rows and a neighboring
+MLA layer. This test requires the installed Lite-capable device binary.
+End-to-end
 performance comparisons must also verify prolog kernel hits in the profile;
 successful fallback execution alone is not evidence that fusion was enabled.
 
 This extends the primitive baseline in `lite-npu-phase-05-mla.md`.
+
+## Head tensor parallelism
+
+Separate MLA projections follow `mapping.mla_weight`: Q-A and KV-A remain
+replicated; Q-B, KV-B and the output gate load contiguous local head rows.
+The output projection loads the matching input columns. Slicing precedes NZ
+preparation, and absorbed W-KC/W-VC are derived from the loaded local KV-B.
+Input-column shards compute their local output projection in FP32 so local
+dot products are not rounded to BF16 before the collective. The decoder layer
+reduces this partial output exactly once in the MLA weight group with FP32
+accumulation, then casts back to the residual dtype before
+residual addition and post-attention RMSNorm. TP1 performs no
+collective. Attention/cache execution and scheduling keep their existing
+contracts; shared latent KV is replicated, so neither its capacity nor minimum
+read volume is divided by the head TP size.
+
+The same explicit first-chunk and absorbed continuation paths consume local
+heads. The prolog output buffer uses local heads, and the existing optional
+prolog kernel admits these local head dimensions. Choosing different head TP
+for Prefill and Decode is a launcher configuration choice; the Decode setting
+is not inferred from Prefill. `test_lite_mla_head_tp.py` checks full checkpoint
+loaders, NZ, shared projections, gate, non-monotonic cache pages, cross-page
+appends, all sixteen 4096-token chunks, and the actual residual/norm reduction
+boundary against replicated TP1 on eight ranks.
+
+The reduced attention output, residual and normalized output retain the
+existing pointwise and relative-L2 gates against TP1. An independent CPU FP64
+RMSNorm formula at the reduced input provides an additional diagnostic;
+passing that check does not replace the cross-TP gate. The test collects all
+normalized-output discrepancies before failing. Near cancellation, a small
+BF16 attention difference can grow after normalization even when each norm
+implementation agrees with its independent reference. The current candidate
+still fails this gate and requires separate full-model logits and greedy
+output validation before it can be enabled.

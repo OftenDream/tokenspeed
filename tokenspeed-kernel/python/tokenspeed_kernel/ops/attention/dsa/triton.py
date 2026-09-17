@@ -22,6 +22,11 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
+from tokenspeed_kernel.ops.attention.dsa._triton.topk import (
+    combine_topk_weights,
+    local_topk_to_global_slots,
+    mark_forced_initial_local_logits,
+)
 from tokenspeed_kernel.platform import CapabilityRequirement
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature

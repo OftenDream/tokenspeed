@@ -163,6 +163,31 @@ class DeepEPCudaGraphRunnerAdapter:
         cls.clean_buffer()
 
 
+def replay_graph_then_update(
+    graph, update_input, previous_replay_event, replay_done_event
+) -> None:
+    """Replay a captured decode graph before re-issuing its NPUGraph task groups.
+
+    Every captured FIA task sits behind an ``ExternalEvent`` gate, so the Host
+    may refresh those tasks on the NPUGraph update stream after the replay has
+    been queued: the device keeps executing the layers ahead of each gate while
+    the Host recomputes tiling, instead of idling for the whole update. The gate
+    also keeps the first replay correct — the captured task cannot run before
+    its updated parameters have been recorded. ``update_input`` is ``None`` on
+    non-NPU devices, where only the replay applies.
+    """
+    with nvtx_range("graph_replay", color="red"):
+        graph.replay()
+    if update_input is not None:
+        if previous_replay_event is not None:
+            # A host snapshot lets us queue the next replay while the previous
+            # one still consumes these same task groups. Patch them only after
+            # that replay has finished; the host need not synchronize.
+            graph.graph_dispatch_mode.update_stream.wait_event(previous_replay_event)
+        graph.update(cpu_update_input=update_input)
+        replay_done_event.record()
+
+
 class ForwardStepRunner:
     """Owns one forward step end to end: metadata prep, then execution.
 
@@ -286,6 +311,7 @@ class ForwardStepRunner:
         }
 
         self.graphs: dict[tuple[str, int], object] = {}
+        self._replay_done_events: dict[tuple[str, int], object] = {}
         self.output_buffers: dict[tuple[str, int], tuple] = {}
         # TOKENSPEED_GRAPH_DEBUG=1: capture-time tensor-identity snapshots,
         # re-verified before every replay (graph_ptr_guard). Off by default —
@@ -923,6 +949,7 @@ class ForwardStepRunner:
         extend_prefix_lens_cpu: torch.Tensor,
         extend_seq_lens: torch.Tensor,
         extend_seq_lens_cpu: torch.Tensor,
+        seq_lens_cpu: tuple[int, ...] | None,
         positions: torch.Tensor | None = None,
         block_tables: dict | None = None,
         block_tables_cpu: dict | None = None,
@@ -1032,14 +1059,29 @@ class ForwardStepRunner:
             graph = self.graphs[graph_key]
             if self._graph_debug:
                 self._verify_graph_metadata(graph_key)
+            update_input = None
+            previous_replay_event = None
+            replay_done_event = None
             if self.device == "npu":
-                graph.update(
-                    cpu_update_input=[
-                        {"actual_seq_lengths_kv": seq_lens.to("cpu").tolist()}
-                    ]
-                )
-            with nvtx_range("graph_replay", color="red"):
-                graph.replay()
+                # Issued-length snapshots are independent of the overlap
+                # queue's delayed commits. Unknown / variable acceptance keeps
+                # the device readback, before replay to avoid waiting on it.
+                if seq_lens_cpu is None:
+                    host_lengths = seq_lens.to("cpu").tolist()
+                else:
+                    if len(seq_lens_cpu) != bs:
+                        raise ValueError(
+                            "host attention lengths must match the live batch"
+                        )
+                    host_lengths = list(seq_lens_cpu) + [1] * (padded_bs - bs)
+                update_input = [{"actual_seq_lengths_kv": host_lengths}]
+                previous_replay_event = self._replay_done_events.get(graph_key)
+                replay_done_event = self.device_module.Event()
+            replay_graph_then_update(
+                graph, update_input, previous_replay_event, replay_done_event
+            )
+            if replay_done_event is not None:
+                self._replay_done_events[graph_key] = replay_done_event
 
             (
                 output_tokens,

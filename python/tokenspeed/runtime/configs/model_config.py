@@ -361,6 +361,11 @@ def configure_mla_attention(model_config) -> None:
         if hasattr(model_config.hf_text_config, "kv_lora_rank")
         else model_config.hf_config
     )
+    if getattr(mla_config, "uses_independent_dsa_selection", False):
+        _configure_dsa_geometry(model_config)
+        model_config.index_init_tokens = mla_config.index_init_tokens
+        model_config.index_local_tokens = mla_config.index_local_tokens
+        return
     model_config.head_dim = 256
     model_config.attention_arch = AttentionArch.MLA
     model_config.kv_lora_rank = mla_config.kv_lora_rank

@@ -281,6 +281,13 @@ to the kernel page tables that attention kernels consume (the
 happen at **one designated point**; beyond that point, kernels see physical
 page tables and nothing upstream sees them at all.
 
+The scheduler-table bridge packs all groups into one fresh pinned CPU buffer
+on CUDA and NPU, then issues one nonblocking device copy on the caller's
+stream. Fresh staging preserves each queued forward's DMA source until the
+backend's caching host allocator retires the copy; a reused writable buffer
+would require its own completion fence. Pinning does not move the copy to
+another stream or permit consumers to overwrite an earlier graph's buffers.
+
 Outside the mapping point, Python code should perceive `prefix_granularity`
 and `page_size` as little as possible. If a Python component needs either
 value, that is a design smell to justify, not a default to reach for.

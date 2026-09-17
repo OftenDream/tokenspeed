@@ -29,9 +29,6 @@ from typing import Literal
 
 from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.base import CacheRecipe
-from tokenspeed.runtime.layers.attention.kv_cache.recipes.checkpointed_tail_oe import (
-    CheckpointedTailOERecipe,
-)
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.deepseek_v4 import (
     DeepseekV4Recipe,
 )
@@ -195,12 +192,6 @@ def prepare_cache_setup(
     recipe = _RECIPES.get(family)
     if recipe is None:
         raise ValueError(f"unsupported cache model family: {family}")
-    if (
-        family == "kimi_k3"
-        and getattr(model_config, "oe_state_provider", None)
-        == "cache-checkpointed-tail"
-    ):
-        recipe = CheckpointedTailOERecipe
     return recipe(
         server_args=server_args,
         model_config=model_config,

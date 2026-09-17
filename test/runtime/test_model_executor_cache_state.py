@@ -25,11 +25,13 @@ import pytest
 import torch
 
 from tokenspeed.runtime.execution.model_executor import ModelExecutor
+from tokenspeed.runtime.execution.queued_cache_lengths import QueuedCacheLengths
 
 
 class _RuntimeStates:
     def __init__(self):
         self.valid_cache_lengths = torch.arange(20, dtype=torch.int32)
+        self.queued_cache_lengths = QueuedCacheLengths()
 
     def reset_states(self, req_pool_indices, prefix_lens):
         self.valid_cache_lengths[req_pool_indices] = prefix_lens
@@ -49,6 +51,7 @@ def test_mixed_batch_resets_only_prefill_lengths(monkeypatch):
     executor.runtime_states = _RuntimeStates()
 
     forward_op = SimpleNamespace(
+        request_ids=["p", "a", "b"],
         request_pool_indices=[2, 3, 4],
         extend_prefix_lens=[10],
         num_extends=lambda: 1,
@@ -68,6 +71,9 @@ def test_mixed_batch_resets_only_prefill_lengths(monkeypatch):
     assert executor.runtime_states.valid_cache_lengths[2].item() == 10
     assert executor.runtime_states.valid_cache_lengths[3].item() == 3
     assert executor.runtime_states.valid_cache_lengths[4].item() == 4
+    assert executor.runtime_states.queued_cache_lengths.advance(
+        ("p",), (2,), (1,), 0, True
+    ) == (11,)
 
 
 def test_remote_prefill_seeds_the_complete_prompt_length(monkeypatch):
@@ -82,6 +88,7 @@ def test_remote_prefill_seeds_the_complete_prompt_length(monkeypatch):
     executor.runtime_states = _RuntimeStates()
 
     forward_op = SimpleNamespace(
+        request_ids=["p", "q", "r"],
         request_pool_indices=[7, 11, 13],
         prefill_lengths=[15, 17, 19],
         extend_prefix_lens=[0, 0],
@@ -103,111 +110,9 @@ def test_remote_prefill_seeds_the_complete_prompt_length(monkeypatch):
     assert executor.runtime_states.valid_cache_lengths[11].item() == 17
     # Only the extend rows are seeded; the third row is not part of this op.
     assert executor.runtime_states.valid_cache_lengths[13].item() == 13
-
-
-def test_external_graph_staging_uses_effective_capture_width(monkeypatch):
-    import tokenspeed.runtime.execution.model_executor as executor_module
-
-    class _ReachedExternalPreparer(Exception):
-        pass
-
-    class _DeviceModule:
-        @staticmethod
-        def current_stream():
-            return _ExecutionStream()
-
-        @staticmethod
-        def stream(_stream):
-            return nullcontext()
-
-    class _ForwardStep:
-        max_tokens_per_req = 1
-
-        @staticmethod
-        def can_run(_bs, _ctx):
-            return True
-
-        @staticmethod
-        def padded_bs(_bs, _ctx):
-            return 1
-
-        def __call__(self, **_kwargs):
-            raise AssertionError("external inputs must be prepared first")
-
-    observed = []
-
-    def prepare_external_inputs(_forward_op, *, resolved_input_ids, graph_tokens):
-        observed.append((resolved_input_ids.tolist(), graph_tokens))
-        raise _ReachedExternalPreparer
-
-    cache_metadata = SimpleNamespace(tables=lambda **_kwargs: ())
-    monkeypatch.setattr(
-        executor_module.CacheBatchMetadata,
-        "from_forward_op",
-        staticmethod(lambda *_args, **_kwargs: cache_metadata),
-    )
-    monkeypatch.setattr(executor_module, "setup_grammar_step", lambda **_kwargs: None)
-    monkeypatch.setattr(executor_module, "LOG_MM_TIMING", False)
-
-    executor = ModelExecutor.__new__(ModelExecutor)
-    executor._reset_valid_cache_length = lambda _op: None
-    executor.log_step = 0
-    executor.device = "cpu"
-    executor.device_module = _DeviceModule()
-    executor.execution_stream = _ExecutionStream()
-    executor.nan_guard = SimpleNamespace(reset=lambda _bs: None)
-    executor._cache_runtime_contract = object()
-    executor._full_history_group_id = None
-    executor.draft_page_table = torch.zeros((1, 1), dtype=torch.int64)
-    executor._publish_draft_page_table = lambda *_args: None
-    executor.input_buffers = SimpleNamespace(
-        fill_input_buffers=lambda **_kwargs: None,
-        input_ids_buf=torch.tensor([7], dtype=torch.int32),
-        input_lengths_buf=torch.tensor([1], dtype=torch.int32),
-        extend_prefix_lens_buf=torch.empty(0, dtype=torch.int32),
-        extend_prefix_lens_cpu=torch.empty(0, dtype=torch.int32),
-        extend_seq_lens_buf=torch.empty(0, dtype=torch.int32),
-        extend_seq_lens_cpu=torch.empty(0, dtype=torch.int32),
-    )
-    executor.runtime_states = SimpleNamespace()
-    executor.drafter = None
-    executor.mm_runtime = SimpleNamespace(
-        build_positions_override=lambda **_kwargs: None
-    )
-    # The CLI keeps its default draft width even when no speculative
-    # algorithm is active. It must not override the graph runner's width.
-    executor.config = SimpleNamespace(
-        data_parallel_size=1,
-        spec_num_tokens=4,
-        output_length=1,
-        grammar_backend="none",
-    )
-    executor.attn_backend = None
-    executor.token_to_kv_pool = None
-    executor._build_sampling_info = lambda *_args: object()
-    executor.grammar_runtime = None
-    executor.sampling_backend = SimpleNamespace(prepare_step=lambda **_kwargs: None)
-    executor._log_dp_sampling_route = lambda *_args: None
-    executor.forward_step = _ForwardStep()
-    executor.model_runner = SimpleNamespace(
-        model=SimpleNamespace(prepare_external_inputs=prepare_external_inputs)
-    )
-    forward_op = SimpleNamespace(
-        request_ids=["r0"],
-        request_pool_indices=[0],
-        input_lengths=[1],
-        extend_prefix_lens=[],
-        num_extends=lambda: 0,
-    )
-
-    try:
-        executor.execute_forward_op(forward_op, sampling_params_list=[])
-    except _ReachedExternalPreparer:
-        pass
-    else:
-        raise AssertionError("external input preparer was not called")
-
-    assert observed == [([7], 1)]
+    assert executor.runtime_states.queued_cache_lengths.advance(
+        ("q", "p"), (11, 7), (1, 1), 0, True
+    ) == (18, 16)
 
 
 def test_draft_final_step_follows_the_complete_drafter_run():

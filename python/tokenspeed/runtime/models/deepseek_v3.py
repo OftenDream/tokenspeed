@@ -101,6 +101,9 @@ from tokenspeed.runtime.layers.moe.topk import TopK
 from tokenspeed.runtime.layers.moe.utils import RoutingMethodType
 from tokenspeed.runtime.layers.paged_attention import PagedAttention
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
+from tokenspeed.runtime.layers.quantization.compressed_tensors.schemes.compressed_tensors_w8a8_int8 import (
+    CompressedTensorsW8A8Int8,
+)
 from tokenspeed.runtime.layers.quantization.nvfp4 import Nvfp4Config
 from tokenspeed.runtime.layers.quantization.utils import (
     block_dequant,
@@ -166,6 +169,7 @@ class DeepseekV3MLP(nn.Module):
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
         is_shared_expert: bool = False,
+        params_dtype: torch.dtype | None = None,
     ) -> None:
         super().__init__()
         self.mapping = mapping
@@ -187,6 +191,7 @@ class DeepseekV3MLP(nn.Module):
             tp_group=tp_group,
             quant_config=quant_config,
             prefix=add_prefix("gate_up_proj", prefix),
+            params_dtype=params_dtype,
         )
         self.down_proj = RowParallelLinear(
             intermediate_size,
@@ -198,12 +203,18 @@ class DeepseekV3MLP(nn.Module):
             tp_group=tp_group,
             quant_config=quant_config,
             prefix=add_prefix("down_proj", prefix),
+            params_dtype=params_dtype,
         )
         if hidden_act != "silu":
             raise ValueError(
                 f"Unsupported activation: {hidden_act}. Only silu is supported for now."
             )
         self.act_fn = SiluAndMul()
+        self._use_int8_swiglu = all(
+            isinstance(getattr(proj, "scheme", None), CompressedTensorsW8A8Int8)
+            for proj in (self.gate_up_proj, self.down_proj)
+        )
+        self.gate_up_proj.defer_dequant = self._use_int8_swiglu
         self._use_nvfp4_gemm_swiglu_nvfp4_quant = (
             envs.TOKENSPEED_NVFP4_GEMM_SWIGLU_NVFP4_QUANT.get()
             and _is_blackwell
@@ -235,7 +246,16 @@ class DeepseekV3MLP(nn.Module):
             return x
 
         gate_up, _ = self.gate_up_proj(x)
-        x = self.act_fn(gate_up)
+        if self._use_int8_swiglu:
+            accumulators, token_scales = gate_up
+            x = self.act_fn(
+                accumulators,
+                int8_out=True,
+                weight_scale=self.gate_up_proj._int8_plan.weight_scale,
+                activation_scale=token_scales,
+            )
+        else:
+            x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
         return x
 

@@ -470,18 +470,11 @@ class ModelExecutor:
         self._active_multimodal_context = None
         self._active_positions_override = None
 
-        initialize_external_inputs = getattr(
-            self.model_runner.model, "initialize_external_inputs", None
+        initialize_host_runtime = getattr(
+            self.model_runner.model, "initialize_host_runtime", None
         )
-        if initialize_external_inputs is not None:
-            initialize_external_inputs(
-                token_to_kv_pool=token_to_kv_pool,
-                max_request_slots=config.max_req_pool_size,
-                max_graph_tokens=max(
-                    1, config.max_cudagraph_capture_size * spec_num_tokens
-                ),
-                device=self.device,
-            )
+        if initialize_host_runtime is not None:
+            initialize_host_runtime()
 
         self.forward_step = ForwardStepRunner(
             forward_func=self._forward_step,
@@ -1127,6 +1120,7 @@ class ModelExecutor:
                     extend_prefix_lens_cpu=ib.extend_prefix_lens_cpu[:0],
                     extend_seq_lens=ib.extend_seq_lens_buf[:0],
                     extend_seq_lens_cpu=ib.extend_seq_lens_cpu[:0],
+                    seq_lens_cpu=None,
                 )
             return
 
@@ -1270,6 +1264,7 @@ class ModelExecutor:
         if num_extends == 0:
             return
         self._write_valid_cache_lengths(
+            forward_op.request_ids[:num_extends],
             forward_op.request_pool_indices[:num_extends],
             forward_op.extend_prefix_lens,
         )
@@ -1288,12 +1283,17 @@ class ModelExecutor:
         if num_extends <= 0:
             return
         self._write_valid_cache_lengths(
+            forward_op.request_ids[:num_extends],
             forward_op.request_pool_indices[:num_extends],
             forward_op.prefill_lengths[:num_extends],
         )
 
-    def _write_valid_cache_lengths(self, pool_indices, lengths) -> None:
+    def _write_valid_cache_lengths(self, request_ids, pool_indices, lengths) -> None:
         """Publish per-row valid cache lengths on the execution stream."""
+        if self.runtime_states.queued_cache_lengths is not None:
+            self.runtime_states.queued_cache_lengths.reset(
+                request_ids, pool_indices, lengths
+            )
         self.execution_stream.wait_stream(self.default_stream)
         with self.device_module.stream(self.execution_stream):
             rows = torch.tensor(
@@ -1323,6 +1323,15 @@ class ModelExecutor:
         request_history_seeds=None,
     ) -> ModelExecutionResult:
         self._reset_valid_cache_length(forward_op)
+        host_seq_lens = None
+        if self.runtime_states.queued_cache_lengths is not None:
+            host_seq_lens = self.runtime_states.queued_cache_lengths.advance(
+                forward_op.request_ids,
+                forward_op.request_pool_indices,
+                forward_op.input_lengths,
+                forward_op.num_extends(),
+                self.drafter is None and self.config.output_length == 1,
+            )
         self.log_step += 1
         num_extends = forward_op.num_extends()
         total_tokens = sum(forward_op.input_lengths)
@@ -1517,28 +1526,12 @@ class ModelExecutor:
                             else bs
                         )
                         forward_step_start = time.perf_counter()
-                    prepare_external_inputs = getattr(
-                        self.model_runner.model, "prepare_external_inputs", None
-                    )
-                    if prepare_external_inputs is not None:
-                        use_graph = self.forward_step.can_run(bs, ctx)
-                        prepare_external_inputs(
-                            forward_op,
-                            resolved_input_ids=self.input_buffers.input_ids_buf[
-                                :total_tokens
-                            ],
-                            graph_tokens=(
-                                self.forward_step.padded_bs(bs, ctx)
-                                * self.forward_step.max_tokens_per_req
-                                if use_graph
-                                else None
-                            ),
-                        )
                     output_tokens, output_lengths, output_logprobs = self.forward_step(
                         bs=bs,
                         ctx=ctx,
                         sampling_info=sampling_info,
                         extend_with_prefix=extend_with_prefix,
+                        seq_lens_cpu=host_seq_lens,
                         extend_prefix_lens=self.input_buffers.extend_prefix_lens_buf[
                             :num_extends
                         ],

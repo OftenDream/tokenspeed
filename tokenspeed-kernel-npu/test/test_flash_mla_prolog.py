@@ -32,9 +32,10 @@ from tokenspeed_kernel_npu.ops import mla_prolog as adapter
 
 @pytest.fixture(autouse=True)
 def clear_loader_cache():
-    adapter._flash_mla_prolog.cache_clear()
+    loader = adapter._flash_mla_prolog
+    loader.cache_clear()
     yield
-    adapter._flash_mla_prolog.cache_clear()
+    loader.cache_clear()
 
 
 @pytest.mark.parametrize(
@@ -195,6 +196,19 @@ def test_exact_packaged_nope_call(inputs, monkeypatch):
     assert keywords["weight_quant_mode"] == keywords["kv_cache_quant_mode"] == 0
 
 
+def test_query_norm_can_be_returned_for_indexer_reuse(inputs, monkeypatch):
+    op = Mock(return_value=("q", "q_aux", None, "q_norm", None))
+    monkeypatch.setattr(adapter, "_flash_mla_prolog", lambda: op)
+    result = adapter.mla_prolog(
+        *inputs,
+        rmsnorm_epsilon_cq=1e-5,
+        rmsnorm_epsilon_ckv=2e-5,
+        return_query_norm=True,
+    )
+    assert result == ("q", "q_aux", "q_norm")
+    assert op.call_args.kwargs["query_norm_flag"] is True
+
+
 def test_large_lite_metadata_admission(inputs):
     inputs[0].shape = (2, 4096)
     inputs[1].shape = (4096, 1536)
@@ -229,3 +243,10 @@ def test_operator_errors_are_not_retried(inputs, monkeypatch):
     with pytest.raises(RuntimeError, match="operator failure"):
         adapter.mla_prolog(*inputs, rmsnorm_epsilon_cq=1e-5, rmsnorm_epsilon_ckv=1e-5)
     op.assert_called_once()
+
+
+@pytest.mark.parametrize("heads", [4, 8, 16, 32, 64])
+def test_local_head_prolog_admission(inputs, heads):
+    inputs[2].shape = (1536, heads * 192)
+    inputs[3].shape = (heads, 128, 512)
+    assert adapter._supports_mla_prolog(*inputs)

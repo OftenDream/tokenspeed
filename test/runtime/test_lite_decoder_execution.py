@@ -30,9 +30,7 @@ from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.models.flash_kda import (
     FLASHLocalDecoderLayer,
     FLASHLocalForCausalLM,
-    FLASHLocalModel,
 )
-from tokenspeed.runtime.models.flash_local_moe import PackedRMSNorm
 
 
 class _Mode:
@@ -130,7 +128,7 @@ def test_decoder_matches_double_residual_oracle() -> None:
     assert layer.moe.ctx.forward_mode.is_decode()
 
 
-def test_packed_moe_owns_its_output_collective(monkeypatch) -> None:
+def test_group_aware_moe_owns_its_output_collective(monkeypatch) -> None:
     config = FLASHLocalConfig.from_dict(lite_config_dict())
     layer = FLASHLocalDecoderLayer(config, 0, Mapping(rank=0))
     hidden = torch.zeros(2, 96, dtype=torch.bfloat16)
@@ -141,7 +139,7 @@ def test_packed_moe_owns_its_output_collective(monkeypatch) -> None:
         layer.moe_comm,
         "post_mlp_fused",
         lambda *_args, **_kwargs: pytest.fail(
-            "packed Grouped MoE must not be reduced a second time"
+            "group-aware MoE must not be reduced a second time"
         ),
     )
 
@@ -151,22 +149,23 @@ def test_packed_moe_owns_its_output_collective(monkeypatch) -> None:
     assert residual_out is residual
 
 
-def test_lite_norm_preserves_fused_residual_semantics_on_cpu() -> None:
-    norm = PackedRMSNorm(4)
-    norm.weight.data.fill_(1)
-    value = torch.tensor([[1.5, -2.0, 3.0, -4.5]], dtype=torch.bfloat16)
-    residual = torch.tensor([[2.0, 1.0, -1.5, 0.5]], dtype=torch.bfloat16)
-    summed = value.float() + residual.float()
-    expected_residual = summed.to(torch.bfloat16)
-    expected = (summed * torch.rsqrt(summed.square().mean(-1, keepdim=True) + 1e-6)).to(
-        torch.bfloat16
+def test_group_aware_moe_owns_its_input_collective(monkeypatch) -> None:
+    config = FLASHLocalConfig.from_dict(lite_config_dict())
+    layer = FLASHLocalDecoderLayer(config, 0, Mapping(rank=0))
+    hidden = torch.zeros(2, 96, dtype=torch.bfloat16)
+    expected = torch.full_like(hidden, 3)
+    monkeypatch.setattr(layer.moe, "forward", lambda *_args, **_kwargs: expected)
+    monkeypatch.setattr(
+        layer.moe_comm,
+        "pre_mlp_comm",
+        lambda *_args, **_kwargs: pytest.fail(
+            "group-aware MoE must receive each DP rank's distinct tokens"
+        ),
     )
 
-    output, residual_out = norm(value, residual)
+    output = layer._forward_moe(hidden, _ctx(), 16, 2)
 
-    assert residual_out is residual
-    assert torch.equal(residual, expected_residual)
-    assert torch.equal(output, expected)
+    assert output is expected
 
 
 def test_kda_uses_linear_attention_mapping() -> None:
@@ -222,33 +221,11 @@ def test_idle_layer_keeps_graph_shape_without_attention() -> None:
     assert residual is hidden
 
 
-def test_model_merges_prepared_oe_before_layers() -> None:
-    config = FLASHLocalConfig.from_dict(lite_config_dict())
-    model = FLASHLocalModel(config, mapping(), oe_table_placement="host")
-    model.layers = nn.ModuleList()
-    model.norm = nn.Identity()
-    model.embed_tokens.weight.zero_()
-    model.embed_tokens.weight[2].fill_(2)
-    model.embed_tokens.weight[60].fill_(13**0.5)
-    model.ngram_embeddings.projection.zero_()
-    raw = torch.zeros(2, 12, 8, dtype=torch.bfloat16)
-    model.ngram_embeddings._runtime = SimpleNamespace(
-        prepared_raw_oe=lambda num_tokens: raw[:num_tokens]
-    )
-
-    output, auxiliary = model(
-        torch.tensor([2, 60]), torch.arange(2), _ctx(), torch.arange(2)
-    )
-
-    assert auxiliary is None
-    assert torch.equal(output[0], torch.full((96,), 2, dtype=torch.bfloat16))
-    assert torch.allclose(output[1].float(), torch.ones(96), atol=0.02, rtol=0)
-
-
 def test_causal_wrapper_uses_dense_head_and_shared_logits_processor(
     monkeypatch,
 ) -> None:
     config = FLASHLocalConfig.from_dict(lite_config_dict())
+    config.use_over_embedding = False
     model = FLASHLocalForCausalLM(config, Mapping(rank=0), oe_table_placement="host")
     hidden = torch.arange(192, dtype=torch.bfloat16).view(2, 96)
 
@@ -356,46 +333,3 @@ def test_decoder_residual_path_on_npu() -> None:
     assert output.shape == hidden.shape
     assert torch.equal(hidden.cpu(), residual)
     assert torch.allclose(output.cpu().float(), expected.float(), atol=0.02, rtol=0.02)
-
-
-@pytest.mark.skipif(not _npu_available(), reason="requires an Ascend NPU")
-def test_oe_embedding_and_logits_on_npu() -> None:
-    config = FLASHLocalConfig.from_dict(lite_config_dict())
-    model = FLASHLocalForCausalLM(config, Mapping(rank=0), oe_table_placement="host")
-    model.model.layers = nn.ModuleList()
-    model = model.to("npu:0")
-    with torch.no_grad():
-        model.model.embed_tokens.weight.zero_()
-        model.model.embed_tokens.weight[2].fill_(2)
-        model.model.embed_tokens.weight[60].fill_(13**0.5)
-        model.model.ngram_embeddings.projection.zero_()
-        model.model.norm.weight.fill_(1)
-        model.lm_head.weight.fill_(0.01)
-    raw = torch.zeros(2, 12, 8, dtype=torch.bfloat16, device="npu:0")
-    model.model.ngram_embeddings._runtime = SimpleNamespace(
-        prepared_raw_oe=lambda num_tokens: raw[:num_tokens]
-    )
-    input_ids = torch.tensor([2, 60], device="npu:0")
-
-    output = model(
-        _ctx(),
-        input_ids,
-        torch.arange(2, device="npu:0"),
-        torch.arange(2, device="npu:0"),
-    )
-    word = torch.stack(
-        (
-            torch.full((96,), 2, dtype=torch.bfloat16),
-            torch.full((96,), 13**0.5, dtype=torch.bfloat16) / (13**0.5),
-        )
-    )
-    expected = word @ torch.full((96, 120), 0.01, dtype=torch.bfloat16)
-
-    assert output.next_token_logits.shape == (2, 120)
-    assert torch.isfinite(output.next_token_logits).all().item()
-    assert torch.allclose(
-        output.next_token_logits.cpu().float(),
-        expected.float(),
-        atol=0.02,
-        rtol=0.02,
-    )

@@ -58,6 +58,11 @@ def resolve_mla_kv_cache_dtype(
 
 @dataclass(kw_only=True)
 class MLAConfig(SoftmaxAttnConfig):
+    # Sparse-attention capabilities live on the common MLA contract rather
+    # than being inferred from a concrete config class. Standard DSA and
+    # LongCat DSA deliberately use different index-cache layouts.
+    uses_separate_bf16_index_cache: bool = False
+
     kv_lora_rank: int
     qk_nope_head_dim: int
     qk_rope_head_dim: int

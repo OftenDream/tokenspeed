@@ -70,7 +70,7 @@ def _supports_mla_prolog(
     if tokens == 0 or weight_uk.ndim != 3:
         return False
     heads = weight_uk.shape[0]
-    if (hidden, heads) not in ((3072, 32), (4096, 64)):
+    if hidden not in (3072, 4096) or heads not in (4, 8, 16, 32, 64):
         return False
     expected = (
         (token_x, (tokens, hidden)),
@@ -125,7 +125,8 @@ def mla_prolog(
     *,
     rmsnorm_epsilon_cq: float,
     rmsnorm_epsilon_ckv: float,
-) -> tuple[torch.Tensor, torch.Tensor] | None:
+    return_query_norm: bool = False,
+) -> tuple[torch.Tensor, ...] | None:
     """Fuse Lite projections/norm/absorption and write the existing packed cache.
 
     Projection weights use logical [in, out] NZ layout; weight_uk is
@@ -181,7 +182,7 @@ def mla_prolog(
         rmsnorm_epsilon_cq=rmsnorm_epsilon_cq,
         rmsnorm_epsilon_ckv=rmsnorm_epsilon_ckv,
         cache_mode="PA_BSND",
-        query_norm_flag=False,
+        query_norm_flag=return_query_norm,
         weight_quant_mode=0,
         kv_cache_quant_mode=0,
         query_quant_mode=0,
@@ -192,4 +193,6 @@ def mla_prolog(
         kc_scale=1.0,
         enable_rope=False,
     )
+    if return_query_norm:
+        return outputs[0], outputs[1], outputs[3]
     return outputs[0], outputs[1]
