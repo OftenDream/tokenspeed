@@ -21,6 +21,9 @@
 import pytest
 import torch
 from tokenspeed_kernel.ops.attention.dsa import dsa_decode, dsa_prefill
+from tokenspeed_kernel.platform import current_platform
+
+platform = current_platform()
 
 
 def _pack_sparse_kv(
@@ -45,13 +48,15 @@ def _pack_sparse_kv(
     return sparse, latent_fp8.float() * scale
 
 
+@pytest.mark.skipif(
+    not (platform.is_nvidia and platform.is_hopper_plus),
+    reason="The flashmla DSA solution registers on Hopper+ NVIDIA GPUs only",
+)
 @pytest.mark.parametrize("phase,q_len", [("prefill", 1), ("decode", 1), ("decode", 3)])
 @pytest.mark.parametrize("degree", [1, 2, 4, 8])
 def test_flashmla_dsa_dcp_partials(phase, q_len, degree):
     packed = phase == "decode"
     attention = dsa_decode if packed else dsa_prefill
-    if not torch.cuda.is_available():
-        pytest.skip("GPU required")
     torch.manual_seed(17)
     latent = torch.randn((256, 512), device="cuda", dtype=torch.bfloat16)
     rope = torch.randn((256, 64), device="cuda", dtype=torch.bfloat16)
