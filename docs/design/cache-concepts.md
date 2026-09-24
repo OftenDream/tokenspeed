@@ -1122,7 +1122,7 @@ prefill reconstructs bounded history chunks with an owner-masked sum reduction;
 GPU DSA sparse prefill instead combines local sparse-attention partials.
 The dense MLA implementation requires FlashMLA and its device/dtype support;
 DCP does not make unsupported kernels portable. These GPU paths currently
-exclude speculative decoding, PD transfer and KVStore.
+exclude speculative decoding and KVStore.
 
 Splitting or regrouping fields can change physical packing and parent plane
 sizes. Capacity planning therefore uses the resulting physical parent byte

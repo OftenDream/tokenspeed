@@ -683,8 +683,6 @@ class ServerArgs:
         )
 
         # Impl constraints:
-        if self.mapping.attn.has_dcp and self.disaggregation_mode != "null":
-            raise ValueError("DCP cache transfer does not yet support PD")
         if self.mapping.moe.has_tp and self.mapping.moe.has_ep:
             raise ValueError("MoE TP and EP cannot be both > 1")
 

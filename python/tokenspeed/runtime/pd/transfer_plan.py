@@ -54,6 +54,48 @@ class CacheTransferFragment:
     rows_per_page: int
 
 
+def local_transfer_pages(
+    source_blocks: tuple[int, ...],
+    destination_blocks: tuple[int, ...],
+    *,
+    group_id: str,
+    source_layout: CacheTransferContract,
+    destination_layout: CacheTransferContract,
+    source_tp_rank: int,
+    destination_tp_rank: int,
+) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    """Resolve paired logical positions to pages owned by this transfer edge.
+
+    Block IDs are independently allocated by P and D, not comparable between
+    peers. The input order pairs the same logical positions. Rank coordinates
+    are attention TP ranks, containing consecutive DCP replica subgroups.
+    Returns equally sized source/destination physical-page tuples; an edge
+    with no owned pairs returns empty tuples and still participates in ACKs.
+    """
+    source_degree = source_layout.shard_count(group_id)
+    destination_degree = destination_layout.shard_count(group_id)
+    source_bound = source_layout.virtual_block_count(group_id)
+    destination_bound = destination_layout.virtual_block_count(group_id)
+    source_pages, destination_pages = [], []
+    for source, destination in zip(source_blocks, destination_blocks, strict=True):
+        if not 0 < source < source_bound or not 0 < destination < destination_bound:
+            raise UnsupportedPDLayoutError(
+                "Cache transfer block is outside the virtual address space"
+            )
+        source_page, source_owner = divmod(source - 1, source_degree)
+        destination_page, destination_owner = divmod(
+            destination - 1, destination_degree
+        )
+        if (
+            source_owner != source_tp_rank % source_degree
+            or destination_owner != destination_tp_rank % destination_degree
+        ):
+            continue
+        source_pages.append(source_page + 1)
+        destination_pages.append(destination_page + 1)
+    return tuple(source_pages), tuple(destination_pages)
+
+
 MAX_CACHE_TP_SIZE = 1024
 
 
@@ -113,6 +155,32 @@ class CacheTransferPlanner:
             raise UnsupportedPDLayoutError(
                 f"Cache TP sizes cannot exceed {MAX_CACHE_TP_SIZE}"
             )
+        self._prefill_shards = {
+            spec.group_id: spec.shard_count for spec in prefill_layout.group_specs
+        }
+        self._decode_shards = {
+            spec.group_id: spec.shard_count for spec in decode_layout.group_specs
+        }
+        for layout, tp_size in (
+            (prefill_layout, prefill_tp_size),
+            (decode_layout, decode_tp_size),
+        ):
+            for spec in layout.group_specs:
+                if tp_size % spec.shard_count:
+                    raise UnsupportedPDLayoutError(
+                        "Cache shard count must divide attention TP size"
+                    )
+                if spec.shard_count > 1 and any(
+                    layout.transfer_schema.partition_for(field.field_id) is not None
+                    for field in layout.fields_for_group(spec.group_id)
+                ):
+                    raise UnsupportedPDLayoutError(
+                        "DCP transfer requires TP-replicated fields within sharded cache groups"
+                    )
+        self._has_sharded_cache = any(
+            count > 1
+            for count in (*self._prefill_shards.values(), *self._decode_shards.values())
+        )
         self.prefill_tp_size = prefill_tp_size
         self.decode_tp_size = decode_tp_size
         all_fields = frozenset(field.field_id for field in prefill_layout.plan.fields)
@@ -158,7 +226,11 @@ class CacheTransferPlanner:
             )
         # Equal-TP fast path: empty fragments mean "copy every field whole".
         # A stage owning only a subset must keep its explicit fragment route.
-        if self.prefill_tp_size == self.decode_tp_size and self._field_ids is None:
+        if (
+            self.prefill_tp_size == self.decode_tp_size
+            and self._field_ids is None
+            and not self._has_sharded_cache
+        ):
             return RankTransferPlan(
                 fragments_by_prefill_rank={decode_tp_rank: ()},
             )
@@ -209,7 +281,13 @@ class CacheTransferPlanner:
                     prefill_interval=None,
                     decode_interval=None,
                 )
-                fragments.setdefault(prefill_rank, []).append(fragment)
+                # Pick one replica subgroup, then contact every possible owner.
+                # Request-specific source/destination IDs determine which pages
+                # each edge actually moves, even when both DCP sizes are equal.
+                degree = self._prefill_shards[group_id]
+                base_rank = prefill_rank // degree * degree
+                for owner in range(base_rank, base_rank + degree):
+                    fragments.setdefault(owner, []).append(fragment)
                 continue
 
             decode_partitions = self._rank_partitions(
@@ -358,7 +436,7 @@ class CacheTransferPlanner:
         return (decode_tp_rank * prefill_tp_size) // decode_tp_size
 
     def _calc_source_decode_ranks(self) -> dict[int, frozenset[int]]:
-        if self.prefill_tp_size == self.decode_tp_size:
+        if self.prefill_tp_size == self.decode_tp_size and not self._has_sharded_cache:
             return {rank: frozenset({rank}) for rank in range(self.prefill_tp_size)}
         decode_ranks = {rank: set() for rank in range(self.prefill_tp_size)}
         for decode_tp_rank in range(self.decode_tp_size):
