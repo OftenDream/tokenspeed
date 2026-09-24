@@ -44,13 +44,9 @@ from tokenspeed.runtime.layers.attention.configs.dsa import DSAConfig
 from tokenspeed.runtime.layers.attention.configs.linear_attn import LinearAttnConfig
 from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
 from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
-from tokenspeed.runtime.layers.attention.configs.msa import (
-    MSAConfig,
-)
+from tokenspeed.runtime.layers.attention.configs.msa import MSAConfig
 from tokenspeed.runtime.layers.attention.kv_cache.arena import CacheArena
-from tokenspeed.runtime.layers.attention.kv_cache.base import (
-    CachePool,
-)
+from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
 from tokenspeed.runtime.layers.attention.kv_cache.factory import (
     create_cache_arena,
     create_cache_pool,
@@ -692,9 +688,7 @@ def _create_hybrid_linear_attn_backend(
     from tokenspeed.runtime.layers.attention.backends.hybrid.linear import (
         HybridLinearAttnBackend,
     )
-    from tokenspeed.runtime.layers.attention.backends.state.kda import (
-        KdaAttnBackend,
-    )
+    from tokenspeed.runtime.layers.attention.backends.state.kda import KdaAttnBackend
     from tokenspeed.runtime.layers.attention.backends.state.mamba import (
         MambaAttnBackend,
     )
@@ -1075,6 +1069,30 @@ def create_attn_components(
     target_full_attn_backend_name = _resolve_full_attn_backend_name(
         target, softmax_attn, hybrid_request=target.requested_backend
     )
+    if (
+        config.dcp_size > 1
+        and target.is_hybrid_linear
+        and not config.uses_replicated_dcp_cache
+    ):
+        expected_backend = "dsa" if softmax_attn.is_dsa else "flashmla"
+        if (
+            cache_family != "kimi_k3"
+            or target_full_attn_backend_name != expected_backend
+        ):
+            raise ValueError(
+                "Hybrid DCP requires the MLA/KDA cache and the matching FlashMLA/DSA backend"
+            )
+        resolved_softmax = dataclasses.replace(
+            softmax_attn, backend_name=target_full_attn_backend_name
+        )
+        config = dataclasses.replace(
+            config,
+            components=tuple(
+                resolved_softmax if component is softmax_attn else component
+                for component in config.components
+            ),
+        )
+        softmax_attn = resolved_softmax
     draft_attn_config = (
         _create_attn_config(server_args, draft_model_config, is_draft=True)
         if draft is not None and not draft.is_dspark

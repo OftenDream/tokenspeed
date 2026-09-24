@@ -1698,6 +1698,7 @@ class FLASHLocalForCausalLM(BaseCausalLM):
             else None
         )
         seen_sources: set[str] = set()
+        pending_dsa_fp8: dict[str, dict[str, torch.Tensor]] = {}
 
         for source_name, loaded_weight in weights:
             checkpoint_spec = None
@@ -1707,9 +1708,12 @@ class FLASHLocalForCausalLM(BaseCausalLM):
                         f"Duplicate Flash-Lite checkpoint weight {source_name!r}."
                     )
                 checkpoint_spec = self.checkpoint_layout.spec(source_name)
-                if (
-                    tuple(loaded_weight.shape) != checkpoint_spec.shape
-                    or loaded_weight.dtype != checkpoint_spec.dtype
+                if tuple(loaded_weight.shape) != checkpoint_spec.shape or (
+                    loaded_weight.dtype != checkpoint_spec.dtype
+                    and not (
+                        source_name.endswith(".indexer.weights_proj.weight")
+                        and loaded_weight.dtype == torch.float32
+                    )
                 ):
                     raise ValueError(
                         f"Flash-Lite checkpoint weight {source_name!r} has "
@@ -1718,6 +1722,36 @@ class FLASHLocalForCausalLM(BaseCausalLM):
                         f"{checkpoint_spec.shape}/{checkpoint_spec.dtype}."
                     )
                 seen_sources.add(source_name)
+
+            layer_id = _get_layer_id(source_name)
+            if (
+                checkpoint_spec is not None
+                and layer_id is not None
+                and ".self_attn." in source_name
+                and isinstance(
+                    self.model.layers[layer_id].self_attn, LongCatDSAAttention
+                )
+                and (
+                    loaded_weight.dtype == torch.float8_e4m3fn
+                    or source_name.endswith(".weight_scale_inv")
+                )
+            ):
+                from tokenspeed.runtime.layers.quantization.utils import block_dequant
+
+                weight_name = source_name.removesuffix("_scale_inv")
+                part = "scale" if source_name.endswith("_scale_inv") else "weight"
+                pair = pending_dsa_fp8.setdefault(weight_name, {})
+                pair[part] = loaded_weight
+                if len(pair) != 2:
+                    continue
+                loaded_weight = block_dequant(
+                    pair["weight"],
+                    pair["scale"],
+                    config.quantization_config["weight_block_size"],
+                ).to(torch.bfloat16)
+                del pending_dsa_fp8[weight_name]
+                source_name = weight_name
+                checkpoint_spec = self.checkpoint_layout.spec(weight_name)
 
             name = source_name
             name = _canonical_flash_kda_weight_name(name)
@@ -1983,6 +2017,10 @@ class FLASHLocalForCausalLM(BaseCausalLM):
                         f"{tuple(loaded_weight.shape)}"
                     ) from exc
 
+        if pending_dsa_fp8:
+            raise ValueError(
+                f"Incomplete Flash-Lite DSA FP8 weights: {sorted(pending_dsa_fp8)}"
+            )
         if expected_sources is not None:
             # The shard iterator may omit non-local OE-only files, or still
             # yield those weights from mixed shards. They are optional, not

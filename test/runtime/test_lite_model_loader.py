@@ -710,3 +710,119 @@ def test_strict_loader_allows_only_nonlocal_oe_sources_to_be_omitted(
         else:
             model.load_weights(checkpoint)
             post_load.assert_called_once_with()
+
+
+def test_lite_fp8_source_ledger_keeps_block_scales_and_ignored_weights():
+    config = FLASHLocalConfig.from_dict(
+        lite_config_dict(
+            quantization_config={
+                "quant_method": "fp8",
+                "weight_block_size": [16, 16],
+                "modules_to_not_convert": ["lm_head", "re:.*norm.*", "re:.*embed.*"],
+            }
+        )
+    )
+    layout = FLASHLocalCheckpointLayout(
+        config,
+        shared_quant_kind="unquant",
+        moe_quant_kind="fp8",
+        moe_smooth_quant=False,
+    )
+    names = set(layout.iter_source_names())
+    for name in (
+        "model.layers.0.mlp.experts.0.down_proj.weight",
+        "model.layers.0.mlp.shared_experts.gate_proj.weight",
+        "model.layers.0.self_attn.linear_core.q_proj.weight",
+        "model.layers.3.self_attn.kv_a_proj_with_mqa.weight",
+    ):
+        weight = layout.spec(name)
+        scale = layout.spec(name + "_scale_inv")
+        assert weight.dtype == torch.float8_e4m3fn
+        assert scale.dtype == torch.float32
+        assert scale.shape == tuple((n + 15) // 16 for n in weight.shape)
+        assert name + "_scale_inv" in names
+    assert layout.spec("lm_head.weight").dtype == torch.bfloat16
+    with pytest.raises(ValueError, match="Unexpected Lite checkpoint"):
+        layout.spec("lm_head.weight_scale_inv")
+    with pytest.raises(ValueError, match="Unexpected Lite"):
+        layout.spec("model.layers.0.mlp.experts.0.invalid.weight_scale_inv")
+
+
+@pytest.mark.parametrize("scale_first", [False, True])
+def test_lite_independent_dsa_loads_fp8_projection_with_its_scale(scale_first):
+    from tokenspeed.runtime.models.longcat_dsa import LongCatDSAAttention
+
+    config = FLASHLocalConfig.from_dict(
+        lite_config_dict(
+            quantization_config={
+                "quant_method": "fp8",
+                "weight_block_size": [16, 16],
+                "ignored_layers": ["re:.*weights_proj$"],
+            }
+        )
+    )
+    config.index_head_dim = 18
+    config.index_n_heads = 2
+    layout = FLASHLocalCheckpointLayout(
+        config,
+        shared_quant_kind="unquant",
+        moe_quant_kind="unquant",
+        moe_smooth_quant=False,
+    )
+    name = "model.layers.3.self_attn.indexer.wk.weight"
+    score_name = "model.layers.3.self_attn.indexer.weights_proj.weight"
+    q_name = "model.layers.3.self_attn.q_a_proj.weight"
+    kv_name = "model.layers.3.self_attn.kv_a_proj_with_mqa.weight"
+    sources = [
+        name,
+        name + "_scale_inv",
+        score_name,
+        q_name,
+        q_name + "_scale_inv",
+        kv_name,
+        kv_name + "_scale_inv",
+    ]
+    layout.iter_source_names = lambda: iter(sources)
+    attention = LongCatDSAAttention.__new__(LongCatDSAAttention)
+    torch.nn.Module.__init__(attention)
+    attention.fused_qkv_a_proj_with_mqa = torch.nn.Linear(
+        96, 24 + 12 + 2, bias=False, dtype=torch.bfloat16
+    )
+    attention.indexer = torch.nn.Module()
+    attention.indexer.wk = torch.nn.Linear(96, 18, bias=False, dtype=torch.bfloat16)
+    attention.indexer.weights_proj = torch.nn.Linear(
+        96, 2, bias=False, dtype=torch.float32
+    )
+    model = FLASHLocalForCausalLM.__new__(FLASHLocalForCausalLM)
+    torch.nn.Module.__init__(model)
+    model.config = config
+    model.mapping = SimpleNamespace(moe=SimpleNamespace(ep_rank=0, ep_size=1))
+    model.checkpoint_layout = layout
+    model.model = torch.nn.Module()
+    model.model.layers = torch.nn.ModuleList([torch.nn.Module() for _ in range(4)])
+    model.model.layers[3].self_attn = attention
+    model.post_load_weights = lambda: None
+    weight = torch.full((18, 96), 2.0).to(torch.float8_e4m3fn)
+    scales = torch.arange(1, 13, dtype=torch.float32).view(2, 6)
+    pair = [(name, weight), (name + "_scale_inv", scales)]
+    pair += [
+        (q_name, torch.full((24, 96), 2.0).to(torch.float8_e4m3fn)),
+        (q_name + "_scale_inv", torch.full((2, 6), 0.25)),
+        (kv_name, torch.full((14, 96), 3.0).to(torch.float8_e4m3fn)),
+        (kv_name + "_scale_inv", torch.full((1, 6), 0.25)),
+    ]
+    if scale_first:
+        pair.reverse()
+    scores = torch.full((2, 96), 1.001, dtype=torch.float32)
+    model.load_weights(iter(pair + [(score_name, scores)]))
+    reference = scales.repeat_interleave(16, 0).repeat_interleave(16, 1)[:18] * 2
+    torch.testing.assert_close(
+        attention.indexer.wk.weight, reference.to(torch.bfloat16)
+    )
+    torch.testing.assert_close(
+        attention.indexer.weights_proj.weight, scores, rtol=0, atol=0
+    )
+    assert torch.all(attention.fused_qkv_a_proj_with_mqa.weight[:24] == 0.5)
+    assert torch.all(attention.fused_qkv_a_proj_with_mqa.weight[24:] == 0.75)
+    with pytest.raises(ValueError, match="Incomplete Flash-Lite DSA FP8"):
+        model.load_weights(iter(pair[:1]))

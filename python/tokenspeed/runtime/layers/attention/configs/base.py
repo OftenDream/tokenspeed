@@ -100,9 +100,7 @@ def resolve_cache_layer_types(
 
 
 def resolve_dtype(kv_cache_dtype_str: str) -> torch.dtype:
-    if kv_cache_dtype_str == "auto":
-        return torch.bfloat16
-    elif kv_cache_dtype_str == "bfloat16":
+    if kv_cache_dtype_str == "auto" or kv_cache_dtype_str == "bfloat16":
         return torch.bfloat16
     elif kv_cache_dtype_str in ("fp8", "fp8_e4m3"):
         return torch.float8_e4m3fn
@@ -131,7 +129,6 @@ class SoftmaxAttnConfig(AttnComponentSpec):
     """Base of the softmax-attention families (MHA / MLA / DSA / MSA)."""
 
     is_dsa: ClassVar[bool] = False
-    uses_dsa_dcp_partials: bool = False
 
     num_attention_heads: int
     num_kv_heads: int
@@ -217,14 +214,41 @@ class AttnConfig:
             )
         if self.dcp_size > 1:
             softmax = softmax_components[0]
-            if softmax.uses_dsa_dcp_partials:
+            if softmax.backend_name == "flashmla":
+                if torch.device(self.device).type != "cuda":
+                    raise ValueError("FlashMLA DCP requires CUDA")
+                if (
+                    self.speculative_num_steps > 0
+                    or self.speculative_num_draft_tokens > 1
+                    or self.is_draft
+                ):
+                    raise ValueError("FlashMLA DCP does not yet support speculation")
+            elif (
+                softmax.is_dsa
+                and not self.uses_replicated_dcp_cache
+                and softmax.backend_name in (None, "dsa")
+            ):
+                if torch.device(self.device).type != "cuda":
+                    raise ValueError("GPU DSA DCP requires CUDA")
+                if (
+                    self.speculative_num_steps > 0
+                    or self.speculative_num_draft_tokens > 1
+                    or self.is_draft
+                ):
+                    raise ValueError("GPU DSA DCP does not yet support speculation")
+            elif softmax.backend_name == "hybrid_linear_attn":
+                # The registry resolves the user's full-attention leaf after
+                # composing the hybrid components, and validates it before
+                # cache allocation. The composite name is not a capability.
+                pass
+            elif self.uses_replicated_dcp_cache:
                 # LongCat DSA combines context-shard partials with the max/sum
                 # emitted by SparseFlashAttentionDecode. The backend validates
                 # its stricter full-head topology when it is constructed.
                 pass
             elif softmax.backend_name != "deepseek_v4":
                 raise ValueError(
-                    "DCP currently requires DeepSeek V4 or LongCat DSA attention"
+                    "DCP currently requires DeepSeek V4, LongCat DSA or FlashMLA attention"
                 )
             else:
                 # Partials merge through a no-sink LSE; fail here rather than at
@@ -235,6 +259,27 @@ class AttnConfig:
                         "DCP requires a DeepSeek V4 decode kernel that returns a "
                         f"no-sink LSE; none is registered for {platform.device_name}"
                     )
+
+    @property
+    def uses_replicated_dcp_cache(self) -> bool:
+        """Whether the selected DSA path partitions compute over full cache replicas.
+
+        Independent indexing is a model fact, not a storage policy. Only the
+        Ascend BF16 DSA implementation currently uses replicated DCP storage.
+        """
+        from tokenspeed.runtime.layers.attention.configs.dsa import DSAConfig
+
+        dsa = self.component(DSAConfig)
+        return (
+            str(self.device).split(":", 1)[0] == "npu"
+            and dsa is not None
+            and dsa.uses_independent_index_cache
+        )
+
+    @property
+    def dcp_cache_shard_count(self) -> int:
+        """Storage owners for the full-history MLA/DSA cache group."""
+        return 1 if self.uses_replicated_dcp_cache else self.dcp_size
 
     def component(self, cls: type[ComponentT]) -> ComponentT | None:
         """The first component that is a ``cls``, or None.

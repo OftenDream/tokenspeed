@@ -71,7 +71,9 @@ class _Pool:
         *,
         cache_k_nope=None,
         cache_k_rope=None,
+        write_mask,
     ):
+        assert write_mask is None
         self.events.append("write")
         kv = kv if kv is not None else cache_k_nope
         auxiliary = auxiliary if auxiliary is not None else cache_k_rope
@@ -96,6 +98,9 @@ class _Backend:
         )
         self.spec_num_tokens = 1
         self.supports_mla_projected_value_decode = False
+
+    def cache_placement(self, layer):
+        return None
 
     def select_out_cache_loc(self, _layer, loc, _mode):
         return loc

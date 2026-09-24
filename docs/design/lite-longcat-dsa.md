@@ -10,8 +10,9 @@ independent forward must not repeat the paired path's input gather.
 
 The single attention class and shared indexer live in `models/longcat_dsa.py`;
 there is no Lite-specific attention class, model file, or attention config.
-Lite reuses `DSAConfig`; explicit fields select its independent BF16 index-cache
-and DCP-partial contracts while their defaults preserve the packed GPU path.
+Lite reuses `DSAConfig`; `uses_independent_index_cache` selects independent
+per-layer indexing. GPU quantizes Index-K to packed FP8 with FP32 scales;
+Ascend retains BF16 Index-K. Projection dtype does not select cache dtype.
 Execution keeps the existing `DSABackend` contract and graph lifecycle. The
 common/CUDA implementation remains in
 `backends/paged/dsa.py`; the Ascend implementation is the
@@ -47,12 +48,12 @@ the same registry.
 ## Cache and kernel boundaries
 
 The existing hybrid KDA recipe owns all persistent state. Full-attention
-pages carry three BF16 fields: `dsa_key` (latent K/V), `dsa_rope`, and
-`dsa_index_k`. They share scheduler page identities but occupy separate
+pages carry BF16 `latent_kv` (NoPE and RoPE) and `dsa_index_k` (packed FP8
+plus FP32 scales on GPU, BF16 on Ascend). They share scheduler page identities but occupy separate
 physical planes, because the sparse kernels require exact contiguous page
 strides. There is no backend-private persistent cache.
 
-KDA state can share latent planes, not the extra RoPE/index planes. For this
+KDA state can share latent planes, not the separate index planes. For this
 DSA layout the recipe bounds parent padding at 1.0 rather than MLA's 0.25;
 this is an explicit memory reservation, not additional live cache tokens.
 Existing MLA/draft packing policies are unchanged. Runtime capacity is still

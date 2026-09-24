@@ -715,9 +715,11 @@ A recipe's group set never depends on the DCP size. Only groups whose every
 reader can attend to a shard may be sharded; a group some consumer must read
 whole stays replicated and is declared as its own group at every DCP size, so
 prefix matching, transfer and zeroing -- all keyed by group -- see one
-topology. DeepSeek V4 shards its compressed-KV chains and keeps the SWA cache,
-the compressor states and the indexer's K replicated; the indexer K is its own
-full-history group rather than a tenant of the compressed chain it indexes.
+topology. DeepSeek V4 shards its compressed-KV chains and keeps the SWA cache
+and compressor states replicated. Index-K is sharded in its own full-history
+group; its virtual IDs are independent of the compressed attention chain.
+Backend binding validates the DCP shard count for both compressed KV and
+Index-K; SWA and compressor-state groups must remain replicated.
 
 Splitting or regrouping fields can change physical packing and parent plane
 sizes. Capacity planning therefore uses the resulting physical parent byte

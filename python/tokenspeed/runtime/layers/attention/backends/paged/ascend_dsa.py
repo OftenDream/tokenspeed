@@ -42,7 +42,8 @@ from tokenspeed.runtime.execution.forward_step import (
 from tokenspeed.runtime.layers.attention.backends.paged.dsa import DSABackend
 from tokenspeed.runtime.layers.attention.backends.paged.mla import MLAAttnBackend
 from tokenspeed.runtime.layers.attention.dcp.metadata import (
-    DCPPageTableMetadata,
+    PositionPreservingDCPLayout,
+    PositionPreservingDCPMetadata,
     refresh_dcp_page_table_metadata,
 )
 from tokenspeed.runtime.layers.attention.kernel_page_sizes import ASCEND_SFAD_PAGE_SIZE
@@ -78,7 +79,7 @@ class _AscendDCPKernelMetadata:
 
 def _compact_dcp_kernel_metadata(
     *,
-    placement: DCPPageTableMetadata,
+    placement: PositionPreservingDCPMetadata,
     seq_lens: torch.Tensor,
     page_size: int,
     init_tokens: int,
@@ -159,7 +160,7 @@ class _AscendDSAContextParallel:
         self.primary_process_group = None
         self.auxiliary_process_group = None
         self.virtual_block_count = virtual_block_count
-        self.page_placement: DCPPageTableMetadata | None = None
+        self.page_placement: PositionPreservingDCPMetadata | None = None
         self.page_table: torch.Tensor | None = None
         self.seq_lens: torch.Tensor | None = None
         self.init_counts: torch.Tensor | None = None
@@ -216,6 +217,7 @@ class _AscendDSAContextParallel:
         if virtual_block_count is None:
             raise RuntimeError("DSA CP cache metadata was not bound")
         self.page_placement = refresh_dcp_page_table_metadata(
+            layout=PositionPreservingDCPLayout(),
             page_table=page_table,
             virtual_block_count=virtual_block_count,
             degree=self.degree,
@@ -318,7 +320,7 @@ class AscendDSABackend(DSABackend):
         *,
         kernel_page_size: int,
     ) -> None:
-        if not (spec.is_dsa and spec.uses_separate_bf16_index_cache):
+        if not (spec.is_dsa and spec.uses_independent_index_cache):
             raise NotImplementedError(
                 "Ascend DSA currently requires the LongCat BF16 indexer/cache contract"
             )

@@ -419,6 +419,7 @@ class K3DSparkModel(nn.Module):
                 cache_locs,
                 latent[..., : attn.kv_lora_rank].contiguous(),
                 latent[..., attn.kv_lora_rank :].contiguous(),
+                write_mask=None,
             )
 
     @torch.no_grad()

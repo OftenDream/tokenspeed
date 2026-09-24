@@ -247,8 +247,18 @@ class CacheGroupRouter(AttentionBackend):
         super()._publish_cache_pool(cache_pool)
 
     def configure_runtime(self, **kwargs) -> None:
-        for leaf in self.leaves.values():
-            leaf.configure_runtime(**kwargs)
+        specs = {
+            spec.group_id: spec for spec in self.cache_pool.arena.cache_group_specs
+        }
+        for group_id, leaf in self.leaves.items():
+            leaf.configure_runtime(
+                block_granularity=self.geometry.granularity_of(group_id),
+                shard_count=specs[group_id].shard_count,
+                virtual_block_count=self.cache_pool.arena.runtime_contract.virtual_block_counts[
+                    group_id
+                ],
+                **kwargs,
+            )
 
     def init_prefill_graph_state(self, max_num_tokens: int, max_bs: int) -> None:
         for leaf in self.leaves.values():
@@ -729,6 +739,9 @@ class CacheGroupRouter(AttentionBackend):
             for leaf in self.leaves.values()
         )
 
+    def cache_placement(self, layer):
+        return self._leaf_for(layer).cache_placement(layer)
+
     def run_projection_branches(self, layer, primary, secondary):
         return self._leaf_for(layer).run_projection_branches(layer, primary, secondary)
 
@@ -889,8 +902,18 @@ class CacheGroupRouter(AttentionBackend):
         # Every leaf sizes from the one config.context_len; any leaf answers.
         return next(iter(self.leaves.values())).max_context_len
 
+    def prepare_sparse_selection(self, *args, **kwargs):
+        return self._sole_leaf("prepare_sparse_selection").prepare_sparse_selection(
+            *args, **kwargs
+        )
+
     def forward_extend_chunked(self, *args, **kwargs):
         return self._sole_leaf("forward_extend_chunked").forward_extend_chunked(
+            *args, **kwargs
+        )
+
+    def forward_sparse_decode(self, *args, **kwargs):
+        return self._sole_leaf("forward_sparse_decode").forward_sparse_decode(
             *args, **kwargs
         )
 

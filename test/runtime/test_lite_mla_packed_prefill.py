@@ -55,14 +55,16 @@ class Pool:
     def get_key_buffer(self, layer_id):
         return self.cache
 
-    def set_mla_kv_buffer(self, layer, loc, *, cache_k_nope, cache_k_rope):
+    def set_mla_kv_buffer(self, layer, loc, *, cache_k_nope, cache_k_rope, write_mask):
+        assert write_mask is None
         self.writes += 1
         rows = torch.cat((cache_k_nope, cache_k_rope), dim=-1).view(-1, 576)
         self.cache.view(-1, 576).index_copy_(0, loc.long(), rows)
 
 
 class Backend(MLAAttnBackend):
-    def __init__(self, page, table):
+    def __init__(self, page, table, pool):
+        self.cache_pool = pool
         # Exercise the real forward_extend; the fixture supplies scheduler-owned
         # metadata and write locations without starting a serving scheduler.
         self.kernel_page_size = page
@@ -167,7 +169,7 @@ def run_layer(chunks, count, attention_tp):
     page = 64
     pool = Pool(page, 81920 // page)
     table = torch.randperm(81920 // page, dtype=torch.int32, device="npu").view(1, -1)
-    backend = Backend(page, table)
+    backend = Backend(page, table, pool)
     op_loader = mla_packed._packed_prefill_op
     op = op_loader()
     assert op is not None

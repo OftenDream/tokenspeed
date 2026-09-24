@@ -24,12 +24,13 @@ from __future__ import annotations
 
 import re
 from collections.abc import Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Literal
 
 import torch
 
 from tokenspeed.runtime.configs.flash_kda_config import FLASHLocalConfig
+from tokenspeed.runtime.layers.quantization.utils import should_ignore_quant_layer
 
 _LAYER_RE = re.compile(r"^model\.layers\.(\d+)\.(.+)$")
 _EXPERT_RE = re.compile(
@@ -76,6 +77,12 @@ class FLASHLocalCheckpointLayout:
         self.shared_quant_kind = shared_quant_kind
 
     def iter_source_names(self) -> Iterator[str]:
+        for name in self._base_source_names():
+            yield name
+            if self.spec(name).dtype == torch.float8_e4m3fn:
+                yield name + "_scale_inv"
+
+    def _base_source_names(self) -> Iterator[str]:
         yield "model.embed_tokens.weight"
         yield "lm_head.weight"
         yield "model.norm.weight"
@@ -148,6 +155,40 @@ class FLASHLocalCheckpointLayout:
             yield f"model.ngram_embeddings.post_projs.{table_id}.weight"
 
     def spec(self, name: str) -> FLASHLocalWeightSpec:
+        scale = name.endswith(".weight_scale_inv")
+        weight_name = name.removesuffix("_scale_inv") if scale else name
+        spec = self._base_spec(weight_name)
+        quant = getattr(self.config, "quantization_config", None) or {}
+        fp8 = (
+            quant.get("quant_method") == "fp8"
+            and weight_name.endswith(".weight")
+            and len(spec.shape) == 2
+            and not should_ignore_quant_layer(
+                weight_name.removesuffix(".weight"),
+                quant.get("ignored_layers", quant.get("modules_to_not_convert", [])),
+                {},
+            )
+        )
+        if not fp8:
+            if scale:
+                raise ValueError(f"Unexpected Lite checkpoint weight {name!r}.")
+            return spec
+        block = quant.get("weight_block_size")
+        if not block or len(block) != 2 or min(block) <= 0:
+            raise ValueError(
+                "Flash-Lite FP8 checkpoints require a 2D weight block size."
+            )
+        if scale:
+            return replace(
+                spec,
+                source_name=name,
+                target_name=spec.target_name + "_scale_inv",
+                shape=tuple((n + b - 1) // b for n, b in zip(spec.shape, block)),
+                dtype=torch.float32,
+            )
+        return replace(spec, dtype=torch.float8_e4m3fn)
+
+    def _base_spec(self, name: str) -> FLASHLocalWeightSpec:
         config = self.config
         if name in {"model.embed_tokens.weight", "lm_head.weight"}:
             return FLASHLocalWeightSpec(

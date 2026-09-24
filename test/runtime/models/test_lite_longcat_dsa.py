@@ -24,7 +24,7 @@ import dataclasses
 import os
 from test.runtime.conftest import kimi_recipe
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, PropertyMock
 
 import pytest
 import torch
@@ -45,28 +45,21 @@ from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
 from tokenspeed.runtime.layers.attention.kv_cache import hybrid_kda
 from tokenspeed.runtime.layers.attention.kv_cache.factory import create_cache_pool
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import pack
-from tokenspeed.runtime.layers.attention.longcat_dsa import (
-    _PackedLongCatDSAIndexer,
-)
-from tokenspeed.runtime.models.longcat_dsa import (
-    LongCatDSAAttention,
-    LongCatDSAIndexer,
-)
+from tokenspeed.runtime.layers.attention.longcat_dsa import _PackedLongCatDSAIndexer
+from tokenspeed.runtime.models.longcat_dsa import LongCatDSAAttention, LongCatDSAIndexer
 from tokenspeed.runtime.utils.cuda_stream import limit_stream_cores
 
 
 def _lite_dsa_config(**kwargs) -> DSAConfig:
     kwargs.update(
-        uses_separate_bf16_index_cache=True,
-        uses_dsa_dcp_partials=True,
+        uses_independent_index_cache=True,
     )
     return DSAConfig(**kwargs)
 
 
 def test_lite_reuses_standard_dsa_config_with_distinct_cache_layout():
     assert DSAConfig.is_dsa
-    assert not DSAConfig.uses_separate_bf16_index_cache
-    assert not DSAConfig.uses_dsa_dcp_partials
+    assert not DSAConfig.uses_independent_index_cache
 
 
 @pytest.mark.parametrize("independent", [False, True])
@@ -91,8 +84,36 @@ def test_dsa_selection_policy_is_generated_by_standard_config(monkeypatch, indep
 
     assert values["index_init_tokens"] == 4
     assert values["index_local_tokens"] == 1024
-    assert values["uses_separate_bf16_index_cache"] is independent
-    assert values["uses_dsa_dcp_partials"] is independent
+    assert values["uses_independent_index_cache"] is independent
+    assert "uses_dsa_dcp_partials" not in values
+
+
+@pytest.mark.parametrize("device", ["cuda", "npu", "npu:0"])
+@pytest.mark.parametrize("independent", [False, True])
+def test_dsa_cache_placement_depends_on_device_and_layout(device, independent):
+    recipe = kimi_recipe(kv_cache_dtype=torch.bfloat16)
+    mla = recipe.attn_config.component(MLAConfig)
+    dsa = DSAConfig(
+        **{
+            **dataclasses.asdict(mla),
+            "backend_name": "dsa",
+            "uses_independent_index_cache": independent,
+        },
+        index_n_heads=16,
+        index_head_dim=128,
+        index_topk=2048,
+    )
+    config = dataclasses.replace(
+        recipe.attn_config,
+        device=device,
+        components=(dsa,),
+    )
+    replicated = independent and device.startswith("npu")
+    assert config.uses_replicated_dcp_cache is replicated
+    assert config.dcp_cache_shard_count == 1
+    if device == "cuda" or replicated:
+        config = dataclasses.replace(config, dcp_size=4, dcp_group=(0, 1, 2, 3))
+        assert config.dcp_cache_shard_count == (1 if replicated else 4)
 
 
 def test_longcat_dsa_inheritance_keeps_hybrid_kda_cache_pool(monkeypatch):
@@ -343,7 +364,9 @@ def test_lite_reuses_longcat_owner_for_every_attention_layer(monkeypatch):
 
 
 @pytest.mark.parametrize("tp_size", [4, 8, 16])
-def test_bf16_cache_planes_have_exact_page_strides(tp_size):
+@pytest.mark.parametrize("degree", [1, 4])
+@pytest.mark.parametrize("device", ["cuda", "npu"])
+def test_independent_cache_planes_have_exact_page_strides(tp_size, degree, device):
     recipe = kimi_recipe(tp_size=tp_size, kv_cache_dtype=torch.bfloat16)
     mla = recipe.attn_config.component(MLAConfig)
     dsa = _lite_dsa_config(
@@ -354,14 +377,23 @@ def test_bf16_cache_planes_have_exact_page_strides(tp_size):
         index_init_tokens=4,
         index_local_tokens=1024,
     )
+    dsa = dataclasses.replace(dsa, backend_name="dsa")
     recipe.attn_config = dataclasses.replace(
         recipe.attn_config,
+        device=device,
+        dcp_size=degree,
+        dcp_group=tuple(range(degree)),
         components=tuple(
             dsa if isinstance(c, MLAConfig) else c
             for c in recipe.attn_config.components
         ),
     )
     groups = recipe.groups()
+    assert all(
+        spec.shard_count
+        == (degree if spec.group_id == "full_attention" and device == "cuda" else 1)
+        for spec, _ in groups
+    )
     layout = pack(
         groups,
         prefix_granularity=recipe.prefix_granularity,
@@ -375,6 +407,15 @@ def test_bf16_cache_planes_have_exact_page_strides(tp_size):
         fields for spec, fields in groups if spec.group_id == "full_attention"
     )
     assert len(full_fields) == 24 * 2
+    index_fields = [
+        field for field in full_fields if field.field_id.endswith("dsa_index_k")
+    ]
+    assert len(index_fields) == 24
+    assert all(
+        field.dtype == ("uint8" if device == "cuda" else "bfloat16")
+        and field.shape == ((128, 132) if device == "cuda" else (128, 1, 128))
+        for field in index_fields
+    )
     assert all(field.exact_page_stride for field in full_fields)
     assert len({field.plane_id for field in full_fields}) == len(full_fields)
 
@@ -454,6 +495,12 @@ def test_longcat_indexer_rope_preserves_unrotated_tail(monkeypatch):
 def indexed_backend(monkeypatch):
     """Real DSA/MLA metadata with only the physical NPU kernels substituted."""
     config = kimi_recipe(kv_cache_dtype=torch.bfloat16, max_bs=8).attn_config
+    # Metadata is allocated on CPU while this fixture simulates the Ascend
+    # backend, including its replicated storage policy. Device-policy tests
+    # above exercise the real property independently of this fixture.
+    monkeypatch.setattr(
+        type(config), "uses_replicated_dcp_cache", PropertyMock(return_value=True)
+    )
     # ServerArgs uses the canonical string "none" for an unquantized cache.
     config = dataclasses.replace(config, kv_cache_quant_method="none")
     spec = _lite_dsa_config(
@@ -532,15 +579,6 @@ def test_ascend_backend_owns_projection_branch_scheduling(indexed_backend, monke
 
     assert calls == ["indexer", "mla"]
     assert result == ("index-result", "mla-result")
-
-
-def test_ascend_dsa_isolated_from_common_backend():
-    assert not hasattr(dsa_backend, "ascend_dsa_kernels")
-    assert not hasattr(dsa_backend.DSABackend, "_init_context_parallel")
-    assert not hasattr(dsa_backend.DSABackend, "_refresh_dcp_metadata")
-    assert not hasattr(dsa_backend.DSABackend, "_select_indexed")
-    assert not hasattr(dsa_backend.DSABackend, "_run_indexed_sparse_attention")
-    assert issubclass(ascend_backend.AscendDSABackend, dsa_backend.DSABackend)
 
 
 def test_ascend_dsa_rejects_unimplemented_forward_variants(indexed_backend):
@@ -801,8 +839,7 @@ def test_existing_dsa_keeps_gpu_plan_and_rejects_unadapted_npu_layout(
     _, config, spec, _ = indexed_backend
     values = dataclasses.asdict(spec)
     values.update(
-        uses_separate_bf16_index_cache=False,
-        uses_dsa_dcp_partials=False,
+        uses_independent_index_cache=False,
     )
     gpu_spec = DSAConfig(**values)
     with pytest.raises(NotImplementedError, match="BF16 indexer/cache contract"):
@@ -963,3 +1000,15 @@ def test_npu_dsa_matches_explicit_paged_pipeline(mode, monkeypatch):
             graph.replay()
             torch.npu.synchronize()
             torch.testing.assert_close(captured, expected, rtol=0, atol=0)
+
+
+def test_gpu_backend_implements_projection_branch_contract():
+    backend = dsa_backend.DSABackend.__new__(dsa_backend.DSABackend)
+    calls = []
+    result = backend.run_projection_branches(
+        None,
+        lambda: calls.append("indexer") or "index-result",
+        lambda: calls.append("mla") or "mla-result",
+    )
+    assert calls == ["indexer", "mla"]
+    assert result == ("index-result", "mla-result")

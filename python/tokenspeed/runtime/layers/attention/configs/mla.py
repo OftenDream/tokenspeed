@@ -58,10 +58,9 @@ def resolve_mla_kv_cache_dtype(
 
 @dataclass(kw_only=True)
 class MLAConfig(SoftmaxAttnConfig):
-    # Sparse-attention capabilities live on the common MLA contract rather
-    # than being inferred from a concrete config class. Standard DSA and
-    # LongCat DSA deliberately use different index-cache layouts.
-    uses_separate_bf16_index_cache: bool = False
+    # Independent indexing is a model contract, separate from storage dtype:
+    # GPU uses packed FP8 Index-K; Ascend retains its native BF16 layout.
+    uses_independent_index_cache: bool = False
 
     kv_lora_rank: int
     qk_nope_head_dim: int

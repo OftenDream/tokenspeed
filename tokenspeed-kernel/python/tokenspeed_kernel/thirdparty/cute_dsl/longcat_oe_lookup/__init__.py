@@ -28,7 +28,7 @@ from typing import Any
 import torch
 
 SUPPORTED_FEATURE_WIDTHS = (128, 256, 512)
-SUPPORTED_FRAGMENT_COUNTS = (2, 3)
+SUPPORTED_FRAGMENT_COUNTS = (2, 3, 4)
 
 
 def _cutedsl_available() -> bool:
@@ -117,7 +117,7 @@ class LongCatOEAppendPackedLookup:
             for _, modulus, feature_width in fragment_configs
         )
         compile_tables = oe_tables + tuple(
-            oe_tables[index % len(oe_tables)] for index in range(3 - len(oe_tables))
+            oe_tables[index % len(oe_tables)] for index in range(4 - len(oe_tables))
         )
         out = make_fake_tensor(
             cutlass.BFloat16,
@@ -197,7 +197,7 @@ class LongCatOEAppendPackedLookup:
                     self._compiled[key] = compiled
 
         launch_tables = oe_tables + tuple(
-            oe_tables[index % len(oe_tables)] for index in range(3 - len(oe_tables))
+            oe_tables[index % len(oe_tables)] for index in range(4 - len(oe_tables))
         )
         compiled(
             input_ids,

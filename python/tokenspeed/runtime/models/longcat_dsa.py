@@ -28,6 +28,7 @@ from typing import Any
 
 import torch
 from tokenspeed_kernel.ops.attention.dsa import dsa_decode_topk, dsa_prefill_topk
+from tokenspeed_kernel.ops.attention.dsa.triton import workspace_topk_to_global_slots
 from tokenspeed_kernel.ops.attention.mla import (
     mla_project_value,
     mla_prolog,
@@ -45,6 +46,8 @@ from tokenspeed.runtime.execution.breakable_cuda_graph import (
 )
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+from tokenspeed.runtime.layers.attention.dcp.indexer import select_dsa_topk
+from tokenspeed.runtime.layers.attention.dcp.placement import resolve_cache_slots
 from tokenspeed.runtime.layers.attention.longcat_dsa import (
     LongCatDSAIndexer,
     LongCatDSAIndexerOutput,
@@ -620,23 +623,58 @@ class LongCatDSAAttention(DeepseekV3AttentionMLA):
             else seq_lens.unsqueeze(1)
         )
         initial_tokens, local_tokens = ctx.attn_backend.dsa_selection_policy
-        dsa_decode_topk(
-            q,
-            weights,
-            seq_lens,
-            page_table,
-            page_size=ctx.token_to_kv_pool.arena.kv_page_size,
-            topk=self.index_topk,
-            softmax_scale=self._require_indexer().weights_softmax_scale,
-            q_len_per_req=window.q_len_per_req,
-            index_k_cache=index_k_cache,
-            seq_lens_2d=seq_lens_2d,
-            plan=metadata._dsa_plan,
-            initial_tokens=initial_tokens,
-            local_tokens=local_tokens,
-            out=index_slice,
-            lens_out=length_slice,
-        )
+        placement = ctx.attn_backend.cache_placement(self.attn_mqa)
+        if placement is not None:
+            page_size = ctx.token_to_kv_pool.arena.kv_page_size
+            requests = (
+                torch.arange(q.shape[0], device=q.device, dtype=torch.int32)
+                // window.q_len_per_req
+            )
+            causal_lens = (
+                seq_lens[requests.long()]
+                - (window.q_len_per_req - 1)
+                + torch.arange(q.shape[0], device=q.device) % window.q_len_per_req
+            )
+            offsets, counts = select_dsa_topk(
+                q,
+                weights,
+                index_k_cache,
+                page_table,
+                requests,
+                causal_lens,
+                placement=placement,
+                page_size=page_size,
+                topk=self.index_topk,
+                softmax_scale=self._require_indexer().weights_softmax_scale,
+                initial_tokens=initial_tokens,
+                local_tokens=local_tokens,
+                max_logits_bytes=64 * 1024 * 1024,
+            )
+            pages = page_table[
+                requests.long().unsqueeze(1), offsets.clamp_min(0).long() // page_size
+            ]
+            index_slice.copy_(
+                torch.where(offsets >= 0, pages * page_size + offsets % page_size, -1)
+            )
+            length_slice.copy_(counts)
+        else:
+            dsa_decode_topk(
+                q,
+                weights,
+                seq_lens,
+                page_table,
+                page_size=ctx.token_to_kv_pool.arena.kv_page_size,
+                topk=self.index_topk,
+                softmax_scale=self._require_indexer().weights_softmax_scale,
+                q_len_per_req=window.q_len_per_req,
+                index_k_cache=index_k_cache,
+                seq_lens_2d=seq_lens_2d,
+                plan=metadata._dsa_plan,
+                initial_tokens=initial_tokens,
+                local_tokens=local_tokens,
+                out=index_slice,
+                lens_out=length_slice,
+            )
         return LongCatDSADecodeSelection(indices, lengths)
 
     def _compute_prefill_selection(
@@ -700,23 +738,47 @@ class LongCatDSAAttention(DeepseekV3AttentionMLA):
         row_ends = row_starts + candidate_lens
         max_logits_mb = int(global_server_args_dict[_INDEXER_PREFILL_MAX_LOGITS_MB_ARG])
         initial_tokens, local_tokens = ctx.attn_backend.dsa_selection_policy
-        workspace_indices, topk_lens = dsa_prefill_topk(
-            indexer_output.query[:num_prefill_tokens].contiguous(),
-            indexer_output.weights[:num_prefill_tokens],
-            kv_workspace_slots,
-            row_starts.to(device=device, dtype=torch.int32),
-            row_ends.to(device=device, dtype=torch.int32),
-            topk=self.index_topk,
-            softmax_scale=self._require_indexer().weights_softmax_scale,
-            index_k_cache=ctx.token_to_kv_pool.get_index_k_buffer(
-                self.selection_owner_layer_id
-            ),
-            page_size=page_size,
-            max_logits_bytes=max(1, max_logits_mb) * 1024 * 1024,
-            candidate_lens_cpu=candidate_lens,
-            initial_tokens=initial_tokens,
-            local_tokens=local_tokens,
-        )
+        placement = ctx.attn_backend.cache_placement(self.attn_mqa)
+        if placement is not None:
+            global_starts, global_ends = row_starts.to(
+                device=device, dtype=torch.int32
+            ), row_ends.to(device=device, dtype=torch.int32)
+            offsets, topk_lens = select_dsa_topk(
+                indexer_output.query[:num_prefill_tokens],
+                indexer_output.weights[:num_prefill_tokens],
+                ctx.token_to_kv_pool.get_index_k_buffer(self.selection_owner_layer_id),
+                page_table,
+                token_req.to(device=device, dtype=torch.int32),
+                global_ends - global_starts,
+                placement=placement,
+                page_size=ctx.token_to_kv_pool.arena.kv_page_size,
+                topk=self.index_topk,
+                softmax_scale=self._require_indexer().weights_softmax_scale,
+                initial_tokens=initial_tokens,
+                local_tokens=local_tokens,
+                max_logits_bytes=max(1, max_logits_mb) * 1024 * 1024,
+            )
+            workspace_indices = torch.where(
+                offsets >= 0, offsets + global_starts.unsqueeze(1), -1
+            ).to(torch.int32)
+        else:
+            workspace_indices, topk_lens = dsa_prefill_topk(
+                indexer_output.query[:num_prefill_tokens].contiguous(),
+                indexer_output.weights[:num_prefill_tokens],
+                kv_workspace_slots,
+                row_starts.to(device=device, dtype=torch.int32),
+                row_ends.to(device=device, dtype=torch.int32),
+                topk=self.index_topk,
+                softmax_scale=self._require_indexer().weights_softmax_scale,
+                index_k_cache=ctx.token_to_kv_pool.get_index_k_buffer(
+                    self.selection_owner_layer_id
+                ),
+                page_size=page_size,
+                max_logits_bytes=max(1, max_logits_mb) * 1024 * 1024,
+                candidate_lens_cpu=candidate_lens,
+                initial_tokens=initial_tokens,
+                local_tokens=local_tokens,
+            )
         return LongCatDSAPrefillSelection(
             workspace_indices=workspace_indices,
             topk_lens=topk_lens,
@@ -751,10 +813,10 @@ class LongCatDSAAttention(DeepseekV3AttentionMLA):
             or ctx.num_extends != 0
             or hidden_states.shape[0] != ctx.bs
             or self.w_kc is None
+            or not mla_prolog_available()
             or not self.q_a_proj._weight_nz_transposed
             or not self.kv_a_proj_with_mqa._weight_nz_transposed
             or not self.q_b_proj._weight_nz_transposed
-            or not mla_prolog_available()
         ):
             return None
         pool = ctx.token_to_kv_pool
@@ -784,6 +846,69 @@ class LongCatDSAAttention(DeepseekV3AttentionMLA):
             return None
         query_nope, query_aux, q_norm = result
         return torch.cat((query_nope, query_aux), dim=-1), q_norm
+
+    def _forward_independent_sparse(self, q, key, index, ctx, save_kv_cache):
+        backend = ctx.attn_backend
+        locations = backend.write_locations(self.attn_mqa, ctx.forward_mode)
+        num_prefill = (
+            0
+            if ctx.forward_mode.is_decode()
+            else int(backend.chunked_prefill_metadata.extend_seq_lens_cpu.sum())
+        )
+        if num_prefill > q.shape[0]:
+            raise ValueError("Independent DSA prefill metadata exceeds the token batch")
+        outputs = []
+        for start, end, prefill in (
+            (0, num_prefill, True),
+            (num_prefill, q.shape[0], False),
+        ):
+            if start == end:
+                continue
+            query = q[start:end]
+            keys = key[start:end] if key is not None else None
+            slots, counts, causal = backend.prepare_sparse_selection(
+                query,
+                keys,
+                self.attn_mqa,
+                locations[start:end],
+                ctx.token_to_kv_pool,
+                save_kv_cache=save_kv_cache,
+                prefill=prefill,
+                index_query=index.query[start:end],
+                index_key=index.key[start:end],
+                index_weights=index.weights[start:end],
+            )
+            if prefill:
+                output = backend.forward_sparse_prefill(
+                    q=query,
+                    layer=self.attn_mqa,
+                    token_to_kv_pool=ctx.token_to_kv_pool,
+                    topk_slots=slots,
+                    topk_lens=counts,
+                    kv_seq_lens=causal,
+                    max_seq_len=backend.max_context_len,
+                )
+            else:
+                output = backend.forward_sparse_decode(
+                    q=query,
+                    k=keys,
+                    v=None,
+                    layer=self.attn_mqa,
+                    out_cache_loc=locations[start:end],
+                    token_to_kv_pool=ctx.token_to_kv_pool,
+                    bs=ctx.bs,
+                    save_kv_cache=False,
+                    topk_indices=slots,
+                    topk_lens=counts,
+                )
+            outputs.append(
+                output.view(end - start, self.num_local_heads, self.kv_lora_rank)
+            )
+        if not outputs:
+            output = q.new_empty((0, self.num_local_heads, self.kv_lora_rank))
+        else:
+            output = outputs[0] if len(outputs) == 1 else torch.cat(outputs, dim=0)
+        return output.transpose(0, 1).contiguous()
 
     def forward(self, positions, hidden_states, ctx, comm_manager):
         if not self.independent_selection:
@@ -862,17 +987,20 @@ class LongCatDSAAttention(DeepseekV3AttentionMLA):
             index_k,
             index_weights,
         )
-        out = self.attn_mqa(
-            q,
-            key,
-            key[..., : self.kv_lora_rank] if key is not None else None,
-            ctx,
-            save_kv_cache=save_kv_cache,
-            index_query=index.query,
-            index_key=index.key.unsqueeze(1),
-            index_weights=index.weights,
-            head_major_output=True,
-        )
+        if q.device.type == "npu":
+            out = self.attn_mqa(
+                q,
+                key,
+                key[..., : self.kv_lora_rank] if key is not None else None,
+                ctx,
+                save_kv_cache=save_kv_cache,
+                index_query=index.query,
+                index_key=index.key.unsqueeze(1),
+                index_weights=index.weights,
+                head_major_output=True,
+            )
+        else:
+            out = self._forward_independent_sparse(q, key, index, ctx, save_kv_cache)
         expected_shape = (
             self.num_local_heads,
             hidden_states.shape[0],
@@ -992,10 +1120,14 @@ class LongCatDSAAttention(DeepseekV3AttentionMLA):
                 indexer_hidden, expected_rows=int(q_norm.shape[0])
             )
             indexer_output = self._require_indexer()(indexer_hidden, q_norm, positions)
+            index_slots, index_mask = resolve_cache_slots(
+                out_cache_loc, ctx.attn_backend.cache_placement(self.attn_mqa)
+            )
             ctx.token_to_kv_pool.set_index_k_buffer(
                 self.selection_owner_layer_id,
-                out_cache_loc,
+                index_slots,
                 indexer_output.key,
+                write_mask=index_mask,
             )
             if ctx.num_extends > 0:
                 self._selection.prefill = self._compute_prefill_selection(
@@ -1079,11 +1211,12 @@ class LongCatDSAAttention(DeepseekV3AttentionMLA):
             q=query,
             layer=self.attn_mqa,
             token_to_kv_pool=ctx.token_to_kv_pool,
-            page_table=selection.page_table,
-            seq_lens=selection.seq_lens,
-            workspace_indices=selection.workspace_indices,
+            topk_slots=workspace_topk_to_global_slots(
+                workspace_indices=selection.workspace_indices,
+                kv_workspace_slots=selection.kv_workspace_slots,
+            ),
             topk_lens=selection.topk_lens,
-            kv_workspace_slots=selection.kv_workspace_slots,
+            kv_seq_lens=None,
             max_seq_len=selection.max_seq_len,
         )
         mla_project_value(

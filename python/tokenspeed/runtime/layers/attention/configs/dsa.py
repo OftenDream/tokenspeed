@@ -56,7 +56,9 @@ class DSAConfig(MLAConfig):
     index_kpool: int | None = None
     # Index-cache and selection contracts vary independently of the model
     # family. Existing GPU DSA keeps the packed cache defaults; Lite selects
-    # the separate BF16 layout and DCP partial reduction from checkpoint facts.
+    # independent selection from checkpoint facts. Index-K uses FP8 on GPU
+    # and BF16 on Ascend. Storage placement is
+    # resolved separately by AttnConfig from the execution device.
     index_init_tokens: int = 0
     index_local_tokens: int = 0
 
@@ -81,8 +83,7 @@ class DSAConfig(MLAConfig):
             index_n_heads=model_config.index_n_heads,
             index_kpool=getattr(model_config, "index_kpool", None),
             indexer_layer_ids=getattr(model_config, "indexer_layer_ids", None),
-            uses_separate_bf16_index_cache=independent_selection,
-            uses_dsa_dcp_partials=independent_selection,
+            uses_independent_index_cache=independent_selection,
             index_init_tokens=getattr(model_config, "index_init_tokens", 0),
             index_local_tokens=getattr(model_config, "index_local_tokens", 0),
         )
@@ -104,11 +105,11 @@ class DSAConfig(MLAConfig):
             raise ValueError("Independent DSA selection does not support MTP")
         config = super().generate(server_args, model_config, is_draft)
         spec = config.component(DSAConfig)
-        if spec.uses_separate_bf16_index_cache and (
+        if spec.uses_independent_index_cache and (
             config.kv_cache_dtype != torch.bfloat16
         ):
             raise ValueError(
-                "Separate DSA index cache currently requires BF16 KV cache"
+                "Independent DSA selection currently requires BF16 KV cache"
             )
         if config.kv_cache_dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
             platform = current_platform()
@@ -127,10 +128,12 @@ class DSAConfig(MLAConfig):
         return self.indexer_layer_ids is None or layer_id in self.indexer_layer_ids
 
     def cache_cell_size(self, config: AttnConfig) -> int:
-        if self.uses_separate_bf16_index_cache:
+        if self.uses_independent_index_cache:
             element_size = torch._utils._element_size(torch.bfloat16)
-            return element_size * (
-                self.kv_lora_rank + self.qk_rope_head_dim + self.index_head_dim
+            return element_size * (self.kv_lora_rank + self.qk_rope_head_dim) + (
+                element_size * self.index_head_dim
+                if str(config.device).split(":", 1)[0] == "npu"
+                else dsa_index_k_row_bytes(self.index_head_dim)
             )
         index_k_cell_size = dsa_index_k_row_bytes(
             self.index_head_dim,

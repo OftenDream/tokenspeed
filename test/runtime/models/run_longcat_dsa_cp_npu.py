@@ -15,6 +15,7 @@ import torch_npu  # noqa: F401
 from tokenspeed_kernel_npu.ops.longcat_dsa import AscendDSAKernels
 
 from tokenspeed.runtime.layers.attention.dcp.metadata import (
+    PositionPreservingDCPLayout,
     refresh_dcp_page_table_metadata,
 )
 
@@ -36,6 +37,7 @@ def _all_gather(tensor: torch.Tensor) -> torch.Tensor:
 
 def _owned_metadata(rank: int, table: torch.Tensor):
     placement = refresh_dcp_page_table_metadata(
+        layout=PositionPreservingDCPLayout(),
         page_table=table,
         virtual_block_count=1 + TOKENS * PAGES_PER_REQUEST,
         degree=DEGREE,

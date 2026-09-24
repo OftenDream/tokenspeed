@@ -29,9 +29,6 @@ from tokenspeed_kernel.ops.attention.dsa import (
     dsa_plan,
     dsa_prefill,
 )
-from tokenspeed_kernel.ops.attention.dsa.triton import (
-    workspace_topk_to_global_slots,
-)
 from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.configs.model_config import AttentionArch
@@ -45,11 +42,24 @@ from tokenspeed.runtime.layers.attention.backends.paged.trtllm_mla import (
 )
 from tokenspeed.runtime.layers.attention.backends.support import CudaGraphSupport
 from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
-from tokenspeed.runtime.layers.attention.configs.dsa import DSAConfig
+from tokenspeed.runtime.layers.attention.configs.dsa import (
+    DSAConfig,
+    dsa_index_k_row_bytes,
+)
+from tokenspeed.runtime.layers.attention.dcp.comm import (
+    combine_attention_partials,
+    gather_query_heads,
+)
+from tokenspeed.runtime.layers.attention.dcp.indexer import select_dsa_topk
+from tokenspeed.runtime.layers.attention.dcp.placement import (
+    CachePlacement,
+    resolve_cache_slots,
+)
 from tokenspeed.runtime.layers.attention.kernel_page_sizes import (
     DSA_SPARSE_PAGE_SIZE,
 )
 from tokenspeed.runtime.layers.attention.kpool import KPoolRuntime
+from tokenspeed.runtime.layers.attention.kv_cache.dsa import write_index_k_cache
 from tokenspeed.runtime.layers.attention.registry import register_backend
 
 if TYPE_CHECKING:
@@ -98,6 +108,14 @@ class DSABackend(PagedAttentionBackend):
         self._dense_backend = self._create_dense_leaf(
             config, spec, platform, kernel_page_size
         )
+        self.dcp_group = tuple(config.dcp_group)
+        self.dcp_rank = config.dcp_rank
+        self.dcp_block_granularity: int | None = None
+        self.dcp_virtual_block_count: int | None = None
+        if len(self.dcp_group) > 1 and spec.index_kpool is not None:
+            raise ValueError("DSA DCP does not yet support KPool selection")
+        self.independent_index_cache = spec.uses_independent_index_cache
+        self.index_head_dim = spec.index_head_dim
         self.index_topk = spec.index_topk
         self.index_init_tokens = spec.index_init_tokens
         self.index_local_tokens = spec.index_local_tokens
@@ -121,6 +139,40 @@ class DSABackend(PagedAttentionBackend):
             # replay explicitly in its model code, so the class-level DSA
             # restriction does not apply to it.
             self.cuda_graph_support = CudaGraphSupport(prefill_graph=True)
+
+    def run_projection_branches(self, layer, primary, secondary):
+        """Run independent indexer/MLA projections on the caller's GPU stream."""
+        del layer
+        return primary(), secondary()
+
+    def configure_runtime(
+        self,
+        *,
+        block_granularity: int,
+        virtual_block_count: int,
+        shard_count: int,
+        **kwargs,
+    ) -> None:
+        super().configure_runtime(**kwargs)
+        if (
+            shard_count != len(self.dcp_group)
+            or block_granularity % self.kernel_page_size
+        ):
+            raise ValueError("DSA cache geometry does not match DCP topology")
+        self.dcp_block_granularity = block_granularity
+        self.dcp_virtual_block_count = virtual_block_count
+
+    def cache_placement(self, layer) -> CachePlacement | None:
+        if len(self.dcp_group) == 1:
+            return None
+        if self.dcp_block_granularity is None or self.dcp_virtual_block_count is None:
+            raise RuntimeError("DSA DCP cache geometry is not configured")
+        return CachePlacement(
+            self.dcp_block_granularity,
+            self.dcp_virtual_block_count,
+            self.dcp_group,
+            self.dcp_rank,
+        )
 
     @property
     def dsa_selection_policy(self) -> tuple[int, int]:
@@ -221,6 +273,8 @@ class DSABackend(PagedAttentionBackend):
     def _publish_cache_pool(self, cache_pool: CachePool) -> None:
         super()._publish_cache_pool(cache_pool)
         self._prefill_page_table = None
+        self.dcp_block_granularity = None
+        self.dcp_virtual_block_count = None
         if self.kpool_runtime is not None:
             self.kpool_runtime.reset_forward(None)
 
@@ -260,6 +314,8 @@ class DSABackend(PagedAttentionBackend):
             num_extends=num_extends,
             for_graph_replay=for_graph_replay,
         )
+        if self.independent_index_cache:
+            return
         metadata = self.forward_decode_metadata
         if getattr(metadata, "_dsa_seq_lens_2d", None) is None:
             # First refresh at a lazily-built bs (no capture ran): allocate the
@@ -333,7 +389,11 @@ class DSABackend(PagedAttentionBackend):
         # Target mixed batches carry decode rows needing the per-token plan.
         # A draft's plan is rebuilt by the wrapper's refresh_decode_metadata
         # after this init (the unified draft contract).
-        if forward_mode.is_mixed() and not self.is_draft:
+        if (
+            forward_mode.is_mixed()
+            and not self.is_draft
+            and not self.independent_index_cache
+        ):
             metadata = self.forward_decode_metadata
             # Per-token context lengths: the paged-MQA-logits kernel only supports
             # next_n == 1, so each verify token is its own row (bs * spec_num_tokens
@@ -480,6 +540,8 @@ class DSABackend(PagedAttentionBackend):
                 topk_indices=topk_indices,
                 topk_lens=topk_lens,
             )
+        if len(self.dcp_group) > 1:
+            raise ValueError("Sharded DSA decode requires global top-k selection")
         metadata = self.forward_decode_metadata
         if metadata is not None and metadata.seq_lens_k is not None:
             num_extends = int(metadata.num_extends or 0)
@@ -496,20 +558,120 @@ class DSABackend(PagedAttentionBackend):
             **kwargs,
         )
 
+    def prepare_sparse_selection(
+        self,
+        q,
+        k,
+        layer,
+        out_cache_loc,
+        pool,
+        *,
+        save_kv_cache: bool,
+        prefill: bool,
+        index_query: torch.Tensor,
+        index_key: torch.Tensor,
+        index_weights: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Write owned KV/Index-K rows and select global sparse cache slots.
+
+        Returns per-query global slots, valid candidate counts and causal lengths.
+        This prepares selection only; callers use the common sparse attention APIs.
+        """
+        self._validate_logit_cap(layer.logit_cap)
+        if self.dcp_block_granularity is None or self.dcp_virtual_block_count is None:
+            raise RuntimeError("DSA cache geometry is not configured")
+        placement = CachePlacement(
+            self.dcp_block_granularity,
+            self.dcp_virtual_block_count,
+            self.dcp_group,
+            self.dcp_rank,
+        )
+        slots, owned = resolve_cache_slots(out_cache_loc, placement)
+        if save_kv_cache:
+            if k is None:
+                raise ValueError("Independent DSA cache writes require keys")
+            pool.set_mla_kv_buffer(
+                layer,
+                slots,
+                k[..., : self.kv_lora_rank],
+                k[..., self.kv_lora_rank :],
+                write_mask=owned,
+            )
+        index_cache = pool.get_component(layer.layer_id, "dsa_index_k")
+        write_index_k_cache(
+            index_cache,
+            index_key.view(-1, self.index_head_dim),
+            slots,
+            page_size=self.kernel_page_size,
+            head_dim=self.index_head_dim,
+            write_mask=owned,
+        )
+        index_cache = index_cache.view(
+            -1,
+            dsa_index_k_row_bytes(self.index_head_dim),
+        )
+        rows = torch.arange(q.shape[0], dtype=torch.int32, device=q.device)
+        if prefill:
+            metadata = self.chunked_prefill_metadata
+            ends = metadata.cum_extend_seq_lens
+            requests = torch.bucketize(rows, ends[1:], right=True)
+            lengths = self.forward_prefill_metadata.seq_lens
+            causal = lengths[requests] - (ends[requests + 1] - rows - 1)
+            table = self._prefill_page_table
+        else:
+            metadata = self.forward_decode_metadata
+            start = int(metadata.num_extends or 0)
+            lengths = metadata.seq_lens_k[start:]
+            table = metadata.page_table[start:]
+            if q.shape[0] != lengths.shape[0]:
+                raise ValueError(
+                    "Independent DSA decode requires one query per request"
+                )
+            requests, causal = rows, lengths
+        offsets, counts = select_dsa_topk(
+            index_query,
+            index_weights,
+            index_cache,
+            table,
+            requests,
+            causal,
+            placement=placement,
+            page_size=self.kernel_page_size,
+            topk=self.index_topk,
+            softmax_scale=self.index_head_dim**-0.5,
+            initial_tokens=self.index_init_tokens,
+            local_tokens=self.index_local_tokens,
+            max_logits_bytes=64 * 1024 * 1024,
+        )
+        pages = table[
+            requests.long().unsqueeze(1),
+            offsets.clamp_min(0).long() // self.kernel_page_size,
+        ]
+        topk_slots = torch.where(
+            offsets >= 0,
+            pages * self.kernel_page_size + offsets % self.kernel_page_size,
+            -1,
+        ).to(torch.int32)
+        return topk_slots, counts, causal
+
     def forward_sparse_prefill(
         self,
         *,
         q: torch.Tensor,
         layer,
         token_to_kv_pool,
-        page_table: torch.Tensor,
-        seq_lens: torch.Tensor,
-        kv_seq_lens: torch.Tensor | None = None,
-        workspace_indices: torch.Tensor,
+        kv_seq_lens: torch.Tensor | None,
+        topk_slots: torch.Tensor,
         topk_lens: torch.Tensor,
-        kv_workspace_slots: torch.Tensor | None = None,
         max_seq_len: int,
     ) -> torch.Tensor:
+        """Attend to preselected global KV slots and merge DCP partials.
+
+        topk_slots contains one candidate row per query, with -1 for invalid
+        entries; topk_lens gives valid counts. kv_seq_lens optionally supplies
+        per-query causal lengths, bounded by max_seq_len. KV is already written.
+        Returns token-major attention output, flattened over heads and features.
+        """
         if layer.logit_cap and layer.logit_cap > 0:
             self._validate_logit_cap(layer.logit_cap)
         if getattr(token_to_kv_pool, "quant_method", None) == "per_token_head":
@@ -517,10 +679,10 @@ class DSABackend(PagedAttentionBackend):
                 "DSA sparse prefill does not support "
                 "kv_cache_quant_method='per_token_head' yet."
             )
-        if workspace_indices.shape[0] != q.shape[0]:
+        if topk_slots.shape[0] != q.shape[0]:
             raise RuntimeError(
                 "DSA sparse prefill metadata token mismatch: "
-                f"indices={workspace_indices.shape[0]}, q_tokens={q.shape[0]}"
+                f"indices={topk_slots.shape[0]}, q_tokens={q.shape[0]}"
             )
         if topk_lens.shape[0] != q.shape[0]:
             raise RuntimeError(
@@ -538,20 +700,11 @@ class DSABackend(PagedAttentionBackend):
             return q.new_empty((0, layer.tp_q_head_num * layer.v_head_dim))
         # KPool selection can append up to pool_size - 1 visible tail tokens,
         # so its workspace may be wider than the configured pooled top-k.
-        if workspace_indices.dim() != 2 or workspace_indices.shape[1] <= 0:
+        if topk_slots.dim() != 2 or topk_slots.shape[1] <= 0:
             raise RuntimeError(
                 "DSA sparse prefill top-k shape mismatch: "
-                f"indices={tuple(workspace_indices.shape)}"
+                f"indices={tuple(topk_slots.shape)}"
             )
-        if kv_workspace_slots is None:
-            raise RuntimeError(
-                "DSA sparse prefill requires kv_workspace_slots to "
-                "map workspace-local top-k rows back to KV cache slots."
-            )
-        topk_slots = workspace_topk_to_global_slots(
-            workspace_indices=workspace_indices,
-            kv_workspace_slots=kv_workspace_slots,
-        )
         q_view = q.view(q.shape[0], layer.tp_q_head_num, layer.head_dim)
         if self.data_type == torch.float8_e4m3fn and q_view.dtype != self.data_type:
             q_view = q_view.to(self.data_type)
@@ -562,6 +715,11 @@ class DSABackend(PagedAttentionBackend):
             if getattr(layer, "k_scale_float", None) is not None
             else 1.0
         )
+        use_dcp = len(self.dcp_group) > 1
+        if use_dcp:
+            slots, owned = resolve_cache_slots(topk_slots, self.cache_placement(layer))
+            topk_slots = torch.where(owned, slots, -1)
+            q_view = gather_query_heads(q_view, self.dcp_group)
         out = dsa_prefill(
             q=q_view,
             kv_cache=kv_cache,
@@ -581,7 +739,17 @@ class DSABackend(PagedAttentionBackend):
             page_size=self.kernel_page_size,
             logit_cap=layer.logit_cap,
             k_scale=k_scale,
+            return_lse=use_dcp,
         )
+        if use_dcp:
+            local_output, local_lse = out
+            out = combine_attention_partials(
+                local_output,
+                local_lse,
+                group=self.dcp_group,
+                rank=self.dcp_rank,
+                sink=None,
+            )
         # GLM's sparse-prefill path writes both the latent KV and index_k before
         # entering this method, but bypasses the backend's forward and its
         # normal PD readiness hook. Publish the layer only after the dependent
@@ -626,11 +794,15 @@ class DSABackend(PagedAttentionBackend):
             )
         if save_kv_cache:
             assert k is not None
+            local_slots, write_mask = resolve_cache_slots(
+                out_cache_loc, self.cache_placement(layer)
+            )
             token_to_kv_pool.set_mla_kv_buffer(
                 layer,
-                out_cache_loc,
+                local_slots,
                 k[..., : self.kv_lora_rank],
                 k[..., self.kv_lora_rank :],
+                write_mask=write_mask,
             )
 
         if topk_indices.dtype != torch.int32:
@@ -714,11 +886,17 @@ class DSABackend(PagedAttentionBackend):
         max_seqlen_k = int(
             getattr(metadata, "max_seq_len_k", 0) or self.max_context_len
         )
+        use_dcp = len(self.dcp_group) > 1
+        topk_slots = topk_indices.view(num_tokens, -1)
+        if use_dcp:
+            slots, owned = resolve_cache_slots(topk_slots, self.cache_placement(layer))
+            topk_slots = torch.where(owned, slots, -1)
+            q_view = gather_query_heads(q_view, self.dcp_group)
         out = dsa_decode(
             q=q_view,
             kv_cache=kv_cache,
             sparse_kv_cache=None,
-            topk_slots=topk_indices.view(num_tokens, -1),
+            topk_slots=topk_slots,
             topk_lens=topk_lens,
             max_seqlen_k=max_seqlen_k,
             qk_nope_head_dim=self.qk_nope_head_dim,
@@ -731,7 +909,19 @@ class DSABackend(PagedAttentionBackend):
             kv_seq_lens=kv_seq_lens,
             logit_cap=layer.logit_cap,
             k_scale=k_scale,
+            return_lse=use_dcp,
         )
+        if use_dcp:
+            local_output, local_lse = out
+            out = combine_attention_partials(
+                local_output,
+                local_lse,
+                group=self.dcp_group,
+                rank=self.dcp_rank,
+                sink=None,
+            ).to(
+                torch.bfloat16 if q_view.dtype == torch.float8_e4m3fn else q_view.dtype
+            )
         return out.reshape(-1, layer.tp_q_head_num * layer.v_head_dim)
 
 

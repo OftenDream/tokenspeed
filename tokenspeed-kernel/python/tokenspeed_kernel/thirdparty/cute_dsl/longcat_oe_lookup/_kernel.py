@@ -27,8 +27,8 @@ import cutlass.cute as cute
 from cuda.bindings.driver import CUstream
 
 _BLOCK_SIZE = 64
-_MAX_FRAGMENTS = 3
-_SUPPORTED_FRAGMENT_COUNTS = (2, 3)
+_MAX_FRAGMENTS = 4
+_SUPPORTED_FRAGMENT_COUNTS = (2, 3, 4)
 _SUPPORTED_FEATURE_WIDTHS = (128, 256, 512)
 
 
@@ -49,7 +49,8 @@ class CuteLongCatOEAppendPackedLookup:
             raise ValueError(f"vocab_size must be positive, got {vocab_size}")
         if len(fragment_configs) not in _SUPPORTED_FRAGMENT_COUNTS:
             raise ValueError(
-                "local fragment count must be 2 or 3, got " f"{len(fragment_configs)}"
+                "local fragment count must be 2, 3 or 4, got "
+                f"{len(fragment_configs)}"
             )
         for index, (ngram_order, modulus, feature_width) in enumerate(fragment_configs):
             if not 2 <= ngram_order <= 5:
@@ -81,13 +82,16 @@ class CuteLongCatOEAppendPackedLookup:
         self.ngram_order0, self.modulus0, self.feature_width0 = padded_configs[0]
         self.ngram_order1, self.modulus1, self.feature_width1 = padded_configs[1]
         self.ngram_order2, self.modulus2, self.feature_width2 = padded_configs[2]
+        self.ngram_order3, self.modulus3, self.feature_width3 = padded_configs[3]
 
         self.output_offset0 = 0
         self.output_offset1 = self.feature_width0
         self.output_offset2 = self.feature_width0 + self.feature_width1
+        self.output_offset3 = self.output_offset2 + self.feature_width2
         self.values_per_thread0 = self.feature_width0 // _BLOCK_SIZE
         self.values_per_thread1 = self.feature_width1 // _BLOCK_SIZE
         self.values_per_thread2 = self.feature_width2 // _BLOCK_SIZE
+        self.values_per_thread3 = self.feature_width3 // _BLOCK_SIZE
 
         self.powers0 = tuple(
             pow(vocab_size, delta, self.modulus0) for delta in range(self.ngram_order0)
@@ -97,6 +101,9 @@ class CuteLongCatOEAppendPackedLookup:
         )
         self.powers2 = tuple(
             pow(vocab_size, delta, self.modulus2) for delta in range(self.ngram_order2)
+        )
+        self.powers3 = tuple(
+            pow(vocab_size, delta, self.modulus3) for delta in range(self.ngram_order3)
         )
 
     @cute.jit
@@ -111,6 +118,7 @@ class CuteLongCatOEAppendPackedLookup:
         table0: cute.Tensor,
         table1: cute.Tensor,
         table2: cute.Tensor,
+        table3: cute.Tensor,
         out: cute.Tensor,
         stream: CUstream,
     ) -> None:
@@ -125,6 +133,7 @@ class CuteLongCatOEAppendPackedLookup:
             table0,
             table1,
             table2,
+            table3,
             out,
         ).launch(
             grid=[token_count, self.local_fragments, 1],
@@ -226,6 +235,7 @@ class CuteLongCatOEAppendPackedLookup:
         table0: cute.Tensor,
         table1: cute.Tensor,
         table2: cute.Tensor,
+        table3: cute.Tensor,
         out: cute.Tensor,
     ) -> None:
         tidx, _, _ = cute.arch.thread_idx()
@@ -291,6 +301,18 @@ class CuteLongCatOEAppendPackedLookup:
                     self.modulus2,
                     self.powers2,
                 )
+            if active and local_fragment == 3:
+                selected_row[0] = self._hash_fragment(
+                    input_ids,
+                    history_token_ids,
+                    token_index,
+                    position,
+                    slot,
+                    stable_len,
+                    self.ngram_order3,
+                    self.modulus3,
+                    self.powers3,
+                )
             if (
                 active
                 and cutlass.const_expr(self.segment_ignored_tokens)
@@ -321,6 +343,14 @@ class CuteLongCatOEAppendPackedLookup:
                 if request_active[0] != 0:
                     value = table2[row, column]
                 out[token_index, self.output_offset2 + column] = value
+
+        if local_fragment == 3:
+            for value_index in cutlass.range_constexpr(self.values_per_thread3):
+                column = tidx + value_index * _BLOCK_SIZE
+                value = cutlass.BFloat16(0)
+                if request_active[0] != 0:
+                    value = table3[row, column]
+                out[token_index, self.output_offset3 + column] = value
 
         if cutlass.const_expr(self.use_pdl):
             cute.arch.sync_threads()

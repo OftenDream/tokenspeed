@@ -74,33 +74,58 @@ class DSATokenToKVPool(MLATokenToKVPool):
         layer_id: int,
         loc: torch.Tensor,
         index_k: torch.Tensor,
+        *,
+        write_mask: torch.Tensor | None,
     ) -> None:
         if index_k.dtype != self.model_dtype:
             index_k = index_k.to(self.model_dtype)
         index_k = index_k.view(-1, self.index_head_dim)
-        self._set_index_k_buffer(layer_id, loc, index_k)
+        self._set_index_k_buffer(layer_id, loc, index_k, write_mask=write_mask)
 
     def _set_index_k_buffer(
         self,
         layer_id: int,
         loc: torch.Tensor,
         index_k: torch.Tensor,
+        *,
+        write_mask: torch.Tensor | None,
     ) -> None:
         buf = self._require_index_k_buffer(layer_id)
-        index_k_fp8, index_k_scale = quantize_fp8_with_scale(
-            index_k,
-            granularity="token_group",
-            group_size=_INDEX_K_FP8_GROUP_SIZE,
-            scale_encoding="float32",
-        )
-
-        # Fused scatter; (page, slot_in_page) is derived from loc in-kernel.
-        index_k_block_split_scatter(
+        write_index_k_cache(
             buf,
-            index_k_fp8,
-            index_k_scale,
+            index_k,
             loc,
             page_size=self.arena.kv_page_size,
             head_dim=self.index_head_dim,
-            group_size=_INDEX_K_FP8_GROUP_SIZE,
+            write_mask=write_mask,
         )
+
+
+def write_index_k_cache(
+    cache: torch.Tensor,
+    index_k: torch.Tensor,
+    slots: torch.Tensor,
+    *,
+    page_size: int,
+    head_dim: int,
+    write_mask: torch.Tensor | None,
+) -> None:
+    """Quantize Index-K and write owned rows in the page-planar FP8 layout."""
+    index_k_fp8, index_k_scale = quantize_fp8_with_scale(
+        index_k,
+        granularity="token_group",
+        group_size=_INDEX_K_FP8_GROUP_SIZE,
+        scale_encoding="float32",
+    )
+
+    # Fused scatter; (page, slot_in_page) is derived from loc in-kernel.
+    index_k_block_split_scatter(
+        cache,
+        index_k_fp8,
+        index_k_scale,
+        slots,
+        page_size=page_size,
+        head_dim=head_dim,
+        group_size=_INDEX_K_FP8_GROUP_SIZE,
+        write_mask=write_mask,
+    )

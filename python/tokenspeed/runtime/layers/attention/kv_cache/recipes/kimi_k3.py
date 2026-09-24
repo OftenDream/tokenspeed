@@ -30,18 +30,16 @@ from __future__ import annotations
 
 import math
 from collections.abc import Mapping
+from dataclasses import replace
 from functools import cached_property
 
 import torch
 from typing_extensions import override
 
-from tokenspeed.runtime.layers.attention.configs.linear_attn import (
-    LinearAttnConfig,
-)
+from tokenspeed.runtime.layers.attention.configs.dsa import dsa_index_k_row_bytes
+from tokenspeed.runtime.layers.attention.configs.linear_attn import LinearAttnConfig
 from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
-from tokenspeed.runtime.layers.attention.kv_cache.recipes.base import (
-    CacheRecipe,
-)
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.base import CacheRecipe
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
     require_positive_int,
 )
@@ -180,6 +178,23 @@ class KimiK3Recipe(CacheRecipe):
             for group_id in self.group_ids
         )
 
+    @override
+    def groups(self) -> tuple[CacheGroupDeclaration, ...]:
+        # Storage placement is resolved centrally; independent indexing alone
+        # does not imply replicated cache. KDA state groups remain replicated.
+        shard_count = self.attn_config.dcp_cache_shard_count
+        return tuple(
+            (
+                (
+                    replace(spec, shard_count=shard_count)
+                    if spec.group_id == FULL_ATTENTION
+                    else spec
+                ),
+                fields,
+            )
+            for spec, fields in super().groups()
+        )
+
     # ---- geometry ----
 
     @property
@@ -190,8 +205,8 @@ class KimiK3Recipe(CacheRecipe):
     @property
     @override
     def max_padding_fraction(self) -> float:
-        if self.attn_config.component(MLAConfig).uses_separate_bf16_index_cache:
-            # KDA state shares latent planes, but not the separate RoPE/index
+        if self.attn_config.component(MLAConfig).uses_independent_index_cache:
+            # KDA state shares latent planes, but not the separate index
             # planes required by sparse kernels. Bound the reservation rather
             # than disabling the planner's padding check.
             return 1.0
@@ -230,11 +245,11 @@ class KimiK3Recipe(CacheRecipe):
             )
         if self.attn_config.kv_cache_quant_method == "per_token_head":
             raise ValueError("Kimi-K3 cache does not support per_token_head MLA cache")
-        uses_separate_bf16_index_cache = self.attn_config.component(
+        uses_independent_index_cache = self.attn_config.component(
             MLAConfig
-        ).uses_separate_bf16_index_cache
+        ).uses_independent_index_cache
         if (
-            not uses_separate_bf16_index_cache
+            not uses_independent_index_cache
             and getattr(self._text_config, "mla_use_nope", None) is not True
         ):
             raise ValueError("Kimi-K3 cache requires mla_use_nope=True")
@@ -260,7 +275,7 @@ class KimiK3Recipe(CacheRecipe):
                 else self.draft_attn_config
             )
             spec = config.component(MLAConfig)
-            if spec.uses_separate_bf16_index_cache:
+            if spec.uses_independent_index_cache:
                 return (
                     CacheFieldSpec(
                         f"layer.{layer_id}.latent_kv",
@@ -275,8 +290,19 @@ class KimiK3Recipe(CacheRecipe):
                     CacheFieldSpec(
                         f"layer.{layer_id}.dsa_index_k",
                         f"dsa_index_k.{occurrence}",
-                        (self.prefix_granularity, 1, spec.index_head_dim),
-                        cache_dtype_name(torch.bfloat16),
+                        (
+                            (self.prefix_granularity, 1, spec.index_head_dim)
+                            if str(config.device).split(":", 1)[0] == "npu"
+                            else (
+                                self.prefix_granularity,
+                                dsa_index_k_row_bytes(spec.index_head_dim),
+                            )
+                        ),
+                        (
+                            "bfloat16"
+                            if str(config.device).split(":", 1)[0] == "npu"
+                            else "uint8"
+                        ),
                     ),
                 )
             latent_width = spec.kv_lora_rank + spec.qk_rope_head_dim
@@ -348,7 +374,7 @@ class KimiK3Recipe(CacheRecipe):
             group_id == FULL_ATTENTION for group_id in self.target_group_ids
         )
         expected = num_mla_layers + self.num_draft_layers
-        if self.attn_config.component(MLAConfig).uses_separate_bf16_index_cache:
+        if self.attn_config.component(MLAConfig).uses_independent_index_cache:
             # Sparse attention reads one exact contiguous [NoPE|RoPE] plane;
             # the Indexer keeps its independent exact-stride key plane.
             expected *= 2
@@ -449,11 +475,29 @@ class KimiK3Recipe(CacheRecipe):
     # ---- capacity: the scheduler's concurrency decides, then a search ----
 
     @override
+    def num_lcm_blocks(self, layout: CacheLayout) -> int:
+        budgeted = self._budgeted_parents(
+            self.cache_budget_bytes - self.workspace_bytes(), layout.lcm_block_bytes
+        )
+        if self.token_limit is None:
+            return budgeted
+        # A token limit caps history, not the unsharded KDA working set.
+        # Use the same per-group demand as the inverse capacity calculation.
+        return min(budgeted, self.parents_needed(layout, self.token_limit))
+
+    @override
     def token_capacity(self, layout: CacheLayout, num_lcm_blocks: int) -> int:
         upper = self.token_limit
         if upper is None:
+            # Search bound in logical tokens, not per-rank physical rows.
+            # parents_needed still accounts for unsharded KDA state/reservations.
             full_packing = dict(layout.group_packing)[FULL_ATTENTION]
-            upper = num_lcm_blocks * full_packing * layout.prefix_granularity
+            upper = (
+                num_lcm_blocks
+                * full_packing
+                * self._shard_counts[FULL_ATTENTION]
+                * layout.prefix_granularity
+            )
         return self._capacity_from_parents(layout, num_lcm_blocks, upper_bound=upper)
 
     @override
@@ -478,6 +522,7 @@ class KimiK3Recipe(CacheRecipe):
         parents = 0
         for group_id, packing in layout.group_packing:
             if group_id == FULL_ATTENTION:
+                packing *= self._shard_counts[group_id]
                 child_pages = (
                     math.ceil(token_capacity / page_tokens)
                     + max_live_requests

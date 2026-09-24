@@ -44,11 +44,12 @@ if platform.is_nvidia:
         signatures=format_signatures(("table",), "dense", {torch.bfloat16}),
         priority=Priority.SPECIALIZED,
         traits={
-            "fragment_count": frozenset({2, 3}),
+            "fragment_count": frozenset({2, 3, 4}),
             "fragment_widths": frozenset(
                 {
                     (512, 512),
                     (256, 256, 256),
+                    (256, 256, 256, 256),
                     (256, 128),
                 }
             ),
