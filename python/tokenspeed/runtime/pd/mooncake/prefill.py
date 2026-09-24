@@ -50,11 +50,13 @@ from tokenspeed.runtime.pd.mooncake.entities import (
 from tokenspeed.runtime.pd.mooncake.pack import (
     PackedCopy,
     PrefillPackScratch,
+    coalesce_transfer_blocks,
     flatten_transfer_blocks,
 )
 from tokenspeed.runtime.pd.transfer_plan import (
     CacheTransferFragment,
     CacheTransferPlanner,
+    local_transfer_pages,
 )
 from tokenspeed.runtime.pd.utils import (
     DisaggregationMode,
@@ -363,7 +365,7 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
         n_sge = 0
         n_bytes = 0
         ret = 0
-        block_iter = iter(sges)
+        block_iter = iter(coalesce_transfer_blocks(sges))
         while batch := tuple(islice(block_iter, _TRANSFER_DESCRIPTOR_BATCH_SIZE)):
             src_addrs, dst_addrs, lengths = zip(*batch, strict=True)
             n_sge += len(batch)
@@ -386,6 +388,7 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
         self,
         *,
         dst_ptr: int,
+        dst_tp_rank: int,
         src_block_manifest: CachePDBlockManifest | None,
         dst_block_manifest: CachePDBlockManifest,
         transfer_fragments: tuple[CacheTransferFragment, ...] = (),
@@ -431,6 +434,15 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                 )
                 if block_selection is not None
                 else dst_group.block_ids
+            )
+            source_block_ids, destination_block_ids = local_transfer_pages(
+                source_block_ids,
+                destination_block_ids,
+                group_id=group_spec.group_id,
+                source_layout=layout,
+                destination_layout=dst_cache_layout,
+                source_tp_rank=self.topology.tp_rank,
+                destination_tp_rank=dst_tp_rank,
             )
             group_transfers.append(
                 (
@@ -616,6 +628,7 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                 assert req.block_manifest is not None
                 blocks = self._cache_transfer_blocks(
                     dst_ptr=registration.dst_kv_ptr,
+                    dst_tp_rank=registration.decode_tp_rank,
                     src_block_manifest=None,
                     dst_block_manifest=req.block_manifest,
                     transfer_fragments=registration.transfer_fragments,
@@ -818,6 +831,7 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                     assert req.block_manifest is not None
                     blocks = self._cache_transfer_blocks(
                         dst_ptr=registration.dst_kv_ptr,
+                        dst_tp_rank=registration.decode_tp_rank,
                         src_block_manifest=kv_chunk.block_manifest,
                         dst_block_manifest=req.block_manifest,
                         transfer_fragments=registration.transfer_fragments,

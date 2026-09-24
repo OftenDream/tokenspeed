@@ -95,6 +95,18 @@ class CacheTransferContract:
     def __post_init__(self) -> None:
         self.transfer_schema.validate(self.plan)
 
+    def shard_count(self, group_id: str) -> int:
+        """Return the cache group's cyclic owner count; one means replicated."""
+        return next(
+            spec.shard_count for spec in self.group_specs if spec.group_id == group_id
+        )
+
+    def virtual_block_count(self, group_id: str) -> int:
+        """Exclusive scheduler-ID bound, distinct from local physical pages."""
+        return 1 + (self.plan.group(group_id).page_count - 1) * self.shard_count(
+            group_id
+        )
+
     def fields_for_group(self, group_id: str) -> tuple[CacheFieldLayout, ...]:
         return tuple(
             sorted(
@@ -435,7 +447,7 @@ def validate_cache_manifest(
                 f"{peer} manifest group {group.group_id!r} block count disagrees "
                 "with its transfer policy"
             )
-        group_capacity = layout.plan.group(spec.group_id).page_count
+        group_capacity = layout.virtual_block_count(spec.group_id)
         if any(block <= 0 or block >= group_capacity for block in group.block_ids):
             raise CacheContractError(
                 f"{peer} manifest group {group.group_id!r} has an out-of-bounds block"
@@ -485,7 +497,7 @@ def build_cache_block_manifest(
             int(table[request_row, logical_slot]) for logical_slot in logical_slots
         )
         for logical_slot, block_id in zip(logical_slots, block_ids, strict=True):
-            group_capacity = layout.plan.group(spec.group_id).page_count
+            group_capacity = layout.virtual_block_count(spec.group_id)
             if block_id <= 0 or block_id >= group_capacity:
                 raise CacheContractError(
                     f"table {spec.group_id!r} logical slot {logical_slot} "
@@ -588,7 +600,7 @@ def build_cache_layerwise_block_selection(
         source_block_ids = tuple(
             int(table[request_row, logical_slot]) for logical_slot in logical_slots
         )
-        group_capacity = layout.plan.group(spec.group_id).page_count
+        group_capacity = layout.virtual_block_count(spec.group_id)
         for logical_slot, block_id in zip(logical_slots, source_block_ids, strict=True):
             if block_id <= 0 or block_id >= group_capacity:
                 raise CacheContractError(
