@@ -146,6 +146,47 @@ runner pod recreation and avoids downloading the same large wheels again on
 that node. Other runner families keep their existing cache behavior because
 their cluster storage layouts may differ.
 
+For model evaluation and performance jobs, the reusable PR task workflow puts
+uv's cache in `.uv-cache` under the job's work directory, overriding an inherited
+shared uv cache. EvalScope dependency installs therefore do not depend on free
+space in a persistent `/cache/uv` volume. The existing always-run work-directory
+cleanup removes the job's uv cache on success or failure. Unit-test, kernel
+benchmark, pip, and release-wheel caches retain their existing policy.
+
+Accuracy jobs also keep Triton's compiled kernels in `.triton-cache` under their
+work directory. Lazy compilation during a request can then write its cache even
+when the runner's shared `/cache/triton` volume is full. The directory survives
+the task's server restarts and is removed by the same job cleanup; compiler
+options and test workloads are unchanged. Performance jobs retain the runner's
+Triton cache policy so cold compilation is not newly introduced into measured
+requests.
+
+The AMD Kimi-K3 EAGLE3 performance task publishes its EvalScope outputs and
+tokenizer under
+`.ci-artifacts/published/kimi-k3-eagle3-tp8ep1-50k-500-perf`, including the
+request/response database. These artifacts allow input, output, and speculative
+acceptance differences to be investigated alongside timing changes. The task
+measures 16 concurrent 50K-input/500-output requests with TP8/EP1 and zero
+benchmark warmup requests.
+
+The corresponding AMD Kimi-K3 EAGLE3 AIME26 gate publishes its per-question
+predictions and scoring records under
+`.ci-artifacts/published/kimi-k3-eagle3-aime26`. This retains evidence for accuracy
+misses without changing the full 30-question workload, generation settings, or
+score threshold.
+
+The AMD DeepSeek-V4.1-Flash GSM8K task downloads its weights into
+`.hf-model-cache` in the job's work directory. Its uncached checkpoint can exceed
+the remaining capacity of the shared model volume; the job filesystem provides
+separate writable storage, cleaned up with the work directory. The model ID,
+precision, evaluation workload, and score threshold stay the same. This task
+downloads a fresh checkpoint for each job, so startup includes the download time.
+
+The same model jobs isolate MIOpen's writable user database and kernel cache
+under `.miopen-db` and `.miopen-kernels` in their work directory. This avoids
+SQLite I/O failures from a runner's shared cache. MIOpen's system database and
+tuning settings remain unchanged; the job cleanup removes the writable caches.
+
 The MI450 simulator launcher sets `TRITON_LIBHIP_PATH` to the ROCm SDK's
 unversioned `libamdhip64.so` linker name. The gfx1250 PyTorch wheel and
 TokenSpeed use separate Triton distributions in the same process, and this
@@ -187,19 +228,29 @@ declared in task YAMLs and therefore does not enter default CI matrices.
 
 Each vendor PR workflow starts with a `scan` job that classifies the changed
 files with `test/ci_system/ci_path_filter.py --runner-group <group>` and skips
-its GPU matrix jobs when nothing requires that vendor. The classification is
-directory based:
+its GPU matrix jobs when nothing requires that runner group. The first
+matching rule decides (`ci_path_filter.py` holds the full lists):
 
-* Shared paths (`python/`, `test/`, `tokenspeed-kernel/`,
-  `tokenspeed-scheduler/`, `run-pr-test-stage.yml`) require every runner group.
-* Vendor-owned paths require only that vendor's runner groups, even inside a
-  shared directory: `tokenspeed-kernel-amd/` and
-  `tokenspeed-kernel/test/amd/` are AMD; `tokenspeed-mla/` and
-  `tokenspeed-kernel/test/nvidia/` are NVIDIA.
+* Markdown files require no runner group.
+* Vendor-owned paths (`tokenspeed-kernel-amd/`, `tokenspeed-mla/`, the
+  `tokenspeed-kernel/test/<vendor>/` subtrees, and vendor-specific requirements
+  and CI scripts) require only that vendor's runner groups.
+* Kernel sources are classified by solution name: `cuda`, `cute_dsl`,
+  `flashinfer`, `deep_gemm`, `trtllm`, etc. are NVIDIA; `gluon` is AMD. A
+  vendor-named file whose content mentions another vendor stays shared.
+* `test/ci` task YAMLs require only the runner groups matching their
+  `runner.labels`.
+* Other paths under `python/`, `test/`, `tokenspeed-kernel/`, and
+  `tokenspeed-scheduler/` require every runner group.
 * Each workflow's own YAML requires only its runner group; `workflow_dispatch`
   always runs.
 
-`tokenspeed-kernel/test/` is laid out to feed this filter. Tests whose
+PR and push diffs containing only `test/ci/**/*.yaml` run only the changed tasks,
+with existing validation and runner/trigger rules. Mixed, empty, or potentially
+truncated diffs (300+ paths) keep the existing scope. Manual and nightly runs
+retain their existing task selection.
+
+`tokenspeed-kernel/test/` is laid out to feed the vendor rules. Tests whose
 module-level gate (`is_cdna4()`, `is_cdna5()`, `is_amd()`, or an import from
 `tokenspeed_kernel_amd`) skips them off AMD hardware live under
 `tokenspeed-kernel/test/amd/`; tests that require CUDA, CuTe DSL, FlashInfer,
@@ -429,7 +480,7 @@ hardware. A selected YAML follows the same rule; YAMLs that already declare a
 `slurm-dispatch-gb300` coordinators form one shared pool for manual, nightly,
 and per-commit submissions.
 
-The `GB200 Slurm Per Commit` workflow runs single-node `slurm-gb200-*`
+The `GB200` workflow runs single-node `slurm-gb200-*`
 tasks through the `slurm-dispatch` coordinator. Qwen four-GPU tasks migrated
 from B200 use `slurm-gb200-4gpu`: the 397B NVFP4 AIME25 evaluation, 35B FP8
 DeepEP GSM8K evaluation, and 122B EPD OCRBench evaluation and unit test.
@@ -446,7 +497,7 @@ the approved-PR and latest-main retry workflows also cover this workflow.
 Its default `eval,perf` selection covers the three migrated evaluations;
 select `ut` explicitly to include the EPD unit test.
 
-The `GB300 Slurm Per Commit` workflow selects only multi-node model tasks with
+The `GB300` workflow selects only multi-node model tasks with
 the `per-commit` trigger and submits them through the same
 `slurm-dispatch-gb300` coordinator pool used by manual dispatch. It runs for
 pushes to `main` and for non-draft pull requests whose head branch belongs to
@@ -464,7 +515,7 @@ cannot filter the multi-node matrix here. During this workflow's
 bootstrap only, leave the switch unset; after dispatcher support reaches
 `main`, set it to `true` and re-run the merge commit's workflow.
 
-`Retry Failed Latest Main CI` also covers `GB300 Slurm Per Commit`. Its hourly
+`Retry Failed Latest Main CI` also covers `GB300`. Its hourly
 or manual scan retries failed jobs from completed, failed push runs on the
 latest `main` commit, using the original run and commit. The retry workflow
 stops after three total attempts (the original plus two retries); older

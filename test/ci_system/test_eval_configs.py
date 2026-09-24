@@ -203,12 +203,16 @@ def test_deepseek_v41_flash_runs_tp4_gsm8k_on_b200_and_mi35x():
         assert task["score_threshold"] == 0.90
 
         if label == "b200-4gpu":
+            assert "--download-dir" not in server_tokens
             assert "--enable-expert-parallel" in server_tokens
             assert flag_value(server_tokens, "--moe-backend") == "mega_moe"
             # The NVIDIA gate exercises the split prefill graph (encoder and
             # decoder graphs around the eager narrowing layer).
             assert "--disable-prefill-graph" not in server_tokens
         else:
+            assert (
+                flag_value(server_tokens, "--download-dir") == "${PWD}/.hf-model-cache"
+            )
             assert "--enable-expert-parallel" not in server_tokens
             assert "--moe-backend" not in server_tokens
             # Not yet exercised on AMD; keep that gate on eager prefill.
@@ -218,9 +222,9 @@ def test_deepseek_v41_flash_runs_tp4_gsm8k_on_b200_and_mi35x():
 def test_kimi_k3_amd_gates_use_eagle3():
     filenames = (
         "kimi-k3-eagle3-mxfp4-tp8ep1-evalscope-aime26-amd.yaml",
-        "kimi-k3-eagle3-mxfp4-tp8ep8-evalscope-random-4k-1k-mi35x.yaml",
+        "kimi-k3-eagle3-mxfp4-tp8ep1-evalscope-random-50k-500-mi35x.yaml",
     )
-    ep_sizes = ("1", "8")
+    ep_sizes = ("1", "1")
     tasks = []
     for config_dir, filename, ep_size in zip(
         (EVAL_CONFIG_DIR, PERF_CONFIG_DIR), filenames, ep_sizes, strict=True
@@ -245,9 +249,47 @@ def test_kimi_k3_amd_gates_use_eagle3():
     eval_tokens = shlex.split(tasks[0]["eval"]["command"])
     generation_config = json.loads(flag_value(eval_tokens, "--generation-config"))
     assert generation_config["seed"] == 42
+    assert generation_config["max_tokens"] == 32768
+    assert flag_value(eval_tokens, "--eval-batch-size") == "16"
+    assert "--limit" not in eval_tokens
+    assert (
+        flag_value(eval_tokens, "--work-dir")
+        == ".ci-artifacts/published/kimi-k3-eagle3-aime26"
+    )
     assert tasks[0]["score_threshold"] == 0.90
-    assert tasks[1]["perf_reference"] == {1: [161, 18.8]}
+    perf_server_tokens = shlex.split(tasks[1]["server"]["command"])
+    assert flag_value(perf_server_tokens, "--init-expert-location") == "trivial"
+    assert flag_value(perf_server_tokens, "--ep-dispatch-algorithm") == "static"
+    assert flag_value(perf_server_tokens, "--attention-backend") == "gluon"
+    assert flag_value(perf_server_tokens, "--drafter-attention-backend") == "gluon"
+    assert flag_value(perf_server_tokens, "--max-model-len") == "65536"
+    assert flag_value(perf_server_tokens, "--max-num-seqs") == "16"
+    assert flag_value(perf_server_tokens, "--chunked-prefill-size") == "8192"
+    assert flag_value(perf_server_tokens, "--max-prefill-tokens") == "8192"
+    assert tasks[1]["perf_reference"] == {16: [23, 12.5]}
+    assert tasks[1]["perf_threshold"] == 0.9
     assert "'evalscope[perf]==1.11.1'" in tasks[1]["perf"]["install"][0]
+    perf_tokens = shlex.split(tasks[1]["perf"]["command"])
+    assert (
+        "OUTPUTS_DIR=$PWD/.ci-artifacts/published/kimi-k3-eagle3-tp8ep1-50k-500-perf"
+        in perf_tokens
+    )
+    assert "trap" not in perf_tokens
+    for flag, value in {
+        "--parallel": "16",
+        "--number": "16",
+        "--warmup-num": "0",
+        "--dataset-offset": "300160",
+        "--seed": "20260906",
+        "--min-prompt-length": "50000",
+        "--max-prompt-length": "50000",
+        "--min-tokens": "500",
+        "--max-tokens": "500",
+    }.items():
+        assert flag_value(perf_tokens, flag) == value
+    assert flag_value(perf_tokens, "--total-timeout") == "21600"
+    assert "--no-apply-chat-template" in perf_tokens
+    assert "--no-test-connection" in perf_tokens
 
     control_filenames = (
         "kimi-k3-mxfp4-tp8ep8-evalscope-aime26-amd.yaml",
