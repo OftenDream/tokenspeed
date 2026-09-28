@@ -1153,8 +1153,9 @@ partials using FP32 natural-log LSE before restoring TP-local heads. MLA
 prefill reconstructs bounded history chunks with an owner-masked sum reduction;
 GPU DSA sparse prefill instead combines local sparse-attention partials.
 The dense MLA implementation requires FlashMLA and its device/dtype support;
-DCP does not make unsupported kernels portable. These GPU paths currently
-exclude speculative decoding and KVStore.
+DCP does not make unsupported kernels portable. Verify uses per-query causal
+bounds; FlashMLA maps them to local lengths, while DSA selects causal Top-K
+before mapping cache slots. KVStore and non-causal DSA block drafts remain unsupported.
 
 Splitting or regrouping fields can change physical packing and parent plane
 sizes. Capacity planning therefore uses the resulting physical parent byte
