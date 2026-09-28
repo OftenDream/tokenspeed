@@ -329,10 +329,18 @@ def test_hybrid_forwards_runtime_geometry_to_both_children():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-@pytest.mark.parametrize("hybrid", [False, True])
-@pytest.mark.parametrize("model_write", [False, True])
+@pytest.mark.parametrize(
+    "hybrid,model_write,cache_dtype",
+    [
+        (False, False, torch.bfloat16),
+        (False, True, torch.bfloat16),
+        (True, False, torch.bfloat16),
+        (True, True, torch.bfloat16),
+        (True, False, torch.float8_e4m3fn),
+    ],
+)
 def test_physical_mla_writer_with_placement_and_explicit_history_gather(
-    monkeypatch, hybrid, model_write
+    monkeypatch, hybrid, model_write, cache_dtype
 ):
     from types import SimpleNamespace
 
@@ -351,7 +359,7 @@ def test_physical_mla_writer_with_placement_and_explicit_history_gather(
         prefix_granularity=4,
         layer_num=1,
         latent_width=576,
-        dtype=torch.bfloat16,
+        dtype=cache_dtype,
     )
     arena = make_arena(
         plan,
@@ -364,7 +372,7 @@ def test_physical_mla_writer_with_placement_and_explicit_history_gather(
     pool = pool_cls(
         arena=arena,
         model_dtype=torch.bfloat16,
-        dtype=torch.bfloat16,
+        dtype=cache_dtype,
         quant_method=None,
         kv_lora_rank=512,
         qk_rope_head_dim=64,
@@ -386,6 +394,7 @@ def test_physical_mla_writer_with_placement_and_explicit_history_gather(
     values = torch.arange(3 * 576, device="cuda", dtype=torch.bfloat16).reshape(
         3, 1, 576
     )
+    values = values / 8
     cache = pool.get_key_buffer(0)
     cache.zero_()
     if model_write:
@@ -416,9 +425,10 @@ def test_physical_mla_writer_with_placement_and_explicit_history_gather(
         pool.set_mla_kv_buffer(
             layer, slots, values[..., :512], values[..., 512:], write_mask=mask
         )
-    torch.testing.assert_close(cache[4], values[0])
-    torch.testing.assert_close(cache[8], values[2])
-    assert not cache[:4].any()
+    values = values.to(cache_dtype).to(torch.bfloat16)
+    torch.testing.assert_close(cache.float()[4], values[0].float())
+    torch.testing.assert_close(cache.float()[8], values[2].float())
+    assert not cache.float()[:4].any()
     assert backend.cache_placement(layer) is not None
     # The pool reads physical slots directly, with no distributed state.
     local_nope, local_rope = pool.get_mla_kv_buffer(layer, loc[:2], torch.float32)
@@ -456,9 +466,9 @@ def test_physical_mla_writer_with_placement_and_explicit_history_gather(
     cache.zero_()
     loc.copy_(torch.tensor([8, 12, 4], device="cuda"))
     graph.replay()
-    torch.testing.assert_close(cache[4], values[2])
-    torch.testing.assert_close(cache[8], values[1])
-    assert not cache[:4].any()
+    torch.testing.assert_close(cache.float()[4], values[2].float())
+    torch.testing.assert_close(cache.float()[8], values[1].float())
+    assert not cache.float()[:4].any()
 
 
 @pytest.mark.parametrize("composite", ["hybrid", "router"])

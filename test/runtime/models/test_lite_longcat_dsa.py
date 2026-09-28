@@ -365,9 +365,18 @@ def test_lite_reuses_longcat_owner_for_every_attention_layer(monkeypatch):
 
 @pytest.mark.parametrize("tp_size", [4, 8, 16])
 @pytest.mark.parametrize("degree", [1, 4])
-@pytest.mark.parametrize("device", ["cuda", "npu"])
-def test_independent_cache_planes_have_exact_page_strides(tp_size, degree, device):
-    recipe = kimi_recipe(tp_size=tp_size, kv_cache_dtype=torch.bfloat16)
+@pytest.mark.parametrize(
+    "device,kv_dtype",
+    [
+        ("cuda", torch.bfloat16),
+        ("cuda", torch.float8_e4m3fn),
+        ("npu", torch.bfloat16),
+    ],
+)
+def test_independent_cache_planes_have_exact_page_strides(
+    tp_size, degree, device, kv_dtype
+):
+    recipe = kimi_recipe(tp_size=tp_size, kv_cache_dtype=kv_dtype)
     mla = recipe.attn_config.component(MLAConfig)
     dsa = _lite_dsa_config(
         **dataclasses.asdict(mla),
@@ -411,6 +420,14 @@ def test_independent_cache_planes_have_exact_page_strides(tp_size, degree, devic
         field for field in full_fields if field.field_id.endswith("dsa_index_k")
     ]
     assert len(index_fields) == 24
+    latent_fields = [f for f in full_fields if f.field_id.endswith("latent_kv")]
+    assert all(
+        f.dtype == ("uint8" if kv_dtype == torch.float8_e4m3fn else "bfloat16")
+        for f in latent_fields
+    )
+    assert dsa.cache_cell_size(recipe.attn_config) == sum(
+        f.payload_bytes for f in full_fields
+    ) // (24 * 128)
     assert all(
         field.dtype == ("uint8" if device == "cuda" else "bfloat16")
         and field.shape == ((128, 132) if device == "cuda" else (128, 1, 128))

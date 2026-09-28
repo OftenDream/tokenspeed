@@ -285,7 +285,7 @@ class KimiK3Recipe(CacheRecipe):
                             1,
                             spec.kv_lora_rank + spec.qk_rope_head_dim,
                         ),
-                        cache_dtype_name(torch.bfloat16),
+                        scatter_stored_dtype_name(config.kv_cache_dtype),
                     ),
                     CacheFieldSpec(
                         f"layer.{layer_id}.dsa_index_k",

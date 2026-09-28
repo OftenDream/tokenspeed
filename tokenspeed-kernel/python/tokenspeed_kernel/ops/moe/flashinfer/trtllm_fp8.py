@@ -313,7 +313,7 @@ if platform.is_nvidia:
         ),
         traits={
             "weight_dtype": frozenset({"fp8"}),
-            "activation": frozenset({"swiglu"}),
+            "activation": frozenset({"silu", "swiglu"}),
             "routing_mode": frozenset({"precomputed_topk"}),
             "supports_deferred_finalize": frozenset({True}),
             "supports_ep": frozenset({True}),

@@ -48,6 +48,7 @@ if platform.is_nvidia:
             "fragment_widths": frozenset(
                 {
                     (512, 512),
+                    (256, 256),
                     (256, 256, 256),
                     (256, 256, 256, 256),
                     (256, 128),

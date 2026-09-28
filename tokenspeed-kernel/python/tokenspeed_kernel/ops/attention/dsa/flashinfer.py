@@ -327,9 +327,17 @@ def _flashinfer_trtllm_dsa_impl(
         sparse_mla_top_k_lens=sparse_topk_lens,
         enable_pdl=_resolve_enable_pdl(enable_pdl),
     )
+    result = (out if out is not None else result).reshape(
+        num_tokens, q_kernel.shape[2], int(kv_lora_rank)
+    )
+    # TRTLLM may leave empty request rows unwritten. Padded rows must be zero,
+    # including when the allocator reuses an output that previously held NaNs.
+    result.masked_fill_(
+        (_topk_lens_or_count(topk_slots, topk_lens) == 0)[:, None, None], 0
+    )
     if out is not None:
         return out
-    return result.reshape(num_tokens, q_kernel.shape[2], int(kv_lora_rank))
+    return result
 
 
 if platform.is_nvidia and platform.is_hopper_plus:

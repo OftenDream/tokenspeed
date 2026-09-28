@@ -82,9 +82,18 @@ class _Pool:
         )
 
 
-@pytest.mark.parametrize("topk", [512, 2048])
+@pytest.mark.parametrize(
+    "topk,kv_dtype",
+    [
+        (512, torch.bfloat16),
+        (2048, torch.bfloat16),
+        (2048, torch.float8_e4m3fn),
+    ],
+)
 @pytest.mark.parametrize("phase", ["prefill", "decode", "mixed"])
-def test_independent_dsa_matches_replicated_cache(rank, monkeypatch, phase, topk):
+def test_independent_dsa_matches_replicated_cache(
+    rank, monkeypatch, phase, topk, kv_dtype
+):
     prefill = phase != "decode"
     mixed = phase == "mixed"
     from tokenspeed.runtime.utils.env import global_server_args_dict
@@ -110,7 +119,7 @@ def test_independent_dsa_matches_replicated_cache(rank, monkeypatch, phase, topk
     index_query = torch.randn(tokens, 16, 128, dtype=torch.bfloat16, device=device)
     weights = torch.randn(tokens, 16, dtype=torch.bfloat16, device=device)
     config = kimi_recipe(
-        kv_cache_dtype=torch.bfloat16, context_len=1024, max_bs=3
+        kv_cache_dtype=kv_dtype, context_len=1024, max_bs=3
     ).attn_config
     spec = DSAConfig(
         **{
@@ -200,12 +209,16 @@ def test_independent_dsa_matches_replicated_cache(rank, monkeypatch, phase, topk
         all_slots = torch.arange(34 * 64, device=device)
         physical, owned = resolve_cache_slots(all_slots, placement)
         kv = torch.zeros(
-            ((16 // degree + 1) * 128, 1, 576), dtype=torch.bfloat16, device=device
+            ((16 // degree + 1) * 128, 1, 576), dtype=kv_dtype, device=device
         )
         index = torch.zeros(
             (kv.shape[0] // 64, 64, 132), dtype=torch.uint8, device=device
         )
-        kv[physical[owned]] = original_kv[owned]
+        # Indexing uses bytes because torch index_put has no FP8 implementation.
+        stored_dtype = torch.uint8 if kv_dtype == torch.float8_e4m3fn else kv_dtype
+        kv.view(stored_dtype)[physical[owned]] = original_kv.to(kv_dtype).view(
+            stored_dtype
+        )[owned]
         write_index_k_cache(
             index,
             original_index,
@@ -215,7 +228,9 @@ def test_independent_dsa_matches_replicated_cache(rank, monkeypatch, phase, topk
             write_mask=owned,
         )
         destinations, mask = resolve_cache_slots(slots, placement)
-        kv[destinations[mask]] = torch.nan
+        kv.view(stored_dtype)[destinations[mask]] = (
+            torch.full_like(key, torch.nan).to(kv_dtype).view(stored_dtype)[mask]
+        )
         pages = index.view(-1, 64 * 132)
         packed_keys = pages[:, : 64 * 128].reshape(-1, 64, 128)
         packed_scales = pages[:, 64 * 128 :].view(torch.float32)
@@ -268,7 +283,12 @@ def test_independent_dsa_matches_replicated_cache(rank, monkeypatch, phase, topk
         result = forward()
         assert result.shape == (8, tokens, 512)
         assert torch.isfinite(result).all()
-        torch.testing.assert_close(kv[destinations[mask]], key[mask], rtol=0, atol=0)
+        torch.testing.assert_close(
+            kv.float()[destinations[mask]],
+            key.to(kv_dtype).float()[mask],
+            rtol=0,
+            atol=0,
+        )
         quantized, scales = quantize_fp8_with_scale(
             index_key.view(-1, 128),
             granularity="token_group",
@@ -284,7 +304,7 @@ def test_independent_dsa_matches_replicated_cache(rank, monkeypatch, phase, topk
             rtol=0,
             atol=0,
         )
-        assert not kv[:128].any() and not index[:2].any()
+        assert not kv[:128].view(stored_dtype).any() and not index[:2].any()
         outputs.append(result)
         selected.append(
             (

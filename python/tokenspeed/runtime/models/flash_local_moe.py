@@ -157,6 +157,8 @@ class GroupAwareFlashLocalMoE(nn.Module):
         )
 
         self.experts = nn.Module()
+        self.experts.top_k = config.moe_topk
+        self.experts.quant_config = quant_config
         expert_spec = MoELayerSpec(
             top_k=config.moe_topk,
             num_experts=config.n_routed_experts,
@@ -205,7 +207,7 @@ class GroupAwareFlashLocalMoE(nn.Module):
             intermediate_size=int(config.ffn_hidden_size) * int(shared_count),
             hidden_act="silu",
             mapping=Mapping(rank=0),
-            quant_config=quant_config if self._quant_kind == "int8" else None,
+            quant_config=quant_config,
             prefix=add_prefix("shared_experts", prefix),
             is_shared_expert=False,
             params_dtype=torch.bfloat16,
@@ -252,6 +254,11 @@ class GroupAwareFlashLocalMoE(nn.Module):
                 ep_size=self.experts.ep_size,
                 num_zero_experts=self.zero_expert_num,
                 ispp=self.config.expert_ffn_hidden_size,
+                fp8_scale_block_shape=(
+                    tuple(self.quant_config.weight_block_size)
+                    if self._quant_kind == "fp8"
+                    else None
+                ),
                 internal_activation_dtype=(
                     "int8" if self._quant_kind == "int8" else "input"
                 ),

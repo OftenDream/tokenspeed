@@ -472,3 +472,25 @@ def test_lite_grouped_moe_meta_shapes_and_loader() -> None:
 
     model.load_weights(weights(model.checkpoint_layout))
     assert experts.w13_weight.is_meta and experts.w2_weight.is_meta
+
+
+def test_group_aware_fp8_expert_and_shared_scales() -> None:
+    from tokenspeed.runtime.layers.quantization.fp8 import Fp8Config
+
+    config = FLASHLocalConfig.from_dict(
+        lite_config_dict(
+            hidden_size=512,
+            linear_hidden_size=512,
+            linear_num_heads=128,
+            ffn_hidden_size=128,
+            expert_ffn_hidden_size=128,
+        )
+    )
+    quant = Fp8Config(is_checkpoint_fp8_serialized=True, weight_block_size=[128, 128])
+    layer = GroupAwareFlashLocalMoE(config, mapping(8, rank=0), quant_config=quant)
+    assert layer.experts.top_k == config.moe_topk
+    assert layer.experts.w13_weight.dtype == torch.float8_e4m3fn
+    assert layer.experts.w13_weight_scale_inv.shape == (4, 2, 1)
+    for linear in (layer.shared_experts.gate_up_proj, layer.shared_experts.down_proj):
+        assert linear.weight.dtype == torch.float8_e4m3fn
+        assert linear.weight_scale_inv.dtype == torch.float32

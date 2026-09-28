@@ -28,7 +28,7 @@ from tokenspeed_kernel.ops.over_embedding import (
 
 
 @pytest.mark.parametrize("enable_pdl", [False, True])
-@pytest.mark.parametrize("fragment_count", [3, 4])
+@pytest.mark.parametrize("fragment_count", [2, 3, 4])
 def test_fragment_lookup_with_prefix_padding_and_graph(enable_pdl, fragment_count):
     spec = OverEmbeddingSpec(
         profile="longcat-lite-tp4-test",
