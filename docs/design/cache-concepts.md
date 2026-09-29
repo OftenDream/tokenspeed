@@ -1156,6 +1156,12 @@ The dense MLA implementation requires FlashMLA and its device/dtype support;
 DCP does not make unsupported kernels portable. Verify uses per-query causal
 bounds; FlashMLA maps them to local lengths, while DSA selects causal Top-K
 before mapping cache slots. KVStore and non-causal DSA block drafts remain unsupported.
+DSpark/DFlash context injection is also a cache writer: its MLA model receives
+the draft backend, resolves virtual slots through that backend's placement, and
+passes the ownership mask to the local pool. Fused context scatters without an
+ownership-mask interface are disabled under DCP. A pure-prefill context write
+uses the published extend span; it must not require a decode window that a
+prefill-only worker has never initialized.
 
 Splitting or regrouping fields can change physical packing and parent plane
 sizes. Capacity planning therefore uses the resulting physical parent byte

@@ -411,7 +411,9 @@ class ModelExecutor:
                     "DSpark context across pipeline stages."
                 )
             self.dspark_context_producer = DSparkContextProducer(
-                draft_model_runner.model, draft_token_to_kv_pool
+                draft_model_runner.model,
+                draft_token_to_kv_pool,
+                attn_backend=draft_attn_backend,
             )
         if self.config.spec_algo is not None and self._pp_is_last_stage:
             # Model-to-model wiring (shared embed/head, eagle3 capture ids)
