@@ -101,6 +101,18 @@ class CacheTransferContract:
     def __post_init__(self) -> None:
         self.transfer_schema.validate(self.plan)
 
+    def shard_count(self, group_id: str) -> int:
+        """Return the cache group's cyclic owner count; one means replicated."""
+        return next(
+            spec.shard_count for spec in self.group_specs if spec.group_id == group_id
+        )
+
+    def virtual_block_count(self, group_id: str) -> int:
+        """Exclusive scheduler-ID bound, distinct from local physical pages."""
+        return 1 + (self.plan.group(group_id).page_count - 1) * self.shard_count(
+            group_id
+        )
+
     def fields_for_group(self, group_id: str) -> tuple[CacheFieldLayout, ...]:
         return tuple(
             sorted(

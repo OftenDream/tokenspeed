@@ -540,6 +540,7 @@ def test_equal_tp_sharded_route_sends_through_the_pages_api():
     def grids(rank):
         items = list(
             _sender(prefill_layout, src_ptr)._cache_transfer_blocks(
+                dst_tp_rank=0,
                 dst_ptr=dst_ptr,
                 src_block_manifest=source_manifest,
                 dst_block_manifest=destination_manifest,
@@ -614,13 +615,16 @@ def test_equal_tp_stage_subset_routes_gqa_replicas_like_the_full_plan():
             assert decode_rank in stage.decode_ranks_by_prefill_rank[prefill_rank]
 
 
-def test_sharded_decode_destination_is_rejected():
-    with pytest.raises(UnsupportedPDLayoutError, match="sharded on Decode"):
-        _planner(2, 2, _latent_layout(shard_count=1), _latent_layout(shard_count=2))
+def test_sharded_decode_destination_is_routed():
+    planner = _planner(
+        2, 2, _latent_layout(shard_count=1), _latent_layout(shard_count=2)
+    )
+    for rank in range(2):
+        assert planner.plan_for_decode_rank(rank).target_prefill_ranks == (rank,)
 
 
 def test_shard_count_must_divide_prefill_tp():
-    with pytest.raises(UnsupportedPDLayoutError, match="does not divide"):
+    with pytest.raises(UnsupportedPDLayoutError, match="must divide"):
         _planner(3, 1, _latent_layout(shard_count=2), _latent_layout(shard_count=1))
 
 
@@ -761,6 +765,7 @@ def test_every_target_rank_of_a_hybrid_route_can_send_with_its_own_decisions():
                 assert decisions["history"] is None
             copies = _copies(
                 _sender(prefill_layout, src_ptr)._cache_transfer_blocks(
+                    dst_tp_rank=0,
                     dst_ptr=dst_ptr,
                     src_block_manifest=source_manifest,
                     dst_block_manifest=destination_manifest,
@@ -831,6 +836,7 @@ def test_pipeline_stage_without_a_sharded_group_decides_none_and_sends_rest():
     src_ptr, dst_ptr = 0x10000, 0x20000
     copies = _copies(
         _sender(prefill_layout, src_ptr)._cache_transfer_blocks(
+            dst_tp_rank=0,
             dst_ptr=dst_ptr,
             src_block_manifest=block_manifest(("history", (1, 2)), ("index", (3, 4))),
             dst_block_manifest=block_manifest(("history", (5, 6)), ("index", (7, 8))),
