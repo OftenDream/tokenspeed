@@ -1638,12 +1638,15 @@ class ModelExecutor:
             self._compact_accepted_tree(ctx.bs, logits_output)
 
         if self.drafter is not None:
-            next_round_input_ids = self.drafter.run(
-                base_ctx=ctx,
-                logits_output=logits_output,
-                output_tokens=output_tokens,
-                accept_lengths=accept_lengths,
-            )
+            with self.attn_backend.speculative_commit_draft_scope(
+                accept_lengths, num_extends=ctx.num_extends
+            ):
+                next_round_input_ids = self.drafter.run(
+                    base_ctx=ctx,
+                    logits_output=logits_output,
+                    output_tokens=output_tokens,
+                    accept_lengths=accept_lengths,
+                )
             # _update_runtime_state skips future_input_map when drafter is
             # active — drafter writes the next-round inputs directly, and the
             # row's candidate columns are real from here on.

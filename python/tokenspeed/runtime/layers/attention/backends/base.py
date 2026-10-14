@@ -684,6 +684,18 @@ class AttentionBackend(CachePoolBinding, ABC):
     def register_step_counter(self, step_counter: StepCounter) -> None:
         self.step_counter = step_counter
 
+    @contextmanager
+    def speculative_commit_draft_scope(
+        self, accepted_lengths: torch.Tensor, *, num_extends: int
+    ):
+        """Optional target-state commit overlapped with drafting.
+
+        Runs inside decode capture, after sampling. Implementations must join
+        auxiliary work before leaving and suppress the post-forward commit.
+        The default preserves the existing post-forward behavior.
+        """
+        yield
+
     def commit_speculative_state_after_verify(
         self,
         accepted_lengths: torch.Tensor,

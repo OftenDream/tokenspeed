@@ -28,6 +28,7 @@ forwards dispatch per layer id.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from typing import TYPE_CHECKING
 
 import torch
@@ -345,6 +346,18 @@ class HybridLinearAttnBackend(AttentionBackend):
     def tree_support(self) -> TreeSupport:
         return TreeSupport(verify_blocker=None, draft_blocker=None)
 
+    @contextmanager
+    def speculative_commit_draft_scope(self, accepted_lengths, *, num_extends):
+        if num_extends == 0 and getattr(
+            self.linear_attn_backend, "commit_overlaps_draft", False
+        ):
+            with self.linear_attn_backend.speculative_commit_draft_scope(
+                accepted_lengths, num_extends=num_extends
+            ):
+                yield
+        else:
+            yield
+
     def commit_speculative_state_after_verify(
         self,
         accepted_lengths: torch.Tensor,
@@ -352,7 +365,9 @@ class HybridLinearAttnBackend(AttentionBackend):
         num_extends: int,
         accepted_path: torch.Tensor | None,
     ) -> None:
-        if num_extends == 0:
+        if num_extends == 0 and not getattr(
+            self.linear_attn_backend, "commit_overlaps_draft", False
+        ):
             self.linear_attn_backend.commit_verified_state(
                 accepted_lengths, accepted_path=accepted_path
             )

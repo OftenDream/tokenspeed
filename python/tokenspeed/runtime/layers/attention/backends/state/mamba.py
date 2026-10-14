@@ -1071,6 +1071,19 @@ class MambaAttnBackend(AttentionBackend):
         self._qsl_last_mode = [None] * max_bs
         self._state_out_live = [False] * max_bs
 
+    def _graph_commit_tables(self, bs: int) -> dict[str, torch.Tensor]:
+        # Separate fixed-address tables per captured batch size. Refresh copies
+        # live rows into them; graph replay must not follow Python dictionaries
+        # rebound to a different round's input tables.
+        if not hasattr(self, "_verify_graph_commit_tables"):
+            self._verify_graph_commit_tables = {}
+        if bs not in self._verify_graph_commit_tables:
+            self._verify_graph_commit_tables[bs] = {
+                gid: torch.full((bs, 2), -1, dtype=torch.int32, device=self.device)
+                for gid in self._state_groups()
+            }
+        return self._verify_graph_commit_tables[bs]
+
     def init_forward_metadata_capture_cuda_graph(
         self,
         bs: int,
@@ -1126,6 +1139,15 @@ class MambaAttnBackend(AttentionBackend):
                 state_out.fill_(self.pad_slot_id)
                 state_in_blocks_by_group[gid] = state_in
                 state_out_blocks_by_group[gid] = state_out
+            if is_target_verify and getattr(self, "commit_overlaps_draft", False):
+                tables = self._graph_commit_tables(bs)
+                for table in tables.values():
+                    table.fill_(-1)
+                self._verify_commit_ctx = (
+                    tables,
+                    draft_token_num,
+                    state_in_blocks_by_group,
+                )
             self._state_out_live[bs - 1] = False
         self._qsl_dirty[bs - 1] = False
         self._qsl_last_mode[bs - 1] = (forward_mode, self.spec_num_tokens > 1)
@@ -1229,6 +1251,17 @@ class MambaAttnBackend(AttentionBackend):
                 )
             else:
                 self._verify_commit_ctx = None
+            if getattr(self, "commit_overlaps_draft", False):
+                captured_tables = self._graph_commit_tables(bs)
+                for gid, table in captured_tables.items():
+                    table.fill_(-1)
+                    if real_bs > 0:
+                        table[:real_bs].copy_(verify_tables[gid][:real_bs, :2])
+                self._verify_commit_ctx = (
+                    captured_tables,
+                    draft_token_num,
+                    state_in_blocks_by_group,
+                )
             for group_id in self._state_groups():
                 if real_bs < bs:
                     state_in_blocks_by_group[group_id][real_bs:].fill_(self.pad_slot_id)
