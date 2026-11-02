@@ -201,6 +201,7 @@ CacheCoordinator::CacheCoordinator(std::vector<CacheGroup> groups, std::int32_t 
         _assert(groups_[i].Allocator().ShardCount() == groups_[i].Spec().shard_count,
                 "group allocator shard count must match its group spec");
         const auto& spec = groups_[i].Spec();
+        has_cached_history_groups_ |= spec.attn_kind != AttnKind::kState && !spec.replayable;
         _assert(spec.checkpoint_granularity >= 1, "checkpoint grain must be positive");
         if (spec.checkpoint_granularity > 1) {
             _assert(spec.attn_kind == AttnKind::kState, "only State groups constrain checkpoints");
@@ -391,8 +392,6 @@ CacheCoordinator::BlockRange CacheCoordinator::CopyInSlots(std::size_t i, std::i
 
 CacheCoordinator::BoundaryResidency CacheCoordinator::DeviceBoundaryResidency(const CacheKey& boundary,
                                                                               std::int32_t tail_tokens) const {
-    // Every Device entry under the hash is one of the boundary's keys, and
-    // holds its node.
     _assert(boundary.namespace_id == kDefaultCacheNamespaceId, "a tracked boundary lies in the default namespace");
     const BoundaryTree::Node* node = boundary_tree_.Find(boundary.content_hash);
     const std::int32_t cached = node == nullptr ? 0 : node->Entries(BoundaryTree::kDevice);
@@ -402,6 +401,20 @@ CacheCoordinator::BoundaryResidency CacheCoordinator::DeviceBoundaryResidency(co
     const std::int32_t total = numBoundaryKeys(tail_tokens);
     _assert(cached <= total, "a boundary's Device entries lie among its keys");
     return cached == total ? BoundaryResidency::kComplete : BoundaryResidency::kPartial;
+}
+
+CacheCoordinator::BoundaryEventStatus CacheCoordinator::GetBoundaryEventStatus(const CacheKey& boundary,
+                                                                               std::int32_t tail_tokens) const {
+    _assert(boundary.namespace_id == kDefaultCacheNamespaceId, "a tracked boundary lies in the default namespace");
+    const BoundaryTree::Node* node = boundary_tree_.Find(boundary.content_hash);
+    if (node == nullptr) return {.publishable = false, .has_device_entries = false};
+    const std::int32_t device_entries = node->Entries(BoundaryTree::kDevice);
+    // Sparse State must not gate a history chain, but still owns its descriptor.
+    const std::int32_t cached =
+        device_entries - (has_cached_history_groups_ ? node->StateEntries(BoundaryTree::kDevice) : 0);
+    const std::int32_t total = numBoundaryKeys(tail_tokens) - (has_cached_history_groups_ ? num_state_groups_ : 0);
+    _assert(cached <= total, "a boundary's routing entries lie among its keys");
+    return {.publishable = cached > 0 && cached == total, .has_device_entries = device_entries > 0};
 }
 
 bool CacheCoordinator::HoldsStateCheckpoint(const ContentHash& content_hash) const {

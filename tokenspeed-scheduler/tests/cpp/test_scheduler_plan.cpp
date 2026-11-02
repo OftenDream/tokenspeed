@@ -436,12 +436,162 @@ TEST_F(HybridKvCacheEventTestSuite, DrainsATailBoundaryAlongsideAStateGroup) {
     SendForwardDone("r1", {42});
     SendFinish("r1");
 
-    // Only the prompt end has a state checkpoint, so only the tail [3] is complete; the page [1 2] stays partial.
+    // Only the prompt end has state, but the router needs the history parent
+    // before the tail can refer to it. This does not grant a state-cache hit.
     std::vector<KvCacheEvent> events = scheduler_->DrainKvEvents();
-    ASSERT_EQ(events.size(), 1u);
-    ASSERT_TRUE(std::holds_alternative<KvBlockStoredEvent>(events[0]));
-    EXPECT_EQ(std::get<KvBlockStoredEvent>(events[0]).token_ids, (std::vector<std::int32_t>{3}));
+    ASSERT_EQ(events.size(), 2u);
+    const auto& page = std::get<KvBlockStoredEvent>(events[0]);
+    const auto& tail = std::get<KvBlockStoredEvent>(events[1]);
+    EXPECT_EQ(page.token_ids, (std::vector<std::int32_t>{1, 2}));
+    EXPECT_FALSE(page.parent_block_hash);
+    EXPECT_EQ(tail.token_ids, (std::vector<std::int32_t>{3}));
+    EXPECT_EQ(tail.parent_block_hash, page.block_hashes.front());
     EXPECT_TRUE(scheduler_->DrainKvEvents().empty());
+
+    Submit(RequestSpec{.request_id = "repeat", .tokens = {1, 2, 3}});
+    const ExecutionPlan first = PlanOnce();
+    const ForwardBatch* batch = FindForwardBatch(first);
+    ASSERT_NE(batch, nullptr);
+    EXPECT_EQ(batch->extend_prefix_lens.at(0), 0);
+    // The first repeat creates a checkpoint at the history junction. A later
+    // repeat may reuse it, whereas the complete prompt-end state cannot supply
+    // the logits for the prompt's last token.
+    SendForwardDone("repeat", {});
+    PlanOnce();
+    SendForwardDone("repeat", {43});
+    SendFinish("repeat");
+    PlanOnce();
+    Submit(RequestSpec{.request_id = "hit", .tokens = {1, 2, 3}});
+    const ExecutionPlan repeated = PlanOnce();
+    batch = FindForwardBatch(repeated);
+    ASSERT_NE(batch, nullptr);
+    EXPECT_EQ(batch->extend_prefix_lens.at(0), 2);
+}
+
+TEST_F(HybridKvCacheEventTestSuite, RoutesHistoryButAdmitsOnlyPublishedStateAndRemovesOnClear) {
+    Submit(RequestSpec{.request_id = "seed", .tokens = {1, 2, 3, 4, 5}});
+    PlanOnce();
+    SendForwardDone("seed", {42});
+    SendFinish("seed");
+    const auto stored = scheduler_->DrainKvEvents();
+    ASSERT_EQ(stored.size(), 3u);
+    std::optional<std::uint64_t> parent;
+    std::vector<std::uint64_t> hashes;
+    for (const auto& event : stored) {
+        const auto& block = std::get<KvBlockStoredEvent>(event);
+        EXPECT_EQ(block.parent_block_hash, parent);
+        parent = block.block_hashes.front();
+        hashes.push_back(*parent);
+    }
+
+    Submit(RequestSpec{.request_id = "continuation", .tokens = {1, 2, 3, 4, 5, 6}});
+    const auto plan = PlanOnce();
+    const auto* batch = FindForwardBatch(plan);
+    ASSERT_NE(batch, nullptr);
+    EXPECT_EQ(batch->extend_prefix_lens.at(0), 5);
+    SendForwardDone("continuation", {43});
+    SendFinish("continuation");
+    scheduler_->DrainKvEvents();
+    ASSERT_TRUE(scheduler_->ClearCache());
+    const auto removed = scheduler_->DrainKvEvents();
+    std::unordered_set<std::uint64_t> removed_hashes;
+    for (const auto& event : removed) {
+        const auto& block = std::get<KvBlockRemovedEvent>(event);
+        removed_hashes.insert(block.block_hashes.begin(), block.block_hashes.end());
+    }
+    for (const auto hash : hashes) EXPECT_TRUE(removed_hashes.contains(hash));
+    EXPECT_TRUE(scheduler_->DrainKvEvents().empty());
+}
+
+class StateOnlyKvCacheEventTestSuite : public HybridKvCacheEventTestSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        auto cfg = HybridKvCacheEventTestSuite::MakeConfig();
+        cfg.cache_groups.erase(cfg.cache_groups.begin());
+        SetTestSnapshotPool(cfg);
+        return cfg;
+    }
+};
+
+TEST_F(StateOnlyKvCacheEventTestSuite, KeepsPublishedStateEventsWithoutHistoryGroups) {
+    Submit(RequestSpec{.request_id = "seed", .tokens = {1, 2}});
+    PlanOnce();
+    SendForwardDone("seed", {42});
+    SendFinish("seed");
+    const auto events = scheduler_->DrainKvEvents();
+    ASSERT_EQ(events.size(), 1u);
+    const auto& block = std::get<KvBlockStoredEvent>(events.front());
+    EXPECT_EQ(block.token_ids, (std::vector<std::int32_t>{1, 2}));
+    EXPECT_FALSE(block.parent_block_hash);
+    ASSERT_TRUE(scheduler_->ClearCache());
+    const auto removed = scheduler_->DrainKvEvents();
+    ASSERT_EQ(removed.size(), 1u);
+    EXPECT_EQ(std::get<KvBlockRemovedEvent>(removed.front()).block_hashes, block.block_hashes);
+}
+
+TEST(KvCacheEventStatusTest, SeparatesRoutingFromDescriptorLifetime) {
+    BlockPool pool(4, {1, 1, 1});
+    const std::array specs{
+        CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
+        CacheGroupSpec{.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1, .block_granularity = 0},
+        CacheGroupSpec{.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1, .block_granularity = 0}};
+    auto coordinator = MakeCoordinator(specs, 2, pool, false, nullptr, nullptr, false, false,
+                                       /*checkpoint_retention_requests=*/0);
+    const CacheKey boundary{.content_hash = "prefix"};
+    auto status = coordinator.GetBoundaryEventStatus(boundary, /*tail_tokens=*/0);
+    EXPECT_FALSE(status.publishable);
+    EXPECT_FALSE(status.has_device_entries);
+    // State alone keeps the descriptor; adding history makes it publishable.
+    for (const std::uint32_t group : {1u, 0u}) {
+        auto block = pool.AcquireBlock(group);
+        auto key = boundary;
+        key.group_id = group;
+        coordinator.GroupPrefixIndex(group).Register(pool, block, key, /*access_epoch=*/1,
+                                                     /*logical_block_index=*/-1, CacheBoundaryKind::kChunk,
+                                                     /*newly_cached=*/nullptr, /*session=*/nullptr);
+        status = coordinator.GetBoundaryEventStatus(boundary, /*tail_tokens=*/0);
+        EXPECT_EQ(status.publishable, group == 0);
+        EXPECT_TRUE(status.has_device_entries);
+    }
+    // Routing readiness cannot classify the missing second State as a duplicate.
+    EXPECT_EQ(coordinator.DeviceBoundaryResidency(boundary, /*tail_tokens=*/0),
+              CacheCoordinator::BoundaryResidency::kPartial);
+}
+
+class ReplayableSwaStateKvCacheEventTestSuite : public HybridKvCacheEventTestSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        auto cfg = HybridKvCacheEventTestSuite::MakeConfig();
+        auto& swa = cfg.cache_groups.front();
+        swa.attn_kind = AttnKind::kSlidingWindow;
+        swa.sliding_window_tokens = 2;
+        swa.replayable = true;
+        return cfg;
+    }
+};
+
+TEST_F(ReplayableSwaStateKvCacheEventTestSuite, PublishesAndRemovesStateWithoutCachedHistory) {
+    std::vector<std::uint64_t> hashes;
+    // Clearing and publishing the same prefix again must restore its descriptor.
+    for (const std::string id : {"seed", "repeat"}) {
+        Submit(RequestSpec{.request_id = id, .tokens = {1, 2}});
+        PlanOnce();
+        SendForwardDone(id, {42});
+        SendFinish(id);
+        const auto events = scheduler_->DrainKvEvents();
+        ASSERT_EQ(events.size(), 1u);
+        const auto& stored = std::get<KvBlockStoredEvent>(events.front());
+        EXPECT_EQ(stored.token_ids, (std::vector<std::int32_t>{1, 2}));
+        EXPECT_FALSE(stored.parent_block_hash);
+        if (!hashes.empty()) EXPECT_EQ(stored.block_hashes, hashes);
+        hashes = stored.block_hashes;
+        EXPECT_TRUE(scheduler_->DrainKvEvents().empty());
+        ASSERT_TRUE(scheduler_->ClearCache());
+        const auto removed = scheduler_->DrainKvEvents();
+        ASSERT_EQ(removed.size(), 1u);
+        EXPECT_EQ(std::get<KvBlockRemovedEvent>(removed.front()).block_hashes, hashes);
+        EXPECT_TRUE(scheduler_->DrainKvEvents().empty());
+    }
 }
 
 class MultiGroupKvCacheEventTestSuite : public SchedulerTestSuite {

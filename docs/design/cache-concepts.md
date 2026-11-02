@@ -1437,9 +1437,12 @@ Its responsibilities:
   the group indexes), so the scheduler keeps no residency counters of its own
   — only the token descriptor the event carries and whether that event is
   currently out. A mutation only marks its boundary for reconcile;
-  `DrainKvEvents` reconciles each marked boundary against its residency and
-  reports the net change (published exactly while fully resident), then drops
-  descriptors of boundaries with no cached child. Nothing is decided
+  `DrainKvEvents` uses `GetBoundaryEventStatus`: publication requires complete
+  history residency, excluding sparse State checkpoints; when only State groups
+  participate in prefix caching (including State + replayable SWA), it requires
+  those State entries instead. Events describe locality, not admission readiness.
+  Descriptors survive while any Device entry remains, including State excluded
+  from routing. Host eviction still requires all-group residency. Nothing is decided
   mid-`Admit`, so one admission may evict a boundary's last cached copy and
   then store the request's own copy without any ordering hazard.
   Admission may pre-hash prompt pages beyond the computed prefix. An early
