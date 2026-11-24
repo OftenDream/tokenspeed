@@ -1,5 +1,11 @@
 # Sampling kernels
 
+On Ascend, sampling and speculative verification apply repetition, frequency
+and presence penalties and logit bias in one FP32 pass. Each verification
+row reads its request’s pool slot. The kernel writes a separate result so
+callers can still use the original logits. The count and bias tables may be
+strided views and must cover the full logits vocabulary.
+
 ## CUDA fused Top-K / Top-P
 
 The multi-block Top-K radix pass publishes each CTA's histogram updates before

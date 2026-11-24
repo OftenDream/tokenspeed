@@ -23,6 +23,7 @@
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.registry import ErrorClass, error_fn
 
+apply_penalties_logit_bias = error_fn
 SamplingWorkspace = ErrorClass
 chain_speculative_sampling_target_only = error_fn
 fused_topk_topp_renorm = error_fn
@@ -31,6 +32,9 @@ sample_from_probs = error_fn
 verify_chain_greedy = error_fn
 
 if current_platform().is_npu:
+    from tokenspeed_kernel.ops.sampling.triton.penalties import (
+        ascend_apply_penalties_logit_bias as apply_penalties_logit_bias,
+    )
     from tokenspeed_kernel_npu.ops.sampling import (
         SamplingWorkspace,
         chain_speculative_sampling_target_only,
@@ -42,6 +46,7 @@ if current_platform().is_npu:
 
 __all__ = [
     "SamplingWorkspace",
+    "apply_penalties_logit_bias",
     "chain_speculative_sampling_target_only",
     "fused_topk_topp_renorm",
     "min_p_renorm_prob",

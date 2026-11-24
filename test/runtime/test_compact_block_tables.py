@@ -183,6 +183,61 @@ def test_device_packing_keeps_absolute_rows_and_host_mirror(device_type):
     _assert_packed_matches_absolute(op, result)
 
 
+@pytest.mark.parametrize("device_type", ["cpu", "cuda", "npu"])
+@pytest.mark.parametrize("full_width", [False, True])
+def test_decode_tables_share_device_storage_without_host_mirror(
+    device_type, full_width
+):
+    if device_type == "npu":
+        pytest.importorskip("torch_npu")
+    if device_type != "cpu" and not getattr(torch, device_type).is_available():
+        pytest.skip(f"{device_type} device unavailable")
+    from tokenspeed_kernel.ops.metadata import BLOCK_TABLE_ROW_FIELDS
+    from torch.utils._python_dispatch import TorchDispatchMode
+
+    from tokenspeed.runtime.engine.scheduler_utils import (
+        packed_block_tables_from_forward_op,
+    )
+
+    if full_width:
+        scheduler = _scheduler()
+        _submit(scheduler, "short", [1, 2])
+        op = _forward_op(scheduler.next_execution_plan())
+    else:
+        op = _decode_op(stop_token=16, include_prefill=True)
+    windows = op.block_table_windows().values()
+    assert all(arr.shape[1] == cols for arr, cols in windows) == full_width
+    payload = sum(arr.size for arr, _ in windows)
+    if not full_width:
+        payload += sum(
+            arr.shape[0] * BLOCK_TABLE_ROW_FIELDS for arr, cols in windows if cols
+        )
+    uploads = []
+
+    class RecordUploads(TorchDispatchMode):
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            kwargs = kwargs or {}
+            if (
+                func == torch.ops.aten._to_copy.default
+                and args[0].device.type == "cpu"
+                and kwargs.get("device") is not None
+                and kwargs["device"].type == device_type
+                and device_type != "cpu"
+            ):
+                uploads.append(args[0].numel())
+            return func(*args, **kwargs)
+
+    with RecordUploads():
+        result = packed_block_tables_from_forward_op(op, device_type, host_tables=False)
+    assert uploads == ([] if device_type == "cpu" else [payload])
+    expected = op.block_tables_arrays()
+    assert not result.tables_cpu
+    assert result.tables.keys() == expected.keys()
+    assert len({t.untyped_storage().data_ptr() for t in result.tables.values()}) == 1
+    for group, table in result.tables.items():
+        np.testing.assert_array_equal(table.cpu().numpy(), expected[group])
+
+
 def test_decode_window_compacts_long_reclaimed_prefix():
     from tokenspeed.runtime.engine.scheduler_utils import (
         packed_block_tables_from_forward_op,

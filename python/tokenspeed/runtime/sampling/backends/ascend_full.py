@@ -28,6 +28,7 @@ import msgspec
 import torch
 from tokenspeed_kernel.ops.sampling.ascend import (
     SamplingWorkspace,
+    apply_penalties_logit_bias,
     chain_speculative_sampling_target_only,
     fused_topk_topp_renorm,
     min_p_renorm_prob,
@@ -79,6 +80,26 @@ class AscendFullSamplingBackend(FullSamplingBackendBase):
         elif sp.top_k > self._MAX_TOP_K:
             sp = msgspec.structs.replace(sp, top_k=self._MAX_TOP_K)
         super()._reset_slot(pool_idx, sp)
+
+    @nvtx_range("sampling:penalties", color="yellow")
+    def _apply_penalties_and_bias_for_indices(
+        self,
+        logits: torch.Tensor,
+        pool_indices: torch.Tensor,
+        *,
+        num_tokens_per_req: int = 1,
+    ) -> torch.Tensor:
+        # ascend_full selects the Ascend implementation for both sample and verify.
+        return apply_penalties_logit_bias(
+            logits,
+            pool_indices,
+            self._counts,
+            self._logit_bias,
+            self._freq_pen_pool,
+            self._pres_pen_pool,
+            self._rep_pen_pool,
+            num_tokens_per_req=num_tokens_per_req,
+        )
 
     def _create_capture_generator(
         self, config: SamplingBackendConfig

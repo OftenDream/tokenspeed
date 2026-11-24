@@ -819,6 +819,27 @@ def block_tables_from_forward_op(
     ).tables
 
 
+def _stage_full_block_tables(packable, total: int, *, pin_memory: bool):
+    """Build the complete packed table in host memory before transfer."""
+    out_cpu = {}
+    staged = torch.empty(total, dtype=torch.int32, pin_memory=pin_memory)
+    staged_np = staged.numpy()
+    for key, arr, columns, offset, first in packable:
+        rows, width = arr.shape
+        shape = (rows, columns)
+        size = shape[0] * shape[1]
+        host = staged_np[offset : offset + size].reshape(shape)
+        if width == shape[1]:
+            np.copyto(host, arr)
+        else:
+            for row, start in enumerate(first):
+                host[row, :start] = 0
+                host[row, start : start + width] = arr[row]
+                host[row, start + width :] = -1
+        out_cpu[key] = staged[offset : offset + size].view(shape)
+    return staged, out_cpu
+
+
 def packed_block_tables_from_forward_op(
     forward_op: Any,
     device: "torch.device | str",
@@ -833,12 +854,13 @@ def packed_block_tables_from_forward_op(
     page indices, null hole = 0 preserved, ragged-row padding -1. No
     base-offset companion -- the cache path never compacts.
 
-    All groups ride ONE H2D copy and one kernel rebuilds them into ONE device
+    All groups share one H2D copy and are packed into one device
     storage; the returned per-group views share it, which is the
     precondition of the routers' one-launch fill of every group
     (``GroupTableStacks.fill``). Per-group uploads would fail its
-    same-storage check and fall back to one launch per group. The copy
-    carries the scheduler's compact row windows (``block_table_windows``)
+    same-storage check and fall back to one launch per group. Without a host
+    mirror, a batch of full-width windows uses the packed rows directly.
+    Otherwise the copy carries the compact row windows (``block_table_windows``)
     and their absolute spans (``block_table_spans``). The expansion fills
     omitted columns with null holes before the window and padding after it.
     With ``host_tables`` the tables are also rebuilt in pinned host memory,
@@ -1009,6 +1031,17 @@ def packed_block_tables_from_forward_op(
             out_cpu[key] = torch.empty((rows, 0), dtype=torch.int32)
     if not packable:
         return PackedBlockTables(out, out_cpu)
+    pin_memory = device.type in ("cuda", "npu")
+    if not host_tables and all(
+        arr.shape[1] == columns for _, arr, columns, _, _ in packable
+    ):
+        # Full-width windows already contain every hole and padding entry.
+        staged, _ = _stage_full_block_tables(packable, total, pin_memory=pin_memory)
+        packed = staged.to(device, non_blocking=True)
+        for key, arr, columns, offset, _ in packable:
+            size = arr.shape[0] * columns
+            out[key] = packed[offset : offset + size].view(arr.shape[0], columns)
+        return PackedBlockTables(out, out_cpu)
     from tokenspeed_kernel.ops.metadata import (
         BLOCK_TABLE_ROW_FIELDS,
         expand_block_table_rows,
@@ -1020,7 +1053,6 @@ def packed_block_tables_from_forward_op(
     # Fresh pinned stages per step (event-fenced; reuse races overlap).
     # arr is a read-only zero-copy view over the C++ buffer; np.copyto
     # reads it into our own writable pinned tensors (never writes back).
-    pin_memory = device.type in ("cuda", "npu")
     upload = torch.empty(fields + num_values, dtype=torch.int32, pin_memory=pin_memory)
     upload_np = upload.numpy()
     row_fields = upload_np[:fields].reshape(num_rows, BLOCK_TABLE_ROW_FIELDS)
@@ -1049,21 +1081,10 @@ def packed_block_tables_from_forward_op(
         size = shape[0] * shape[1]
         out[key] = packed[offset : offset + size].view(shape)
     if host_tables:
-        staged = torch.empty(total, dtype=torch.int32, pin_memory=pin_memory)
-        staged_np = staged.numpy()
-        for key, arr, columns, offset, first in packable:
-            rows, width = arr.shape
-            shape = (rows, columns)
-            size = shape[0] * shape[1]
-            host = staged_np[offset : offset + size].reshape(shape)
-            if width == shape[1]:
-                np.copyto(host, arr)
-            else:
-                for row, start in enumerate(first):
-                    host[row, :start] = 0
-                    host[row, start : start + width] = arr[row]
-                    host[row, start + width :] = -1
-            out_cpu[key] = staged[offset : offset + size].view(shape)
+        _, out_cpu_staged = _stage_full_block_tables(
+            packable, total, pin_memory=pin_memory
+        )
+        out_cpu.update(out_cpu_staged)
     return PackedBlockTables(out, out_cpu)
 
 

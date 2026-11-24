@@ -168,3 +168,59 @@ def test_sampling_with_nan_detection_is_graph_safe(verify, implicit_cap, top_k):
     assert vocab - retained_count <= tokens.cpu().item() < vocab
     assert lengths.cpu().tolist() == [1]
     assert torch.isfinite(output.next_token_logprobs.cpu()).all()
+
+
+@pytest.mark.parametrize("tokens_per_req", [1, 8])
+def test_ascend_fused_penalties_match_full_backend(tokens_per_req):
+    from tokenspeed.runtime.sampling.backends.ascend_full import (
+        AscendFullSamplingBackend,
+    )
+    from tokenspeed.runtime.sampling.backends.base import SamplingBackendConfig
+    from tokenspeed.runtime.sampling.backends.full_base import FullSamplingBackendBase
+    from tokenspeed.runtime.sampling.sampling_params import SamplingParams
+
+    vocab = 4101
+    backend = AscendFullSamplingBackend(
+        SamplingBackendConfig(
+            synthetic_acceptance_length=None,
+            enable_speculative_sampling=False,
+            sampling_stream="batch",
+            logprob_order="torch",
+            npu_sampling_top_p_top_k_cap=False,
+            max_bs=3,
+            max_req_pool_size=3,
+            vocab_size=vocab,
+            device="npu",
+            enable_tp_sync=False,
+        )
+    )
+    backend.prepare_step(
+        [101, 102],
+        [2, 1],
+        [
+            SamplingParams(
+                seed=73,
+                frequency_penalty=-0.25,
+                presence_penalty=0.5,
+                repetition_penalty=1.25,
+                logit_bias={"1": 0.75},
+            ),
+            SamplingParams(seed=74),
+        ],
+        num_tokens_per_req=tokens_per_req,
+    )
+    backend._counts[2, ::2] = 3
+    indices = torch.tensor([2, 1, 2], dtype=torch.int32, device="npu")
+    logits = torch.linspace(-3, 3, 3 * tokens_per_req * vocab, device="npu").view(
+        -1, vocab
+    )
+    logits[:, 0] = -float("inf")
+    original = logits.clone()
+    expected = FullSamplingBackendBase._apply_penalties_and_bias_for_indices(
+        backend, logits, indices, num_tokens_per_req=tokens_per_req
+    )
+    actual = backend._apply_penalties_and_bias_for_indices(
+        logits, indices, num_tokens_per_req=tokens_per_req
+    )
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    torch.testing.assert_close(logits, original, rtol=0, atol=0)

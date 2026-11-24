@@ -31,8 +31,9 @@ from tokenspeed_kernel._triton import tl, triton
 
 
 @triton.jit
-def _apply_penalties_logit_bias_inplace_kernel(
+def _apply_penalties_logit_bias_kernel(
     logits_ptr,
+    out_ptr,
     req_pool_indices_ptr,
     counts_ptr,
     logit_bias_ptr,
@@ -41,21 +42,29 @@ def _apply_penalties_logit_bias_inplace_kernel(
     rep_pen_pool_ptr,
     vocab_size: tl.constexpr,
     logits_row_stride: tl.constexpr,
+    logits_col_stride,
+    out_row_stride: tl.constexpr,
     counts_row_stride: tl.constexpr,
     bias_row_stride: tl.constexpr,
+    counts_col_stride,
+    bias_col_stride,
     BLOCK_SIZE: tl.constexpr,
     NUM_TOKENS_PER_REQ: tl.constexpr,
 ):
     row = tl.program_id(0)
     block = tl.program_id(1)
     req_row = row // NUM_TOKENS_PER_REQ
-    pool_idx = tl.load(req_pool_indices_ptr + req_row)
+    pool_idx = tl.load(req_pool_indices_ptr + req_row).to(tl.int64)
     cols = block * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = cols < vocab_size
 
-    logits_offsets = row.to(tl.int64) * logits_row_stride + cols
-    state_offsets = pool_idx * counts_row_stride + cols
-    bias_offsets = pool_idx * bias_row_stride + cols
+    # A strided vocabulary view can span more than 2**31 elements.
+    col_offsets = cols.to(tl.int64)
+    logits_offsets = (
+        row.to(tl.int64) * logits_row_stride + col_offsets * logits_col_stride
+    )
+    state_offsets = pool_idx * counts_row_stride + col_offsets * counts_col_stride
+    bias_offsets = pool_idx * bias_row_stride + col_offsets * bias_col_stride
 
     vals = tl.load(logits_ptr + logits_offsets, mask=mask, other=0.0).to(tl.float32)
     counts = tl.load(counts_ptr + state_offsets, mask=mask, other=0).to(tl.float32)
@@ -70,7 +79,7 @@ def _apply_penalties_logit_bias_inplace_kernel(
     vals = vals - freq * counts - presence * active.to(tl.float32)
     vals += tl.load(logit_bias_ptr + bias_offsets, mask=mask, other=0.0).to(tl.float32)
 
-    tl.store(logits_ptr + logits_offsets, vals, mask=mask)
+    tl.store(out_ptr + row.to(tl.int64) * out_row_stride + cols, vals, mask=mask)
 
 
 def apply_penalties_logit_bias_inplace(
@@ -126,7 +135,8 @@ def apply_penalties_logit_bias_inplace(
         return logits
 
     num_blocks = triton.cdiv(vocab_size, 1024)
-    _apply_penalties_logit_bias_inplace_kernel[(rows, num_blocks)](
+    _apply_penalties_logit_bias_kernel[(rows, num_blocks)](
+        logits,
         logits,
         req_pool_indices,
         counts,
@@ -136,14 +146,86 @@ def apply_penalties_logit_bias_inplace(
         rep_pen_pool,
         vocab_size=vocab_size,
         logits_row_stride=logits.stride(0),
+        logits_col_stride=1,
+        out_row_stride=logits.stride(0),
         counts_row_stride=counts.stride(0),
         bias_row_stride=logit_bias.stride(0),
+        counts_col_stride=counts.stride(1),
+        bias_col_stride=logit_bias.stride(1),
         BLOCK_SIZE=1024,
         NUM_TOKENS_PER_REQ=num_tokens_per_req,
         num_warps=4,
         num_stages=3,
     )
     return logits
+
+
+def ascend_apply_penalties_logit_bias(
+    logits: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    counts: torch.Tensor,
+    logit_bias: torch.Tensor,
+    freq_pen_pool: torch.Tensor,
+    pres_pen_pool: torch.Tensor,
+    rep_pen_pool: torch.Tensor,
+    *,
+    num_tokens_per_req: int,
+) -> torch.Tensor:
+    """Return adjusted FP32 logits for consecutive token rows of each request.
+
+    Request indices select rows in the count and bias tables and entries in
+    the three penalty pools. The original logits remain available for logprobs.
+    """
+    rows, vocab = logits.shape
+    if logits.dtype != torch.float32:
+        raise ValueError("Ascend penalty sampling requires FP32 logits")
+    if req_pool_indices.ndim != 1 or req_pool_indices.dtype not in (
+        torch.int32,
+        torch.int64,
+    ):
+        raise ValueError("request pool indices must be a vector of integers")
+    if counts.ndim != 2 or logit_bias.ndim != 2:
+        raise ValueError("counts and logit_bias must be matrices")
+    if min(counts.shape[1], logit_bias.shape[1]) < vocab:
+        raise ValueError("counts and logit_bias must cover the logits vocabulary")
+    slots = counts.shape[0]
+    if logit_bias.shape[0] != slots or any(
+        pool.shape != (slots,) for pool in (freq_pen_pool, pres_pen_pool, rep_pen_pool)
+    ):
+        raise ValueError(
+            "all penalty and bias pools must have the same number of slots"
+        )
+    if num_tokens_per_req < 1 or rows != req_pool_indices.numel() * num_tokens_per_req:
+        raise ValueError(
+            "logits rows must match request count times tokens per request"
+        )
+    out = torch.empty_like(logits, memory_format=torch.contiguous_format)
+    if out.numel():
+        # Strided gathers need extra unified buffer space on Ascend.
+        dense_vocab = logits.stride(1) == counts.stride(1) == logit_bias.stride(1) == 1
+        block = 4096 if dense_vocab else 128
+        _apply_penalties_logit_bias_kernel[(rows, triton.cdiv(vocab, block))](
+            logits,
+            out,
+            req_pool_indices.contiguous(),
+            counts,
+            logit_bias,
+            freq_pen_pool.contiguous(),
+            pres_pen_pool.contiguous(),
+            rep_pen_pool.contiguous(),
+            vocab,
+            logits.stride(0),
+            logits.stride(1),
+            out.stride(0),
+            counts.stride(0),
+            logit_bias.stride(0),
+            counts.stride(1),
+            logit_bias.stride(1),
+            BLOCK_SIZE=block,
+            NUM_TOKENS_PER_REQ=num_tokens_per_req,
+            enable_fp_fusion=False,
+        )
+    return out
 
 
 @triton.jit
